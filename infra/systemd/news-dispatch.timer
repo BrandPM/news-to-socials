@@ -1,0 +1,12 @@
+[Unit]
+Description=Run news-dispatch every 5 minutes
+Requires=news-dispatch.service
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

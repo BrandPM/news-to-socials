@@ -1,0 +1,31 @@
+[Unit]
+Description=News-to-Socials: poll active sources
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials
+EnvironmentFile=/opt/news-to-socials/.env
+ExecStart=/opt/news-to-socials/.venv/bin/python -m pipeline.scheduler.poll_sources
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/news-to-socials /var/log/news-to-socials
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+
+# Resource limits (W8 mitigation)
+MemoryMax=1G
+CPUQuota=80%
+
+StandardOutput=journal
+StandardError=journal

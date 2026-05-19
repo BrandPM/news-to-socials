@@ -1,0 +1,20 @@
+[Unit]
+Description=News-to-Socials: daily summary to TG
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials
+EnvironmentFile=/opt/news-to-socials/.env
+ExecStart=/opt/news-to-socials/.venv/bin/python -m pipeline.monitoring.daily_summary
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
