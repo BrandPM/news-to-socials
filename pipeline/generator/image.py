@@ -16,7 +16,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
-import replicate
+from replicate.client import Client as ReplicateClient
 
 from ..common.config import get_settings
 from ..common.logging import get_logger
@@ -42,11 +42,14 @@ class BrandVisual:
 class ImageGenerator:
     def __init__(self, model: str = "black-forest-labs/flux-1.1-pro") -> None:
         self.model = model
-        # Replicate's SDK reads REPLICATE_API_TOKEN from env at call time;
-        # we surface it explicitly via settings to fail fast on misconfig.
+        # pydantic-settings loads .env into the Settings object but not os.environ,
+        # so we must construct an explicit Replicate client with the token.
         settings = get_settings()
         if not settings.replicate_api_token:
             log.warning("image_generator.no_token", note="dry-run mode will be forced")
+            self._client = None
+        else:
+            self._client = ReplicateClient(api_token=settings.replicate_api_token)
 
     @with_retry()
     async def generate(self, topic: Topic, brand_visual: BrandVisual) -> str:
@@ -57,8 +60,9 @@ class ImageGenerator:
         prompt = f"{topic.raw.title}, {style}"
 
         log.info("image.generate", brand=brand_visual.brand_id, prompt_len=len(prompt))
-        # `replicate.async_run` is a thin async wrapper.
-        output = await replicate.async_run(
+        if self._client is None:
+            raise RuntimeError("REPLICATE_API_TOKEN missing; cannot generate image")
+        output = await self._client.async_run(
             self.model,
             input={
                 "prompt": prompt,
