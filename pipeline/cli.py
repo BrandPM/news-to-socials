@@ -58,23 +58,27 @@ def summary() -> None:
 
 @app.command()
 def run(
-    brand: str = typer.Option(..., help="Brand slug, e.g. 'icon'"),
-    source: str = typer.Option(..., help="Source UUID from Directus.sources"),
-    language: str = typer.Option("en", help="Language code: ru/uk/en/pl"),
-    channel: str = typer.Option("blog", help="Channel: blog/telegram/facebook/instagram"),
+    brand: str = typer.Option("icon", help="Brand slug (Wave 1: only 'icon')"),
+    source_id: str = typer.Option(..., "--source-id", help="Source identifier"),
+    source_url: str = typer.Option(..., "--source-url", help="Feed URL (RSS for Wave 1)"),
+    language: str = typer.Option("en", help="Language: ru/uk/en/pl"),
     limit: int = typer.Option(3, help="Max items to process this run"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Skip external publish APIs"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Skip Sanity write + image generation"),
 ) -> None:
-    """One-shot run: source → score → generate → adapt → publish."""
+    """One-shot run: source → score → generate → image → Sanity draft.
+
+    For Wave 1 the only output channel is Sanity (blog at /:lang/insights).
+    Wave 2 (Meta) and Wave 3 (Telegram) are separate publishers.
+    """
     from scripts.run_pipeline import run_pipeline
-    from .common.models import Channel, Language
+    from .common.models import Language
 
     results = asyncio.run(
         run_pipeline(
             brand_slug=brand,
-            source_id=source,
+            source_id=source_id,
+            source_url=source_url,
             language=Language(language),
-            channel=Channel(channel),
             limit=limit,
             dry_run=dry_run,
         )

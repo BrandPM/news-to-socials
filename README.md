@@ -36,13 +36,13 @@ queue/          Publish-window + rate-limit-aware queue (SQLite)
    ↓
 bot/            Telegram approval flow with inline buttons
    ↓
-publisher/      Directus (blog) / Telegram Bot API / Meta Graph API
+publisher/      Sanity (blog) / Telegram Bot API / Meta Graph API
    ↓
 monitoring/     Daily summary + critical alerts + /health endpoint
 ```
 
-State of the world lives in **Directus** (headless CMS, PostgreSQL); local
-queues and embedding caches live in SQLite next to the worker.
+State of the world lives in **Sanity** (existing CMS at icon.finance, ADR-018);
+local queues and embedding caches live in SQLite next to the worker.
 
 ---
 
@@ -60,7 +60,7 @@ cp .env.example .env
 $EDITOR .env   # fill API keys
 
 # 4. Run a single source through the pipeline (smoke test)
-nts run --brand icon --source <uuid> --language en --channel blog --limit 3 --dry-run
+nts run --brand icon --source-id reuters-finance --source-url https://www.reuters.com/finance/rss --language en --limit 3 --dry-run
 ```
 
 The `--dry-run` flag prints what would be published without calling any

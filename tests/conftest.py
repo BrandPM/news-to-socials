@@ -21,4 +21,6 @@ def _isolated_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REPLICATE_API_TOKEN", "")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("META_ACCESS_TOKEN", "")
+    monkeypatch.setenv("SANITY_PROJECT_ID", "")
+    monkeypatch.setenv("SANITY_API_TOKEN", "")
     monkeypatch.setenv("DIRECTUS_TOKEN", "")

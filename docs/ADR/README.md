@@ -8,7 +8,7 @@ that supersedes the old one — don't edit history.
 |---|---|---|
 | 001 | Original commentary, not rewrites | Accepted |
 | 002 | Python pipeline, not n8n | Accepted |
-| 003 | Directus as headless CMS | Accepted |
+| 003 | Directus as headless CMS | **Superseded by ADR-018** |
 | 004 | Event-driven polling via systemd timers | Accepted |
 | 005 | Telegram approval flow | Accepted |
 | 006 | Multi-tenant by `brand_id` parameter | Accepted |
@@ -22,6 +22,7 @@ that supersedes the old one — don't edit history.
 | 015 | Frontend: Lovable vs Astro | TODO (Stage 5 Day 1) |
 | 016 | Optional: Directus AI Assistant vs `brand_extractor.py` | TODO (Stage 2 Day 3) |
 | 017 | OpenAI-only LLM stack (drop Anthropic) | Accepted |
+| 018 | Use existing Sanity CMS, drop Directus | Accepted |
 
 The full reasoning behind every decision lives in the Obsidian vault
 under `IT/projects/news-to-socials/IT_PROJ_NTS_010_master_documentation.md §4`.

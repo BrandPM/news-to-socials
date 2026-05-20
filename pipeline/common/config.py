@@ -36,14 +36,15 @@ class Settings(BaseSettings):
     meta_app_secret: str = ""
     meta_access_token: str = ""
 
-    # Directus
-    directus_url: str = "http://localhost:8055"
-    directus_token: str = ""
+    # Sanity CMS (ADR-018)
+    sanity_project_id: str = ""
+    sanity_dataset: str = "production"
+    sanity_api_version: str = "2024-01-01"
+    sanity_api_token: str = ""
 
-    # Postgres (Directus backing store)
-    postgres_password: str = ""
-    postgres_user: str = "directus"
-    postgres_db: str = "directus"
+    # Directus (DEPRECATED — kept for backwards-compat, see ADR-018)
+    directus_url: str = ""
+    directus_token: str = ""
 
     # Pipeline runtime
     pipeline_db_path: Path = Path("./pipeline.db")
