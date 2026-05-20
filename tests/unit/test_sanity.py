@@ -105,3 +105,66 @@ def test_portable_text_each_block_has_unique_key() -> None:
     keys = [b["_key"] for b in blocks]
     assert len(set(keys)) == len(keys)
     assert all(isinstance(k, str) and len(k) > 0 for k in keys)
+
+
+# --- Client integration tests (against mocked HTTP) -----------------
+
+
+def _make_client():
+    """Helper: build a SanityClient with explicit creds bypassing get_settings."""
+    from pipeline.publisher.sanity import SanityClient
+    return SanityClient(
+        project_id="test-proj",
+        dataset="production",
+        api_version="2024-01-01",
+        token="test-token",
+    )
+
+
+async def test_query_uses_post_with_json_body():
+    """Regression: GROQ params must go through POST body, not URL.
+
+    Previously we tried passing them as URL params with $ prefix — Sanity
+    returned 400 for queries that reference parameters. POST with
+    ``{"query": ..., "params": ...}`` is the supported transport.
+    """
+    import json as _json
+
+    import respx
+    from httpx import Response
+
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(
+            "https://test-proj.api.sanity.io/v2024-01-01/data/query/production"
+        ).mock(return_value=Response(200, json={"result": "ok-id"}))
+
+        client = _make_client()
+        result = await client.query(
+            '*[_type=="post" && topicId==$tid][0]._id',
+            {"tid": "abc123"},
+        )
+
+        assert result == "ok-id"
+        request = route.calls[0].request
+        payload = _json.loads(request.read())
+        # The query string is sent verbatim.
+        assert "$tid" in payload["query"]
+        # Parameters are NOT $-prefixed in the JSON body (Sanity prefixes them
+        # internally from the query references).
+        assert payload["params"] == {"tid": "abc123"}
+
+
+async def test_query_without_params_still_works():
+    """A parameter-less GROQ should also POST cleanly."""
+    import respx
+    from httpx import Response
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(
+            "https://test-proj.api.sanity.io/v2024-01-01/data/query/production"
+        ).mock(return_value=Response(200, json={"result": ["item-1"]}))
+
+        client = _make_client()
+        result = await client.query('*[_type=="post"][0..2]._id')
+
+        assert result == ["item-1"]

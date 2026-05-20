@@ -70,7 +70,7 @@ def run(
     For Wave 1 the only output channel is Sanity (blog at /:lang/insights).
     Wave 2 (Meta) and Wave 3 (Telegram) are separate publishers.
     """
-    from scripts.run_pipeline import run_pipeline
+    from .run import run_pipeline
     from .common.models import Language
 
     results = asyncio.run(

@@ -111,11 +111,18 @@ class SanityClient:
 
     @with_retry()
     async def query(self, groq: str, params: dict[str, Any] | None = None) -> Any:
+        # Sanity supports two transports for GROQ:
+        #  1. GET ?query=...&$key=value — URL gets long fast, special-char
+        #     escaping in zsh/curl is fragile, $-prefixed param names
+        #     conflict with shell variable expansion in some contexts.
+        #  2. POST body {"query": ..., "params": {...}} — clean and
+        #     recommended for anything beyond trivial scripts.
+        # We use POST. Reference: https://www.sanity.io/docs/http-query
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(
+            resp = await client.post(
                 f"{self.base}/data/query/{self.dataset}",
                 headers=self._headers(),
-                params={"query": groq, **(params or {})},
+                json={"query": groq, "params": params or {}},
             )
             resp.raise_for_status()
             return resp.json().get("result")
