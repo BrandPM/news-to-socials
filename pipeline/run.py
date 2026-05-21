@@ -15,8 +15,14 @@ Andriy approves through /studio (drafts → publish). The published document
 appears at icon.finance/:lang/insights/:slug.
 
 Usage:
-    nts run --brand icon --source-id <uuid> --language en --limit 5
-    nts run ... --dry-run   # no API calls, prints intended document JSON
+    python -m scripts.run_pipeline                              # all active sources from admin.db
+    python -m scripts.run_pipeline --source-id x --source-url y # override one source
+    python -m scripts.run_pipeline --dry-run                    # no Sanity write, no image gen
+
+Sources / scoring threshold / active prompts / voice profile are read from
+``admin.db`` via :class:`pipeline.admin.config_client.AdminConfigClient`.
+When admin.db is missing or empty we fall back to the in-repo hardcoded
+seeds — see Admin-UI-Specific Invariant B in IT_PROJ_NTS_014.
 
 For Wave 1 we only publish to Sanity (blog channel). Wave 2 adds Meta;
 Wave 3 adds Telegram.
@@ -382,68 +388,56 @@ async def generate_with_image(
 # --------------------------------------------------------------------------
 
 
-async def run_pipeline(
-    brand_slug: str,
-    source_id: str,
-    source_url: str,
+async def _process_source(
+    *,
+    source_record,  # config_client.SourceRecord
+    brand: BrandConfig,
     language: Language,
     limit: int,
     dry_run: bool,
-) -> list[dict[str, Any]]:
-    """The whole pipeline for one (brand, source, language) run.
+    sanity_publisher,
+    client,  # AdminConfigClient
+    run_id: int | None,
+    min_score: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Run the source → score → dedup → generate stages for ONE source.
 
-    For Wave 1 we publish to Sanity only. ``channel`` is implicit = blog.
+    Returns ``(results, stats)``. Per-topic outcomes are also written to
+    the ``topics`` table when ``run_id`` is set.
     """
-    configure_logging()
-    settings = get_settings()
-    if dry_run:
-        settings.dry_run = True  # type: ignore[misc]
-    log.info(
-        "pipeline.start",
-        brand=brand_slug,
-        source=source_id,
-        language=language.value,
-        limit=limit,
-        dry_run=dry_run,
+    from pipeline.sources.rss import RssSource  # noqa: PLC0415
+
+    stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
+    if source_record.source_type != "rss":
+        # web / telegram sources not implemented yet (S3+).
+        log.warning("source.unsupported_type", type=source_record.source_type)
+        return [], stats
+
+    source = RssSource(
+        source_id=str(source_record.id) if source_record.id is not None else source_record.name,
+        name=source_record.name,
+        url=source_record.url,
     )
 
-    # 1. Load brand config (Wave 1: hard-coded for Icon)
-    if brand_slug != "icon":
-        raise NotImplementedError(
-            f"Brand {brand_slug!r} not supported yet — only Icon in Wave 1. "
-            "Stage 5 will load brand config from Sanity `brand` collection."
-        )
-    brand = icon_brand_config()
-
-    # 2. Load source
-    source = load_source_by_id(source_id, source_url)
-
-    # 3. Sanity client (only if not dry-run)
-    sanity_publisher = SanityPublisher() if not dry_run else _DryRunSanityPublisher()
-
-    # 4. Fetch
     raw_items = list(await source.fetch())
+    stats["fetched"] = len(raw_items)
     log.info("source.fetched", count=len(raw_items), source=source.name)
     if not raw_items:
         log.warning("source.empty", source=source.name)
-        return []
+        return [], stats
 
-    # 5. Score relevance (drop noise)
     scored = await score_relevant_topics(
-        raw_items, brand, min_score=7, limit_pool=limit * 4
+        raw_items, brand, min_score=min_score, limit_pool=limit * 4
     )
+    stats["scored"] = len(scored)
     if not scored:
-        log.warning("score.none_passed", brand=brand_slug)
-        return []
+        return [], stats
 
-    # 6. Dedup (local + Sanity)
     deduper = Deduper(DedupConfig())
     topics = await dedup_filter(scored, language, deduper, sanity_publisher, brand)
     if not topics:
-        log.warning("dedup.all_filtered", brand=brand_slug)
-        return []
+        return [], stats
 
-    # 7. For each surviving topic: generate + assign category + image + publish draft
     results: list[dict[str, Any]] = []
     for topic in topics[:limit]:
         try:
@@ -467,16 +461,223 @@ async def run_pipeline(
             if dry_run:
                 log.info("dry_run.would_create", title=post.title, category=category)
                 results.append({"topic_id": topic.id, "status": "dry_run", "category": category, "title": post.title})
+                client.record_topic_result(
+                    run_id=run_id,
+                    topic_id=topic.id,
+                    source_id=source_record.id,
+                    title=post.title,
+                    url=str(topic.raw.url),
+                    score=int(topic.relevance_score),
+                    status="passed",
+                    draft_id=None,
+                )
             else:
                 draft_id = await sanity_publisher.publish_draft(post)
                 results.append({"topic_id": topic.id, "draft_id": draft_id, "category": category, "title": post.title})
+                stats["drafted"] += 1
                 log.info("topic.published_as_draft", topic=topic.id, draft_id=draft_id)
+                client.record_topic_result(
+                    run_id=run_id,
+                    topic_id=topic.id,
+                    source_id=source_record.id,
+                    title=post.title,
+                    url=str(topic.raw.url),
+                    score=int(topic.relevance_score),
+                    status="passed",
+                    draft_id=draft_id,
+                )
         except Exception as exc:  # noqa: BLE001
             log.error("topic.failed", topic=topic.id, err=str(exc))
+            stats["errors"] += 1
             results.append({"topic_id": topic.id, "status": "failed", "error": str(exc)})
+            client.record_topic_result(
+                run_id=run_id,
+                topic_id=topic.id,
+                source_id=source_record.id,
+                title=topic.raw.title,
+                url=str(topic.raw.url),
+                score=int(topic.relevance_score),
+                status="failed",
+                filter_reason=str(exc),
+            )
+    return results, stats
 
-    log.info("pipeline.done", processed=len(results), brand=brand_slug)
-    return results
+
+async def run_pipeline(
+    brand_slug: str = "icon",
+    source_id: str | None = None,
+    source_url: str | None = None,
+    language: Language = Language.en,
+    limit: int = 3,
+    dry_run: bool = False,
+    *,
+    triggered_by: str = "cron",
+    existing_run_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Run the pipeline for a brand.
+
+    Source list resolution:
+
+    * If ``source_id`` AND ``source_url`` are both provided, run for that
+      single source (legacy override path used by the systemd timer until S3).
+    * Otherwise read all active sources from admin.db via AdminConfigClient.
+      If admin.db is missing or has no active rows, fall back to the
+      hardcoded seed list — see Admin-UI-Specific Invariant B.
+
+    Config (threshold / voice profile) also reads through AdminConfigClient
+    with the same fallback semantics.
+    """
+    from pipeline.admin.config_client import AdminConfigClient, SourceRecord  # noqa: PLC0415
+
+    configure_logging()
+    settings = get_settings()
+    if dry_run:
+        settings.dry_run = True  # type: ignore[misc]
+
+    if brand_slug != "icon":
+        raise NotImplementedError(
+            f"Brand {brand_slug!r} not supported yet — only Icon in Wave 1. "
+            "Stage 5 will load brand config from a Sanity `brand` collection."
+        )
+
+    client = AdminConfigClient(brand_id=brand_slug)
+    config = client.get_config()
+    brand = icon_brand_config()
+
+    # Apply admin-db overrides on top of the hardcoded BrandConfig so the
+    # pipeline picks up Andriy's edits without a code change.
+    if config.voice_profile and config.voice_profile != brand.voice_profile_yaml:
+        brand = BrandConfig(
+            slug=brand.slug,
+            name=brand.name,
+            voice_profile_yaml=config.voice_profile,
+            visual=brand.visual,
+            context=brand.context,
+            categories=brand.categories,
+        )
+
+    # Resolve source list.
+    if source_id is not None and source_url is not None:
+        sources = [
+            SourceRecord(
+                id=None,
+                name=source_id,
+                source_type="rss",
+                url=source_url,
+                primary_category="wealth",
+                polling_minutes=720,
+            )
+        ]
+    else:
+        sources = client.get_active_sources()
+
+    log.info(
+        "pipeline.start",
+        brand=brand_slug,
+        sources=[s.name for s in sources],
+        language=language.value,
+        limit=limit,
+        dry_run=dry_run,
+        threshold=config.scoring_threshold,
+    )
+
+    # Record run start (no-op when admin.db is unavailable).
+    run_id = existing_run_id
+    if run_id is None:
+        run_id = client.record_run_start(
+            source_ids=[s.id for s in sources if s.id is not None],
+            triggered_by=triggered_by,
+        )
+
+    sanity_publisher = SanityPublisher() if not dry_run else _DryRunSanityPublisher()
+
+    aggregate_results: list[dict[str, Any]] = []
+    aggregate_stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
+    log_lines: list[str] = []
+
+    for src in sources:
+        try:
+            results, stats = await _process_source(
+                source_record=src,
+                brand=brand,
+                language=language,
+                limit=limit,
+                dry_run=dry_run,
+                sanity_publisher=sanity_publisher,
+                client=client,
+                run_id=run_id,
+                min_score=config.scoring_threshold,
+            )
+            aggregate_results.extend(results)
+            for k, v in stats.items():
+                aggregate_stats[k] = aggregate_stats.get(k, 0) + v
+            log_lines.append(
+                f"source {src.name}: fetched={stats['fetched']} "
+                f"scored={stats['scored']} drafted={stats['drafted']} "
+                f"errors={stats['errors']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("source.failed", source=src.name)
+            aggregate_stats["errors"] += 1
+            log_lines.append(f"source {src.name}: FAILED {exc!r}")
+
+    overall_status = "success" if aggregate_stats["errors"] == 0 else "failed"
+    client.record_run_finish(
+        run_id,
+        status=overall_status,
+        stats=aggregate_stats,
+        log_excerpt="\n".join(log_lines)[-4000:],
+    ) if run_id is not None else None
+
+    log.info("pipeline.done", processed=len(aggregate_results), brand=brand_slug,
+             status=overall_status, stats=aggregate_stats)
+    return aggregate_results
+
+
+async def run_pipeline_for_run(run_id: int) -> None:
+    """Execute the pipeline for an already-recorded ``runs`` row.
+
+    Used by ``pipeline.admin.jobs.execute_pipeline_run`` (i.e. the
+    ``POST /sources/{id}/run`` endpoint). Looks up the source list from
+    the run row, then delegates to :func:`run_pipeline` with
+    ``existing_run_id`` set so we don't double-record.
+    """
+    from pipeline.admin.config_client import AdminConfigClient  # noqa: PLC0415
+
+    client = AdminConfigClient()
+    source_ids = client.get_run_source_ids(run_id)
+
+    # Pull the SourceRecords for those ids out of admin.db. We bypass
+    # get_active_sources() because the operator may have run a source that
+    # has since been deactivated — the run was already accepted.
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from pipeline.admin import db as admin_db  # noqa: PLC0415
+    from pipeline.admin.models import Source  # noqa: PLC0415
+
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        rows = session.scalars(
+            select(Source).where(Source.id.in_(source_ids))
+        ).all()
+    if not rows:
+        client.record_run_finish(
+            run_id, status="failed", log_excerpt="no sources resolved for this run"
+        )
+        return
+
+    # Re-enter the orchestrator with the existing run_id so it appends to
+    # the same row instead of creating a sibling.
+    for source in rows:
+        await run_pipeline(
+            brand_slug=source.brand_id,
+            source_id=str(source.id),
+            source_url=source.url,
+            language=Language.en,
+            limit=3,
+            dry_run=False,
+            existing_run_id=run_id,
+        )
 
 
 class _DryRunSanityPublisher:
@@ -500,13 +701,27 @@ class _DryRunSanityPublisher:
 @app.command()
 def main(
     brand: str = typer.Option("icon", help="Brand slug (Wave 1: only 'icon')"),
-    source_id: str = typer.Option(..., "--source-id", help="Source identifier"),
-    source_url: str = typer.Option(..., "--source-url", help="Feed URL"),
+    source_id: str | None = typer.Option(
+        None, "--source-id", help="Override: run for this source only"
+    ),
+    source_url: str | None = typer.Option(
+        None, "--source-url", help="Override: feed URL (required with --source-id)"
+    ),
     language: str = typer.Option("en", help="Language: ru/uk/en/pl"),
-    limit: int = typer.Option(5, help="Max topics to process"),
+    limit: int = typer.Option(3, help="Max topics per source"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Skip Sanity + image generation"),
 ) -> None:
-    """Run one pipeline pass."""
+    """Run one pipeline pass.
+
+    With no flags: reads active sources from admin.db (or falls back to the
+    in-repo seed list when admin.db is missing). With ``--source-id`` +
+    ``--source-url``: runs only that source. Mixed forms (one but not the
+    other) are rejected by the override resolver.
+    """
+    if (source_id is None) != (source_url is None):
+        typer.echo("--source-id and --source-url must be supplied together", err=True)
+        sys.exit(2)
+
     try:
         results = asyncio.run(
             run_pipeline(
