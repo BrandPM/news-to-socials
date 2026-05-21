@@ -197,7 +197,7 @@ class SanityClient:
 # --- Portable Text conversion ---------------------------------------------
 
 
-_HEADING_RE = re.compile(r"^(#+)\s+(.+)$")
+_HEADING_RE = re.compile(r"^(#+)\s+(.+?)\s*$")
 
 
 def markdown_to_portable_text(markdown: str) -> list[dict[str, Any]]:
@@ -206,10 +206,14 @@ def markdown_to_portable_text(markdown: str) -> list[dict[str, Any]]:
 
     The LLM output is paragraph-based prose with occasional headings. We:
 
-    * Treat ``## ...`` and ``### ...`` lines as H2/H3 blocks
-    * Otherwise emit normal paragraph blocks
-    * Strip surrounding whitespace
-    * Generate stable keys per block (Sanity requires ``_key``)
+    * Treat ``## ...`` and ``### ...`` lines as H2/H3 blocks, whether or not
+      they are separated from surrounding prose by a blank line (gpt-4o
+      sometimes emits ``## Heading\\nBody`` with a single newline).
+    * Otherwise emit normal paragraph blocks. Consecutive non-heading lines
+      separated by a single newline are joined with a space; a blank line
+      flushes the current paragraph.
+    * Strip surrounding whitespace.
+    * Generate stable keys per block (Sanity requires ``_key``).
 
     Bold/italic markdown isn't handled here — the LLM is instructed to
     write clean prose, and inline marks add a lot of complexity for
@@ -217,40 +221,89 @@ def markdown_to_portable_text(markdown: str) -> list[dict[str, Any]]:
     in JS to be ported.
     """
     blocks: list[dict[str, Any]] = []
-    for idx, raw in enumerate(markdown.split("\n\n")):
-        text = raw.strip()
-        if not text:
-            continue
+    paragraph_buf: list[str] = []
+    idx = 0
 
-        style = "normal"
-        m = _HEADING_RE.match(text)
+    def flush_paragraph() -> None:
+        nonlocal idx
+        if not paragraph_buf:
+            return
+        text = " ".join(paragraph_buf).strip()
+        paragraph_buf.clear()
+        if not text:
+            return
+        blocks.append(_make_block(idx, text, style="normal"))
+        idx += 1
+
+    for raw_line in markdown.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            flush_paragraph()
+            continue
+        m = _HEADING_RE.match(line)
         if m:
+            flush_paragraph()
             hashes, rest = m.groups()
             style = {2: "h2", 3: "h3"}.get(len(hashes), "h2")
-            text = rest.strip()
+            blocks.append(_make_block(idx, rest.strip(), style=style))
+            idx += 1
+            continue
+        paragraph_buf.append(line)
+    flush_paragraph()
 
-        blocks.append(
-            {
-                "_type": "block",
-                "_key": _block_key(idx, text),
-                "style": style,
-                "markDefs": [],
-                "children": [
-                    {
-                        "_type": "span",
-                        "_key": _block_key(idx, text, "span"),
-                        "text": text,
-                        "marks": [],
-                    }
-                ],
-            }
-        )
     return blocks
+
+
+def _make_block(idx: int, text: str, *, style: str) -> dict[str, Any]:
+    return {
+        "_type": "block",
+        "_key": _block_key(idx, text),
+        "style": style,
+        "markDefs": [],
+        "children": [
+            {
+                "_type": "span",
+                "_key": _block_key(idx, text, "span"),
+                "text": text,
+                "marks": [],
+            }
+        ],
+    }
 
 
 def _block_key(idx: int, text: str, suffix: str = "") -> str:
     seed = f"{idx}-{text}-{suffix}".encode("utf-8")
     return hashlib.sha1(seed).hexdigest()[:12]
+
+
+# --- Table of contents ----------------------------------------------------
+
+
+_TOC_STYLES = ("h2", "h3")
+
+
+def extract_toc_from_body(blocks: list[dict[str, Any]]) -> list[str]:
+    """Collect heading text from Portable Text blocks to populate a TOC.
+
+    Walks the block list, picks blocks with ``style`` in ``("h2", "h3")``,
+    and joins each block's child span text. Empty headings are skipped so
+    we don't render bullets pointing at nothing.
+    """
+    toc: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("style") not in _TOC_STYLES:
+            continue
+        children = block.get("children") or []
+        text = "".join(
+            (child.get("text") or "")
+            for child in children
+            if isinstance(child, dict)
+        ).strip()
+        if text:
+            toc.append(text)
+    return toc
 
 
 # --- Post conversion -------------------------------------------------------
@@ -324,6 +377,10 @@ class SanityPublisher:
             "topicId": post.topic_id,
             "generatedBy": "pipeline",
         }
+
+        toc = extract_toc_from_body(body_pt)
+        if toc:
+            doc["tableOfContents"] = toc
 
         if post.cover_image_asset_id:
             doc["coverImage"] = {

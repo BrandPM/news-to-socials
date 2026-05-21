@@ -37,6 +37,18 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _LONG_SENT_WORDS = 30
 
 
+def find_banned_phrase_hits(text: str, banned_phrases: list[str]) -> list[str]:
+    """Return the subset of ``banned_phrases`` that appear in ``text``.
+
+    Case-insensitive substring match. Brand-specific banned phrases are read
+    from the brand voice profile (see ``icon_brand_config`` in
+    ``pipeline/run.py``), so this list is wider than ``_FLAGGED_PHRASES``
+    and is configurable per brand.
+    """
+    haystack = text.lower()
+    return [p for p in banned_phrases if p.lower() in haystack]
+
+
 def score_ai_tells(text: str) -> tuple[float, list[str]]:
     """Compute an AI-likeness score and a list of concrete tells."""
     text_lower = text.lower()

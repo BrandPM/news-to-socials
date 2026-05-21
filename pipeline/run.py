@@ -95,13 +95,20 @@ def icon_brand_config() -> BrandConfig:
         slug="icon",
         name="Icon",
         voice_profile_yaml=(
-            "# Icon Finance voice profile (Wave 1 starter — refine in Stage 2)\n"
+            "# Icon Finance voice profile (Wave 1, hardened IT_PROJ_NTS_013)\n"
             "mission: Wealth-management partner for international families and entrepreneurs.\n"
             "audience: HNWI, family office principals, founders post-exit.\n"
             "tone:\n"
             "  formality: high-but-warm\n"
             "  first_person: brand_name # 'Icon believes ...' not 'we'\n"
             "  emoji_allowed: false\n"
+            "voice_principles:\n"
+            "  - Lead with a specific consequence, not a general observation.\n"
+            "  - Name the mechanism: who is repriced, who is exposed, who absorbs the cost.\n"
+            "  - One concrete number or named entity per paragraph, not vague intensifiers.\n"
+            "  - Address the reader as someone already inside the conversation, not someone being briefed.\n"
+            "  - End on what changes for the reader's next decision, not a restatement.\n"
+            "  - Short sentences. Vary length. Do not chain three clauses with em-dashes.\n"
             "topics_relevant:\n"
             "  - cross-border tax structuring\n"
             "  - family office operations\n"
@@ -112,9 +119,45 @@ def icon_brand_config() -> BrandConfig:
             "  - crypto speculation\n"
             "  - retail trading\n"
             "  - day-trading systems\n"
+            "banned_phrases:\n"
+            "  - in today's fast-paced\n"
+            "  - ever-evolving\n"
+            "  - ever-changing\n"
+            "  - navigate the landscape\n"
+            "  - navigate the complexities\n"
+            "  - in the realm of\n"
+            "  - in the world of\n"
+            "  - harness the power of\n"
+            "  - unlock the potential\n"
+            "  - at the forefront of\n"
+            "  - delve into\n"
+            "  - moreover\n"
+            "  - furthermore\n"
+            "  - it's important to note\n"
+            "  - it is important to note\n"
+            "  - in conclusion\n"
+            "  - in summary\n"
+            "  - strategic perspectives on\n"
+            "  - enhancing wealth management\n"
+            "  - robust framework\n"
+            "  - comprehensive approach\n"
+            "  - tailored solutions\n"
+            "  - bespoke solutions\n"
+            "  - cutting-edge\n"
+            "  - in an increasingly\n"
+            "  - paradigm shift\n"
             "style_examples:\n"
-            "  - \"The proposal moves the discussion, not the timeline.\"\n"
-            "  - \"Trust planning rarely fails on tax. It fails on family.\"\n"
+            "  good:\n"
+            "    - \"The proposal moves the discussion, not the timeline.\"\n"
+            "    - \"Trust planning rarely fails on tax. It fails on family.\"\n"
+            "    - \"A 50bp move in base rates is not the story. The story is who can refinance and who cannot.\"\n"
+            "    - \"For a family with operating assets in three jurisdictions, the question is not whether to restructure, but when the cost of not restructuring exceeds the cost of doing it.\"\n"
+            "    - \"India's new credit-fund regime will reprice mezzanine paper before it reprices senior. Allocators who set their yield assumptions last quarter should revisit them this one.\"\n"
+            "  bad:\n"
+            "    - \"In today's fast-paced world of wealth management, it is important to note that the landscape is ever-evolving.\"\n"
+            "    - \"Icon believes in harnessing the power of strategic perspectives to navigate the complexities of cross-border structuring.\"\n"
+            "    - \"This article will delve into the comprehensive framework that enables families to unlock the potential of their wealth.\"\n"
+            "    - \"Moreover, the proposal represents a paradigm shift. Furthermore, it is at the forefront of innovation. In conclusion, allocators should take note.\"\n"
         ),
         visual=BrandVisual(
             brand_id="icon",
@@ -327,8 +370,10 @@ async def generate_with_image(
             resized, filename=f"{brand.slug}-{topic.id}.png"
         )
         return draft, asset_id
-    except Exception as exc:  # noqa: BLE001
-        log.error("image.failed", topic=topic.id, err=str(exc))
+    except Exception:  # noqa: BLE001
+        # log.exception captures the traceback so silent image failures
+        # surface in /var/log/news-to-socials/run.log (IT_PROJ_NTS_013 Defect 1).
+        log.exception("image.failed", topic=topic.id)
         return draft, None  # Continue without image; Andriy can add manually.
 
 

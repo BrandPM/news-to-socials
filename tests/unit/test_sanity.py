@@ -5,6 +5,7 @@ from __future__ import annotations
 from pipeline.publisher.sanity import (
     estimate_read_time,
     excerpt_from_body,
+    extract_toc_from_body,
     markdown_to_portable_text,
     slugify,
 )
@@ -98,6 +99,36 @@ def test_portable_text_skips_empty_paragraphs() -> None:
     assert len(blocks) == 2
 
 
+def test_portable_text_heading_glued_to_paragraph_is_split() -> None:
+    """Real gpt-4o output sometimes emits ``## Heading\\nBody`` with a single
+    newline, not the canonical ``## Heading\\n\\nBody``. We must still pull
+    the heading into its own h2 block (IT_PROJ_NTS_013 Defect 3)."""
+    md = (
+        "Lede paragraph here.\n\n"
+        "## A real heading\n"
+        "Body that follows immediately without a blank line.\n\n"
+        "## Another heading\nMore body."
+    )
+    blocks = markdown_to_portable_text(md)
+    styles = [b["style"] for b in blocks]
+    texts = [b["children"][0]["text"] for b in blocks]
+    assert styles == ["normal", "h2", "normal", "h2", "normal"]
+    assert texts[1] == "A real heading"
+    assert texts[2].startswith("Body that follows")
+    assert texts[3] == "Another heading"
+
+
+def test_portable_text_joins_wrapped_paragraph_lines() -> None:
+    """Multi-line paragraphs (no blank line between lines) collapse into
+    a single normal block, not many."""
+    md = "First line of the paragraph\nsecond line\nthird line.\n\nNext para."
+    blocks = markdown_to_portable_text(md)
+    assert [b["style"] for b in blocks] == ["normal", "normal"]
+    assert blocks[0]["children"][0]["text"] == (
+        "First line of the paragraph second line third line."
+    )
+
+
 def test_portable_text_each_block_has_unique_key() -> None:
     blocks = markdown_to_portable_text(
         "Para one.\n\nPara two.\n\nPara three."
@@ -105,6 +136,49 @@ def test_portable_text_each_block_has_unique_key() -> None:
     keys = [b["_key"] for b in blocks]
     assert len(set(keys)) == len(keys)
     assert all(isinstance(k, str) and len(k) > 0 for k in keys)
+
+
+# --- table of contents ----------------------------------------------
+
+
+def test_toc_extracted_from_h2_and_h3() -> None:
+    md = (
+        "Lede paragraph here.\n\n"
+        "## First section\n\n"
+        "Body of first section.\n\n"
+        "### A subheading\n\n"
+        "More body.\n\n"
+        "## Second section\n\n"
+        "Closing thoughts."
+    )
+    blocks = markdown_to_portable_text(md)
+    toc = extract_toc_from_body(blocks)
+    assert toc == ["First section", "A subheading", "Second section"]
+
+
+def test_toc_empty_when_no_headings() -> None:
+    blocks = markdown_to_portable_text("Just a paragraph.\n\nAnother one.")
+    assert extract_toc_from_body(blocks) == []
+
+
+def test_toc_skips_empty_heading_text() -> None:
+    blocks = [
+        {"_type": "block", "style": "h2", "children": [{"_type": "span", "text": "  "}]},
+        {"_type": "block", "style": "h2", "children": [{"_type": "span", "text": "Real heading"}]},
+    ]
+    assert extract_toc_from_body(blocks) == ["Real heading"]
+
+
+def test_toc_tolerates_malformed_blocks() -> None:
+    """A degenerate block list (missing children, non-dict entries) should
+    not crash the publisher — we'd rather skip TOC than fail to publish."""
+    blocks = [
+        None,  # type: ignore[list-item]
+        {"_type": "block", "style": "h2"},  # no children key
+        {"_type": "block", "style": "h2", "children": [{"_type": "span"}]},  # no text
+        {"_type": "block", "style": "h2", "children": [{"_type": "span", "text": "OK"}]},
+    ]
+    assert extract_toc_from_body(blocks) == ["OK"]
 
 
 # --- Client integration tests (against mocked HTTP) -----------------
@@ -152,6 +226,68 @@ async def test_query_uses_post_with_json_body():
         # Parameters are NOT $-prefixed in the JSON body (Sanity prefixes them
         # internally from the query references).
         assert payload["params"] == {"tid": "abc123"}
+
+
+async def test_publish_draft_populates_table_of_contents():
+    """publish_draft() must derive tableOfContents from body H2/H3 blocks."""
+    from unittest.mock import AsyncMock
+
+    from pipeline.common.models import Language
+    from pipeline.publisher.sanity import SanityPostInput, SanityPublisher
+
+    fake_client = AsyncMock()
+    fake_client.create_draft = AsyncMock(return_value="drafts.post-xyz")
+
+    publisher = SanityPublisher(client=fake_client)
+    body_md = (
+        "Lede paragraph.\n\n"
+        "## The repricing of mezzanine credit\n\n"
+        "Section body.\n\n"
+        "## What allocators should do next\n\n"
+        "Closing thought."
+    )
+    await publisher.publish_draft(
+        SanityPostInput(
+            title="A Title",
+            body_markdown=body_md,
+            language=Language.en,
+            category="special",
+            source_url="https://example.com/x",
+            topic_id="t-1",
+        )
+    )
+
+    fake_client.create_draft.assert_awaited_once()
+    doc = fake_client.create_draft.await_args.args[0]
+    assert doc["tableOfContents"] == [
+        "The repricing of mezzanine credit",
+        "What allocators should do next",
+    ]
+
+
+async def test_publish_draft_omits_toc_when_body_has_no_headings():
+    from unittest.mock import AsyncMock
+
+    from pipeline.common.models import Language
+    from pipeline.publisher.sanity import SanityPostInput, SanityPublisher
+
+    fake_client = AsyncMock()
+    fake_client.create_draft = AsyncMock(return_value="drafts.post-xyz")
+
+    publisher = SanityPublisher(client=fake_client)
+    await publisher.publish_draft(
+        SanityPostInput(
+            title="t",
+            body_markdown="Just paragraphs here.\n\nNo headings at all.",
+            language=Language.en,
+            category="special",
+            source_url="https://example.com/x",
+            topic_id="t-2",
+        )
+    )
+    doc = fake_client.create_draft.await_args.args[0]
+    # Absent rather than empty list — clearer in Studio.
+    assert "tableOfContents" not in doc
 
 
 async def test_query_without_params_still_works():
