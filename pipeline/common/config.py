@@ -48,8 +48,15 @@ class Settings(BaseSettings):
 
     # Pipeline runtime
     pipeline_db_path: Path = Path("./pipeline.db")
+    admin_db_path: Path = Path("./admin.db")
     log_level: str = "INFO"
     tz: str = "Europe/Madrid"
+
+    # Admin API (IT_PROJ_NTS_014). Token validated by middleware on every
+    # request except /health. Empty string means admin API is disabled.
+    admin_trigger_secret: str = ""
+    admin_cors_origin: str = "http://localhost:3000"
+    admin_log_path: Path = Path("/var/log/news-to-socials/run.log")
 
     # Optional services
     ml_service_url: str = ""
