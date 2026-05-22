@@ -68,6 +68,14 @@ def upgrade() -> None:
     bind = op.get_bind()
     now = datetime.now(tz=timezone.utc)
 
+    # SQLite enforces FK constraints when our app engine attaches them
+    # via the ``connect`` event listener (db.py). batch_alter_table
+    # operations recreate tables, which transiently violates FKs. Turn
+    # them off for the duration of this migration; re-enabled at the
+    # end so a subsequent ``alembic upgrade head`` on the same process
+    # sees the proper enforcement.
+    op.execute(sa.text("PRAGMA foreign_keys=OFF"))
+
     # 1. brands table -------------------------------------------------------
     op.create_table(
         "brands",
@@ -310,6 +318,8 @@ def upgrade() -> None:
             "status IN ('running', 'success', 'failed', 'dry_run')",
         )
 
+    op.execute(sa.text("PRAGMA foreign_keys=ON"))
+
 
 def downgrade() -> None:
     """Reverse the multi-brand refactor.
@@ -317,6 +327,8 @@ def downgrade() -> None:
     Recreates the string ``brand_id`` columns on each table, populates
     them from a join through ``brands.slug``, drops the FK + brands table.
     """
+    op.execute(sa.text("PRAGMA foreign_keys=OFF"))
+
     # 1. Re-add string brand_id columns (nullable for backfill window) -----
     for tbl in _affected_existing_tables():
         op.add_column(tbl, sa.Column("brand_id", sa.String(), nullable=True))
@@ -378,6 +390,12 @@ def downgrade() -> None:
         )
         batch_op.create_primary_key("pk_pipeline_config", ["brand_id"])
 
+    # The 'dry_run' status was introduced in this migration's upgrade.
+    # Coerce any existing dry_run rows to 'success' before reinstating
+    # the narrower CHECK constraint — otherwise SQLite refuses the
+    # CREATE-TABLE step inside batch_alter_table.
+    op.execute(sa.text("UPDATE runs SET status='success' WHERE status='dry_run'"))
+
     with op.batch_alter_table("runs", schema=None) as batch_op:
         batch_op.drop_index(batch_op.f("ix_runs_brand_id_fk"))
         batch_op.drop_constraint(
@@ -398,3 +416,5 @@ def downgrade() -> None:
 
     # 3. Finally, drop brands ----------------------------------------------
     op.drop_table("brands")
+
+    op.execute(sa.text("PRAGMA foreign_keys=ON"))
