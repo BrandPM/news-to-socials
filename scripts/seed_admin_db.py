@@ -1,15 +1,21 @@
-"""Seed admin.db with the canonical Icon sources, prompts, and config.
+"""Seed admin.db with brands + the canonical Icon sources/prompts/config.
 
-Idempotent: re-running won't create duplicates. The script reports what
-it INSERTED, what it SKIPPED (already present), and exits 0 on success.
+Idempotent: re-running won't create duplicates and NEVER overwrites
+credentials of an existing brand row (operator may have edited them via
+the UI). The script reports what it INSERTED, what it SKIPPED, and
+exits 0 on success.
 
 Usage:
-    python -m scripts.seed_admin_db [--brand icon] [--dry-run]
+    python -m scripts.seed_admin_db [--brand-slug icon] [--dry-run]
 
-The script uses whatever DB path ``settings.admin_db_path`` resolves to
-(default ``./admin.db``). Make sure the schema is migrated first:
+Make sure the schema is migrated first:
 
     alembic upgrade head
+
+If ``BRANDS_ENCRYPTION_KEY`` is set in .env and the Sanity credentials
+for Icon are present, they will be encrypted-on-insert. If the brand
+row already exists, the Sanity credentials are NOT touched — see
+``_seed_brands`` below.
 """
 
 from __future__ import annotations
@@ -18,13 +24,14 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from pipeline.admin import seed_data
 from pipeline.admin.db import get_session_factory
-from pipeline.admin.models import PipelineConfig, Prompt, Source
+from pipeline.admin.models import Brand, PipelineConfig, Prompt, Source
 
 
 @dataclass
@@ -42,14 +49,99 @@ class SeedReport:
         )
 
 
-def _seed_sources(session: Session, brand_id: str) -> tuple[list[str], list[str]]:
+# ---------------------------------------------------------------------------
+# Brands
+# ---------------------------------------------------------------------------
+
+
+def _seed_brands(session: Session) -> tuple[list[str], list[str]]:
+    """Seed Icon + 4 placeholders. Skip existing brands by slug — NEVER
+    overwrite credentials of a brand that already exists."""
+    inserted: list[str] = []
+    skipped: list[str] = []
+    now = datetime.now(tz=timezone.utc)
+
+    # Icon — active, with encrypted Sanity creds pulled from .env at seed time.
+    existing_icon = session.execute(
+        select(Brand).where(Brand.slug == seed_data.ICON_BRAND_SLUG)
+    ).scalar_one_or_none()
+    if existing_icon is None:
+        from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
+        from pipeline.common.config import get_settings  # noqa: PLC0415
+
+        settings = get_settings()
+        token_enc: str | None = None
+        if settings.sanity_api_token:
+            token_enc = get_encryption().encrypt(settings.sanity_api_token)
+        has_creds = bool(token_enc and settings.sanity_project_id)
+        session.add(
+            Brand(
+                slug=seed_data.ICON_BRAND_SLUG,
+                name=seed_data.ICON_BRAND_NAME,
+                language=seed_data.ICON_BRAND_LANGUAGE,
+                timezone=seed_data.ICON_BRAND_TIMEZONE,
+                status="active" if has_creds else "draft",
+                active=has_creds,
+                sanity_project_id=settings.sanity_project_id or None,
+                sanity_dataset=settings.sanity_dataset or None,
+                sanity_api_version=settings.sanity_api_version or "2024-01-01",
+                sanity_api_token_enc=token_enc,
+                sanity_studio_url=(
+                    f"https://{settings.sanity_project_id}.sanity.studio/"
+                    if settings.sanity_project_id
+                    else None
+                ),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.flush()
+        inserted.append(f"brand {seed_data.ICON_BRAND_SLUG!r} (active, Sanity creds)")
+    else:
+        skipped.append(f"brand {seed_data.ICON_BRAND_SLUG!r}")
+
+    # Placeholders — status='draft', no creds.
+    for placeholder in seed_data.PLACEHOLDER_BRAND_SEEDS:
+        existing = session.execute(
+            select(Brand).where(Brand.slug == placeholder.slug)
+        ).scalar_one_or_none()
+        if existing is not None:
+            skipped.append(f"brand {placeholder.slug!r}")
+            continue
+        session.add(
+            Brand(
+                slug=placeholder.slug,
+                name=placeholder.name,
+                language=placeholder.language,
+                timezone=placeholder.timezone,
+                status="draft",
+                active=False,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        inserted.append(f"brand {placeholder.slug!r} (draft placeholder)")
+    session.flush()
+    return inserted, skipped
+
+
+# ---------------------------------------------------------------------------
+# Sources / prompts / config — bound to the Icon brand row
+# ---------------------------------------------------------------------------
+
+
+def _get_brand_id(session: Session, slug: str) -> int:
+    row = session.execute(select(Brand).where(Brand.slug == slug)).scalar_one()
+    return row.id
+
+
+def _seed_sources(session: Session, brand_id_fk: int) -> tuple[list[str], list[str]]:
     inserted: list[str] = []
     skipped: list[str] = []
     for s in seed_data.ICON_SEED_SOURCES:
-        # Idempotency key: (brand_id, url). URL uniquely identifies a feed.
         existing = session.execute(
             select(Source).where(
-                Source.brand_id == brand_id, Source.url == s.url
+                Source.brand_id_fk == brand_id_fk, Source.url == s.url
             )
         ).scalar_one_or_none()
         if existing is not None:
@@ -57,7 +149,7 @@ def _seed_sources(session: Session, brand_id: str) -> tuple[list[str], list[str]
             continue
         session.add(
             Source(
-                brand_id=brand_id,
+                brand_id_fk=brand_id_fk,
                 name=s.name,
                 source_type=s.source_type,
                 url=s.url,
@@ -71,7 +163,7 @@ def _seed_sources(session: Session, brand_id: str) -> tuple[list[str], list[str]
     return inserted, skipped
 
 
-def _seed_prompts(session: Session, brand_id: str) -> tuple[list[str], list[str]]:
+def _seed_prompts(session: Session, brand_id_fk: int) -> tuple[list[str], list[str]]:
     inserted: list[str] = []
     skipped: list[str] = []
     targets = [
@@ -79,11 +171,9 @@ def _seed_prompts(session: Session, brand_id: str) -> tuple[list[str], list[str]
         ("writer_draft", seed_data.get_active_draft_prompt()),
     ]
     for ptype, (version_name, content) in targets:
-        # Idempotency: skip if a prompt with this (brand, type, version_name)
-        # already exists.
         existing = session.execute(
             select(Prompt).where(
-                Prompt.brand_id == brand_id,
+                Prompt.brand_id_fk == brand_id_fk,
                 Prompt.prompt_type == ptype,
                 Prompt.version_name == version_name,
             )
@@ -91,14 +181,10 @@ def _seed_prompts(session: Session, brand_id: str) -> tuple[list[str], list[str]
         if existing is not None:
             skipped.append(f"prompt {ptype}/{version_name!r}")
             continue
-
-        # If no active prompt of this type exists yet, the new row becomes
-        # the active one. Otherwise the operator activates it later in the
-        # UI — we don't want to silently flip something they've curated.
         has_active = (
             session.execute(
                 select(Prompt.id).where(
-                    Prompt.brand_id == brand_id,
+                    Prompt.brand_id_fk == brand_id_fk,
                     Prompt.prompt_type == ptype,
                     Prompt.is_active.is_(True),
                 )
@@ -107,7 +193,7 @@ def _seed_prompts(session: Session, brand_id: str) -> tuple[list[str], list[str]
         )
         session.add(
             Prompt(
-                brand_id=brand_id,
+                brand_id_fk=brand_id_fk,
                 prompt_type=ptype,
                 version_name=version_name,
                 content=content,
@@ -126,53 +212,65 @@ def _seed_prompts(session: Session, brand_id: str) -> tuple[list[str], list[str]
     return inserted, skipped
 
 
-def _seed_config(session: Session, brand_id: str) -> tuple[list[str], list[str]]:
+def _seed_config(session: Session, brand_id_fk: int) -> tuple[list[str], list[str]]:
     inserted: list[str] = []
     skipped: list[str] = []
-    existing = session.get(PipelineConfig, brand_id)
+    existing = session.get(PipelineConfig, brand_id_fk)
     if existing is not None:
-        skipped.append(f"pipeline_config[{brand_id}]")
+        skipped.append(f"pipeline_config[{brand_id_fk}]")
         return inserted, skipped
 
-    # Pull voice_profile YAML + banned_phrases from the live BrandConfig so
-    # the seed always matches whatever shipped most recently.
+    from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
     from pipeline.run import icon_brand_config  # noqa: PLC0415
 
     brand = icon_brand_config()
-    # banned_phrases JSON is parsed out of the YAML for ease of editing
-    # via the future Settings UI banned-phrases tag input.
-    from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
-
     banned, _examples = parse_voice_guardrails(brand.voice_profile_yaml)
 
     session.add(
         PipelineConfig(
-            brand_id=brand_id,
+            brand_id_fk=brand_id_fk,
             scoring_threshold=seed_data.ICON_SEED_THRESHOLD,
             topics_per_run=seed_data.ICON_SEED_TOPICS_PER_RUN,
             banned_phrases=json.dumps(banned, ensure_ascii=False),
             voice_profile=brand.voice_profile_yaml,
         )
     )
-    inserted.append(f"pipeline_config[{brand_id}]")
+    inserted.append(f"pipeline_config[{brand_id_fk}]")
     return inserted, skipped
 
 
-def seed(brand_id: str = "icon", *, dry_run: bool = False) -> SeedReport:
-    """Seed admin.db. Returns what was inserted / skipped. Idempotent."""
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def seed(brand_slug: str = "icon", *, dry_run: bool = False) -> SeedReport:
+    """Seed admin.db (brands + Icon's sources/prompts/config). Idempotent.
+
+    ``brand_slug`` selects which brand owns the seeded sources/prompts/
+    config rows — for now we only seed Icon's data. Other brands ship
+    with their own data once Andriy creates them via the UI.
+    """
     factory = get_session_factory()
     inserted: list[str] = []
     skipped: list[str] = []
     with factory() as session:
-        a, b = _seed_sources(session, brand_id)
+        a, b = _seed_brands(session)
         inserted.extend(a)
         skipped.extend(b)
-        a, b = _seed_prompts(session, brand_id)
+
+        brand_id_fk = _get_brand_id(session, brand_slug)
+
+        a, b = _seed_sources(session, brand_id_fk)
         inserted.extend(a)
         skipped.extend(b)
-        a, b = _seed_config(session, brand_id)
+        a, b = _seed_prompts(session, brand_id_fk)
         inserted.extend(a)
         skipped.extend(b)
+        a, b = _seed_config(session, brand_id_fk)
+        inserted.extend(a)
+        skipped.extend(b)
+
         if dry_run:
             session.rollback()
         else:
@@ -182,13 +280,17 @@ def seed(brand_id: str = "icon", *, dry_run: bool = False) -> SeedReport:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--brand", default="icon", help="Brand slug (default: icon)")
+    parser.add_argument(
+        "--brand-slug",
+        default="icon",
+        help="Brand slug whose sources/prompts/config get seeded (default: icon)",
+    )
     parser.add_argument(
         "--dry-run", action="store_true", help="Report without committing"
     )
     args = parser.parse_args(argv)
 
-    report = seed(brand_id=args.brand, dry_run=args.dry_run)
+    report = seed(brand_slug=args.brand_slug, dry_run=args.dry_run)
     report.print_to(sys.stdout)
     return 0
 

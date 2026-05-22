@@ -10,12 +10,14 @@ from sqlalchemy.exc import IntegrityError
 
 from pipeline.admin import db as admin_db
 from pipeline.admin.models import (
+    Brand,
     PipelineConfig,
     Prompt,
     Run,
     Source,
     Topic,
 )
+from tests.unit.conftest import seed_icon_brand
 
 
 @pytest.fixture
@@ -34,9 +36,14 @@ def session(tmp_path):
         admin_db.reset_for_tests()
 
 
-def _make_source(session, **overrides) -> Source:
+@pytest.fixture
+def icon_brand_id(session) -> int:
+    return seed_icon_brand(session)
+
+
+def _make_source(session, brand_id_fk: int, **overrides) -> Source:
     defaults: dict = dict(
-        brand_id="icon",
+        brand_id_fk=brand_id_fk,
         name="Private Banker International",
         source_type="rss",
         url="https://example.com/feed",
@@ -52,9 +59,9 @@ def _make_source(session, **overrides) -> Source:
     return src
 
 
-def _make_run(session, **overrides) -> Run:
+def _make_run(session, brand_id_fk: int, **overrides) -> Run:
     defaults: dict = dict(
-        brand_id="icon",
+        brand_id_fk=brand_id_fk,
         triggered_by="manual",
         source_ids="[1]",
         started_at=datetime.now(tz=timezone.utc),
@@ -70,14 +77,16 @@ def _make_run(session, **overrides) -> Run:
 # --- Schema basics --------------------------------------------------------
 
 
-def test_all_five_tables_exist(session) -> None:
+def test_all_six_tables_exist(session) -> None:
     names = set(inspect(session.bind).get_table_names())
-    assert {"sources", "prompts", "pipeline_config", "runs", "topics"} <= names
+    assert {
+        "brands", "sources", "prompts", "pipeline_config", "runs", "topics"
+    } <= names
 
 
-def test_source_type_check_constraint_rejects_unknown(session) -> None:
+def test_source_type_check_constraint_rejects_unknown(session, icon_brand_id) -> None:
     src = Source(
-        brand_id="icon",
+        brand_id_fk=icon_brand_id,
         name="bad",
         source_type="podcast",  # not in {rss, web, telegram}
         url="https://example.com",
@@ -89,9 +98,9 @@ def test_source_type_check_constraint_rejects_unknown(session) -> None:
     session.rollback()
 
 
-def test_prompt_type_check_constraint_rejects_unknown(session) -> None:
+def test_prompt_type_check_constraint_rejects_unknown(session, icon_brand_id) -> None:
     p = Prompt(
-        brand_id="icon",
+        brand_id_fk=icon_brand_id,
         prompt_type="something_else",
         version_name="v1",
         content="...",
@@ -102,11 +111,11 @@ def test_prompt_type_check_constraint_rejects_unknown(session) -> None:
     session.rollback()
 
 
-def test_partial_unique_index_allows_many_inactive_prompts(session) -> None:
+def test_partial_unique_index_allows_many_inactive_prompts(session, icon_brand_id) -> None:
     for i in range(3):
         session.add(
             Prompt(
-                brand_id="icon",
+                brand_id_fk=icon_brand_id,
                 prompt_type="writer_polish",
                 version_name=f"v{i}",
                 content="x",
@@ -116,10 +125,10 @@ def test_partial_unique_index_allows_many_inactive_prompts(session) -> None:
     session.flush()
 
 
-def test_partial_unique_index_blocks_two_active_prompts_same_type(session) -> None:
+def test_partial_unique_index_blocks_two_active_prompts_same_type(session, icon_brand_id) -> None:
     session.add(
         Prompt(
-            brand_id="icon",
+            brand_id_fk=icon_brand_id,
             prompt_type="writer_polish",
             version_name="v1",
             content="x",
@@ -129,7 +138,7 @@ def test_partial_unique_index_blocks_two_active_prompts_same_type(session) -> No
     session.flush()
     session.add(
         Prompt(
-            brand_id="icon",
+            brand_id_fk=icon_brand_id,
             prompt_type="writer_polish",
             version_name="v2",
             content="y",
@@ -141,18 +150,18 @@ def test_partial_unique_index_blocks_two_active_prompts_same_type(session) -> No
     session.rollback()
 
 
-def test_partial_unique_index_allows_active_per_type(session) -> None:
+def test_partial_unique_index_allows_active_per_type(session, icon_brand_id) -> None:
     session.add_all(
         [
             Prompt(
-                brand_id="icon",
+                brand_id_fk=icon_brand_id,
                 prompt_type="writer_polish",
                 version_name="vp",
                 content="x",
                 is_active=True,
             ),
             Prompt(
-                brand_id="icon",
+                brand_id_fk=icon_brand_id,
                 prompt_type="writer_draft",
                 version_name="vd",
                 content="y",
@@ -166,9 +175,9 @@ def test_partial_unique_index_allows_active_per_type(session) -> None:
 # --- Cascade rules --------------------------------------------------------
 
 
-def test_deleting_run_cascades_to_topics(session) -> None:
-    src = _make_source(session)
-    run = _make_run(session)
+def test_deleting_run_cascades_to_topics(session, icon_brand_id) -> None:
+    src = _make_source(session, icon_brand_id)
+    run = _make_run(session, icon_brand_id)
     session.add(
         Topic(
             run_id=run.id,
@@ -186,9 +195,9 @@ def test_deleting_run_cascades_to_topics(session) -> None:
     assert session.scalars(select(Topic)).all() == []
 
 
-def test_deleting_source_with_topics_is_restricted(session) -> None:
-    src = _make_source(session)
-    run = _make_run(session)
+def test_deleting_source_with_topics_is_restricted(session, icon_brand_id) -> None:
+    src = _make_source(session, icon_brand_id)
+    run = _make_run(session, icon_brand_id)
     session.add(
         Topic(
             run_id=run.id,
@@ -206,9 +215,9 @@ def test_deleting_source_with_topics_is_restricted(session) -> None:
     session.rollback()
 
 
-def test_unique_topic_per_run(session) -> None:
-    src = _make_source(session)
-    run = _make_run(session)
+def test_unique_topic_per_run(session, icon_brand_id) -> None:
+    src = _make_source(session, icon_brand_id)
+    run = _make_run(session, icon_brand_id)
     session.add(
         Topic(
             run_id=run.id,
@@ -233,10 +242,10 @@ def test_unique_topic_per_run(session) -> None:
     session.rollback()
 
 
-def test_same_topic_id_across_different_runs_allowed(session) -> None:
-    src = _make_source(session)
-    run1 = _make_run(session)
-    run2 = _make_run(session)
+def test_same_topic_id_across_different_runs_allowed(session, icon_brand_id) -> None:
+    src = _make_source(session, icon_brand_id)
+    run1 = _make_run(session, icon_brand_id)
+    run2 = _make_run(session, icon_brand_id)
     session.add_all(
         [
             Topic(
@@ -259,10 +268,10 @@ def test_same_topic_id_across_different_runs_allowed(session) -> None:
     assert len(session.scalars(select(Topic)).all()) == 2
 
 
-def test_pipeline_config_singleton_per_brand(session) -> None:
+def test_pipeline_config_singleton_per_brand(session, icon_brand_id) -> None:
     session.add(
         PipelineConfig(
-            brand_id="icon",
+            brand_id_fk=icon_brand_id,
             scoring_threshold=7,
             topics_per_run=3,
             voice_profile="mission: x",
@@ -271,7 +280,7 @@ def test_pipeline_config_singleton_per_brand(session) -> None:
     session.flush()
     session.add(
         PipelineConfig(
-            brand_id="icon",  # same PK
+            brand_id_fk=icon_brand_id,  # same PK
             scoring_threshold=8,
             topics_per_run=4,
             voice_profile="y",

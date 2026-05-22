@@ -540,7 +540,7 @@ async def run_pipeline(
             "Stage 5 will load brand config from a Sanity `brand` collection."
         )
 
-    client = AdminConfigClient(brand_id=brand_slug)
+    client = AdminConfigClient(brand_slug=brand_slug)
     config = client.get_config()
     brand = icon_brand_config()
 
@@ -644,7 +644,21 @@ async def run_pipeline_for_run(run_id: int) -> None:
     """
     from pipeline.admin.config_client import AdminConfigClient  # noqa: PLC0415
 
-    client = AdminConfigClient()
+    # Resolve brand slug from the existing run row so the client uses the
+    # right brand context. Step 4 switches AdminConfigClient to take the
+    # brand_id_fk directly.
+    from pipeline.admin import db as admin_db_mod  # noqa: PLC0415
+    from pipeline.admin.models import Brand as BrandModel, Run as RunModel  # noqa: PLC0415
+
+    factory = admin_db_mod.get_session_factory()
+    with factory() as session:
+        run_row = session.get(RunModel, run_id)
+        if run_row is None:
+            raise LookupError(f"run {run_id} not found")
+        brand_row = session.get(BrandModel, run_row.brand_id_fk)
+        brand_slug = brand_row.slug if brand_row is not None else "icon"
+
+    client = AdminConfigClient(brand_slug=brand_slug)
     source_ids = client.get_run_source_ids(run_id)
 
     # Pull the SourceRecords for those ids out of admin.db. We bypass
@@ -667,10 +681,11 @@ async def run_pipeline_for_run(run_id: int) -> None:
         return
 
     # Re-enter the orchestrator with the existing run_id so it appends to
-    # the same row instead of creating a sibling.
+    # the same row instead of creating a sibling. All rows share the same
+    # brand_slug (M1 invariant — sources are brand-scoped).
     for source in rows:
         await run_pipeline(
-            brand_slug=source.brand_id,
+            brand_slug=brand_slug,
             source_id=str(source.id),
             source_url=source.url,
             language=Language.en,

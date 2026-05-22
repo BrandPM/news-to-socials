@@ -3,18 +3,62 @@
 Single source of truth for two consumers:
 
 * ``scripts/seed_admin_db.py`` — populates admin.db on first install.
-* ``pipeline/admin/config_client.py`` — used by ``run_pipeline`` as the
-  fallback when admin.db is missing or empty, so the existing systemd
-  timer keeps producing drafts during the S2/S3 rollout window.
+* tests that pre-populate a brand row before exercising Source/Prompt/etc.
+
+The seed surface covers three layers:
+
+1. **Brands** — Icon (active, real Sanity creds from .env) + 4
+   placeholder drafts. Idempotent by slug. Once a brand exists in the
+   DB, the seed NEVER overwrites its credentials (operator may have
+   edited them via the UI; we don't want to silently undo that).
+2. **Sources** for Icon — three RSS feeds (Private Banker Int'l +
+   Bloomberg + CNBC).
+3. **Prompts** for Icon — active polish + draft from the live
+   ``comment_writer`` module.
 
 If you need to *change* a seed value at runtime, update admin.db through
-the API — don't edit this file. This file is only authoritative when
-admin.db doesn't yet exist or has been wiped.
+the API — don't edit this file.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+
+# ---------------------------------------------------------------------------
+# Brand seeds
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlaceholderBrandSeed:
+    slug: str
+    name: str
+    language: str = "en"
+    timezone: str = "Europe/Madrid"
+
+
+# Five fintech brands per founding requirements (NTS_017 + NTS_025). Icon
+# is the only active brand at S3 deploy time; the other four are seeded
+# as status='draft' so they appear in the brand switcher with a "Setup
+# required" marker but cannot run the pipeline.
+PLACEHOLDER_BRAND_SEEDS: tuple[PlaceholderBrandSeed, ...] = (
+    PlaceholderBrandSeed(slug="neovox", name="Neovox"),
+    PlaceholderBrandSeed(slug="creolix", name="Creolix"),
+    PlaceholderBrandSeed(slug="vilatrix", name="Vilatrix"),
+    PlaceholderBrandSeed(slug="nexora", name="Nexora"),
+)
+
+
+ICON_BRAND_SLUG = "icon"
+ICON_BRAND_NAME = "Icon Finance"
+ICON_BRAND_LANGUAGE = "en"
+ICON_BRAND_TIMEZONE = "Europe/Madrid"
+
+
+# ---------------------------------------------------------------------------
+# Source seeds (Icon)
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -30,9 +74,8 @@ class SeedSource:
 # Three Icon-brand sources tracked in production. Only privatebanker is
 # actively scored in the current pipeline (matches the systemd ExecStart);
 # Bloomberg Wealth and CNBC Wealth ran zero passes on 2026-05-21 per
-# IT_PROJ_NTS_021, so they are seeded as **inactive** until Andriy
-# verifies the feed URLs in the admin UI (S2). The S1 contract is "3
-# seeded rows in /sources", not "3 active sources".
+# IT_PROJ_NTS_021, so they are seeded as inactive until Andriy verifies
+# the feed URLs in the admin UI.
 ICON_SEED_SOURCES: tuple[SeedSource, ...] = (
     SeedSource(
         name="Private Banker International",
@@ -59,6 +102,11 @@ ICON_SEED_SOURCES: tuple[SeedSource, ...] = (
         polling_minutes=720,
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Prompt seeds (Icon)
+# ---------------------------------------------------------------------------
 
 
 # The active polish prompt is imported lazily at seed time to avoid a

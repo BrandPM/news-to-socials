@@ -8,6 +8,11 @@ two reasons:
 2. Pydantic's validators run on every request, so a bad payload fails
    fast at the route boundary instead of bubbling up as an ORM error
    halfway through the handler.
+
+After the multi-brand refactor (NTS_025), the wire-format ``brand_id``
+field is an integer that maps to ``brands.id``. The model attribute is
+``brand_id_fk`` to make the FK relationship obvious in code; the wire
+format keeps the friendlier name.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 SourceType = Literal["rss", "web", "telegram"]
 PromptType = Literal["writer_polish", "writer_draft", "topic_picker", "image_prompt"]
-RunStatus = Literal["running", "success", "failed"]
+RunStatus = Literal["running", "success", "failed", "dry_run"]
 TopicStatus = Literal[
     "passed", "filtered_banned", "filtered_dup", "filtered_score", "failed"
 ]
@@ -32,7 +37,7 @@ TopicStatus = Literal[
 class SourceIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    brand_id: str
+    brand_id: int
     name: str
     source_type: SourceType
     url: HttpUrl
@@ -59,8 +64,10 @@ class SourceUpdate(BaseModel):
 
 
 class SourceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
-    brand_id: str
+    brand_id: int = Field(validation_alias="brand_id_fk")
     name: str
     source_type: SourceType
     url: str
@@ -99,7 +106,7 @@ class RunTriggerOut(BaseModel):
 class PromptIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    brand_id: str
+    brand_id: int
     prompt_type: PromptType
     version_name: str
     content: str
@@ -107,8 +114,10 @@ class PromptIn(BaseModel):
 
 
 class PromptOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
-    brand_id: str
+    brand_id: int = Field(validation_alias="brand_id_fk")
     prompt_type: PromptType
     version_name: str
     content: str
@@ -142,7 +151,9 @@ class PromptTestOut(BaseModel):
 
 
 class PipelineConfigOut(BaseModel):
-    brand_id: str
+    model_config = ConfigDict(from_attributes=True)
+
+    brand_id: int = Field(validation_alias="brand_id_fk")
     scoring_threshold: int
     topics_per_run: int
     banned_phrases: list[str]
@@ -170,6 +181,8 @@ class PipelineConfigUpdate(BaseModel):
 
 
 class TopicOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     topic_id: str
     source_id: int
@@ -183,8 +196,10 @@ class TopicOut(BaseModel):
 
 
 class RunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
-    brand_id: str
+    brand_id: int = Field(validation_alias="brand_id_fk")
     triggered_by: str
     source_ids: list[int]
     started_at: datetime

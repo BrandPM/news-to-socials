@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
@@ -20,6 +19,7 @@ from pipeline.admin import db as admin_db
 from pipeline.admin.models import PipelineConfig, Run, Source, Topic
 from pipeline.common import config as config_module
 from pipeline.common.models import Language, RawItem
+from tests.unit.conftest import seed_icon_brand
 
 
 @pytest.fixture
@@ -32,9 +32,10 @@ def fresh_admin_db_with_source(tmp_path, monkeypatch):
 
     factory = admin_db.get_session_factory()
     with factory() as session:
+        icon_id = seed_icon_brand(session)
         session.add(
             Source(
-                brand_id="icon",
+                brand_id_fk=icon_id,
                 name="Test Feed",
                 source_type="rss",
                 url="https://test.example.com/feed",
@@ -44,7 +45,7 @@ def fresh_admin_db_with_source(tmp_path, monkeypatch):
         )
         session.add(
             PipelineConfig(
-                brand_id="icon",
+                brand_id_fk=icon_id,
                 scoring_threshold=6,
                 topics_per_run=3,
                 banned_phrases=json.dumps(["delve into"]),
@@ -52,7 +53,7 @@ def fresh_admin_db_with_source(tmp_path, monkeypatch):
             )
         )
         session.commit()
-    yield tmp_path / "admin.db"
+    yield {"path": tmp_path / "admin.db", "icon_id": icon_id}
     admin_db.reset_for_tests()
 
 
@@ -85,7 +86,6 @@ def _mock_externals(monkeypatch):
     )
 
     async def fake_score(items, brand, *, min_score, limit_pool):  # noqa: ANN001
-        # Score everything at 8 so it passes any threshold ≤8.
         return [(it, 8) for it in items[:limit_pool]]
 
     monkeypatch.setattr(pipe, "score_relevant_topics", fake_score)
@@ -111,12 +111,10 @@ def _mock_externals(monkeypatch):
             body="Body for " + topic.raw.title,
             key_takeaway="kt",
         )
-        return draft, None  # no image
+        return draft, None
 
     monkeypatch.setattr(pipe, "generate_with_image", fake_generate)
 
-    # Sanity publisher: never call the real one — replace with a stub that
-    # records draft creations.
     class FakeSanity:
         def __init__(self) -> None:
             self.created: list[dict] = []
@@ -152,11 +150,9 @@ def test_run_pipeline_reads_admin_db_writes_runs_topics(
             triggered_by="cron",
         )
     )
-    # Two topics → two drafts.
     assert len(results) == 2
     assert len(fake_sanity.created) == 2
 
-    # Run + topics rows written.
     factory = admin_db.get_session_factory()
     with factory() as session:
         runs = list(session.scalars(select(Run)))
@@ -176,17 +172,12 @@ def test_run_pipeline_reads_admin_db_writes_runs_topics(
 
 def test_run_pipeline_falls_back_when_admin_db_missing(tmp_path, monkeypatch) -> None:
     """The systemd timer must keep working until S3 ships, even if
-    admin.db doesn't exist on the VPS. The pipeline must:
-
-    1. NOT raise because admin.db is absent.
-    2. Use the hardcoded seed source list (Private Banker active).
-    3. NOT write to runs/topics tables (there are none).
-    """
+    admin.db doesn't exist on the VPS."""
     monkeypatch.setattr(config_module, "_settings", None)
     monkeypatch.setenv("ADMIN_DB_PATH", str(tmp_path / "missing.db"))
     admin_db.reset_for_tests()
 
-    fake_sanity = _mock_externals(monkeypatch)
+    _mock_externals(monkeypatch)
 
     from pipeline.run import run_pipeline
 
@@ -198,18 +189,13 @@ def test_run_pipeline_falls_back_when_admin_db_missing(tmp_path, monkeypatch) ->
             dry_run=False,
         )
     )
-    assert len(results) == 2  # two drafts created from the fallback source
-    # admin.db never came into existence — verify.
+    assert len(results) == 2
     assert not (tmp_path / "missing.db").exists()
 
 
 def test_run_pipeline_with_source_id_url_overrides_admin_db(
     fresh_admin_db_with_source, monkeypatch
 ) -> None:
-    """The systemd timer currently passes --source-id/--source-url. Those
-    overrides must take precedence over admin.db's source list so we keep
-    backwards compatibility during the rollout.
-    """
     _mock_externals(monkeypatch)
     from pipeline.run import run_pipeline
 
@@ -223,17 +209,12 @@ def test_run_pipeline_with_source_id_url_overrides_admin_db(
             dry_run=False,
         )
     )
-    # The override source has id=None → no topics rows written (FK would
-    # fail), but the run row should still record finish status.
     factory = admin_db.get_session_factory()
     with factory() as session:
         runs = list(session.scalars(select(Run)))
-        # source_ids was [] (override has no DB id), but the run was recorded.
         assert len(runs) == 1
         assert json.loads(runs[0].source_ids) == []
         topics = list(session.scalars(select(Topic)))
-        # Override path doesn't write topics (no source_id) — that's fine
-        # for the back-compat window.
         assert topics == []
     assert len(results) == 2
 
@@ -241,18 +222,18 @@ def test_run_pipeline_with_source_id_url_overrides_admin_db(
 def test_run_pipeline_for_run_executes_existing_row(
     fresh_admin_db_with_source, monkeypatch
 ) -> None:
-    """``run_pipeline_for_run`` is the entry point used by the BackgroundTasks
-    queue (``POST /sources/{id}/run``). It must update the pre-existing
-    run row instead of creating a new one.
-    """
+    """run_pipeline_for_run is the entry point used by the BackgroundTasks
+    queue (POST /sources/{id}/run). It must update the pre-existing run
+    row instead of creating a new one."""
     _mock_externals(monkeypatch)
+    icon_id = fresh_admin_db_with_source["icon_id"]
 
     factory = admin_db.get_session_factory()
     with factory() as session:
         src = session.scalars(select(Source)).first()
         assert src is not None
         run = Run(
-            brand_id="icon",
+            brand_id_fk=icon_id,
             triggered_by="manual",
             source_ids=json.dumps([src.id]),
             started_at=datetime.now(tz=timezone.utc),
@@ -268,7 +249,6 @@ def test_run_pipeline_for_run_executes_existing_row(
 
     with factory() as session:
         rows = list(session.scalars(select(Run)))
-        # Still exactly one run — same row updated, not a sibling.
         assert len(rows) == 1
         assert rows[0].id == run_id
         assert rows[0].status == "success"

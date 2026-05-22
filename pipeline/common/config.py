@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     admin_cors_origin: str = "http://localhost:3000"
     admin_log_path: Path = Path("/var/log/news-to-socials/run.log")
 
+    # Master Fernet key for per-brand credential encryption in admin.db.
+    # Same value must be set on Mac + VPS .env. repr=False keeps the key
+    # out of any accidental `print(settings)` or structlog `event=settings`.
+    # NTS_025 § "Credential encryption".
+    brands_encryption_key: str = Field(default="", repr=False)
+
     # Optional services
     ml_service_url: str = ""
     browser_render_url: str = ""

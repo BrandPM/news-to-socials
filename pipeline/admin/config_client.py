@@ -1,23 +1,16 @@
-"""Bridge between the pipeline and admin.db.
+"""Bridge between the pipeline and admin.db (multi-brand aware).
 
-The pipeline (``pipeline/run.py``) was previously parameterised by a single
-hardcoded ``icon_brand_config()`` call. With the admin UI in flight we
-want the same orchestrator to:
+The pipeline reads its source list / config / active prompts from
+``admin.db`` through this client. Step 2 of S3 (NTS_025) refactors all
+internal queries to use the ``brand_id_fk`` integer FK; the public
+interface still takes a brand slug for back-compat with the systemd
+ExecStart and the existing tests. Step 4 will switch the constructor
+to take ``brand_id: int`` directly and add a ``BrandNotReadyError``
+path.
 
-* read its source list from ``admin.db`` (sources table where active=1)
-* read the active ``writer_polish`` prompt from ``admin.db``
-* read scoring threshold / topics-per-run / voice profile from
-  ``admin.db`` (pipeline_config row)
-* write per-run history to ``admin.db`` (runs + topics tables)
-
-…BUT keep the existing systemd timer working through the rollout
-window. So when admin.db is absent or empty, we transparently fall
-back to the hardcoded ``icon_brand_config()``. The fallback is an
-invariant (Admin-UI-Specific Invariant B in the NTS_014 spec).
-
-The client is sync. The pipeline calls into it from async code via
-``run_in_threadpool`` where needed — SQLite is serial anyway and the
-admin tables are tiny.
+When admin.db is missing OR the brand row doesn't exist yet, ``get_*``
+methods fall back to the hardcoded seed list — see Admin-UI-Specific
+Invariant B (NTS_014). This back-compat path is removed in Step 4.
 """
 
 from __future__ import annotations
@@ -33,6 +26,7 @@ from sqlalchemy import select
 from pipeline.admin import db as admin_db
 from pipeline.admin import seed_data
 from pipeline.admin.models import (
+    Brand,
     PipelineConfig,
     Prompt,
     Run,
@@ -61,56 +55,59 @@ class ConfigRecord:
 
 
 class AdminConfigClient:
-    """Read/write the admin DB. Falls back to ``icon_brand_config()``
-    transparently when admin.db is absent or empty.
+    """Read/write admin.db scoped to a single brand.
 
-    The check is performed lazily on each call — if the operator runs
-    ``alembic upgrade head`` mid-session, the pipeline will pick up the
-    new schema on the next run without a process restart.
+    ``brand_slug`` selects the brand; the constructor does NOT load the
+    row — that happens lazily on the first method call so a missing
+    admin.db doesn't blow up at import time.
     """
 
-    def __init__(self, brand_id: str = "icon") -> None:
-        self.brand_id = brand_id
+    def __init__(self, brand_slug: str = "icon") -> None:
+        self.brand_slug = brand_slug
 
     # --- existence checks ----------------------------------------------
 
     def admin_db_available(self) -> bool:
-        """``True`` iff the SQLite file exists AND has the sources table."""
+        """``True`` iff the SQLite file exists AND has the brands table."""
         path = Path(get_settings().admin_db_path).expanduser()
         if not path.exists():
             return False
         try:
             factory = admin_db.get_session_factory()
             with factory() as session:
-                session.execute(select(Source).limit(1))
+                session.execute(select(Brand).limit(1))
             return True
         except Exception:  # noqa: BLE001
             return False
 
+    def _resolve_brand_id_fk(self) -> int | None:
+        """Look up brands.id for ``self.brand_slug``. Returns ``None``
+        when admin.db is missing or the brand row doesn't exist."""
+        if not self.admin_db_available():
+            return None
+        factory = admin_db.get_session_factory()
+        with factory() as session:
+            row = session.execute(
+                select(Brand).where(Brand.slug == self.brand_slug)
+            ).scalar_one_or_none()
+        return row.id if row is not None else None
+
     # --- sources --------------------------------------------------------
 
     def get_active_sources(self) -> list[SourceRecord]:
-        """Active sources for ``brand_id``. Falls back to seed data when
-        admin.db is missing OR contains zero active sources for this brand.
-
-        The "zero active sources" check is important: an admin user might
-        deactivate every source temporarily, and we don't want the timer
-        to drift back to hardcoded URLs at that point. So we only fall
-        back when admin.db itself is unusable (missing/no table).
-        """
-        if not self.admin_db_available():
+        """Active sources for this brand. Falls back to seed data when
+        admin.db is missing, brand row absent, or zero active sources."""
+        brand_id_fk = self._resolve_brand_id_fk()
+        if brand_id_fk is None:
             return self._fallback_sources()
         factory = admin_db.get_session_factory()
         with factory() as session:
             rows = session.scalars(
                 select(Source).where(
-                    Source.brand_id == self.brand_id, Source.active.is_(True)
+                    Source.brand_id_fk == brand_id_fk, Source.active.is_(True)
                 )
             ).all()
         if not rows:
-            # Schema present but no active rows — still fall back so the
-            # systemd timer keeps producing drafts. The admin UI is the
-            # right place to fix this; the pipeline shouldn't fail silently.
             return self._fallback_sources()
         return [
             SourceRecord(
@@ -142,16 +139,15 @@ class AdminConfigClient:
 
     def get_active_prompt(self, prompt_type: str) -> tuple[str, str] | None:
         """Return ``(version_name, content)`` for the active prompt or
-        ``None`` if no active prompt exists. The pipeline falls back to
-        the in-repo prompt module when this returns None.
-        """
-        if not self.admin_db_available():
+        ``None`` if no active prompt exists."""
+        brand_id_fk = self._resolve_brand_id_fk()
+        if brand_id_fk is None:
             return None
         factory = admin_db.get_session_factory()
         with factory() as session:
             row = session.scalars(
                 select(Prompt).where(
-                    Prompt.brand_id == self.brand_id,
+                    Prompt.brand_id_fk == brand_id_fk,
                     Prompt.prompt_type == prompt_type,
                     Prompt.is_active.is_(True),
                 )
@@ -164,12 +160,12 @@ class AdminConfigClient:
 
     def get_config(self) -> ConfigRecord:
         """Return the live config row. Falls back to hardcoded defaults
-        when admin.db is missing or has no row for this brand.
-        """
-        if self.admin_db_available():
+        when admin.db is missing, brand absent, or no config row."""
+        brand_id_fk = self._resolve_brand_id_fk()
+        if brand_id_fk is not None:
             factory = admin_db.get_session_factory()
             with factory() as session:
-                row = session.get(PipelineConfig, self.brand_id)
+                row = session.get(PipelineConfig, brand_id_fk)
             if row is not None:
                 banned = (
                     json.loads(row.banned_phrases) if row.banned_phrases else []
@@ -180,8 +176,6 @@ class AdminConfigClient:
                     banned_phrases=banned,
                     voice_profile=row.voice_profile,
                 )
-        # Fallback: pull the voice_profile YAML straight from the hardcoded
-        # brand config, parse banned phrases out of it.
         from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
         from pipeline.run import icon_brand_config  # noqa: PLC0415
 
@@ -202,14 +196,14 @@ class AdminConfigClient:
         triggered_by: str = "cron",
     ) -> int | None:
         """Create a new ``runs`` row and return its id. Returns ``None``
-        if admin.db is unavailable (fallback path).
-        """
-        if not self.admin_db_available():
+        if admin.db / brand row are unavailable."""
+        brand_id_fk = self._resolve_brand_id_fk()
+        if brand_id_fk is None:
             return None
         factory = admin_db.get_session_factory()
         with factory() as session:
             run = Run(
-                brand_id=self.brand_id,
+                brand_id_fk=brand_id_fk,
                 triggered_by=triggered_by,
                 source_ids=json.dumps(source_ids),
                 started_at=datetime.now(tz=timezone.utc),
@@ -221,7 +215,7 @@ class AdminConfigClient:
 
     def record_run_finish(
         self,
-        run_id: int,
+        run_id: int | None,
         *,
         status: str,
         stats: dict[str, Any] | None = None,
@@ -256,8 +250,7 @@ class AdminConfigClient:
         draft_id: str | None = None,
     ) -> None:
         """Record a per-topic row. No-ops when run_id or source_id is None
-        (fallback path doesn't have DB rows to FK against).
-        """
+        (fallback path doesn't have DB rows to FK against)."""
         if run_id is None or source_id is None:
             return
         factory = admin_db.get_session_factory()

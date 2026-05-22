@@ -15,27 +15,27 @@ router = APIRouter()
 
 
 @router.get("", response_model=PipelineConfigOut)
-def get_config(brand_id: str = "icon") -> PipelineConfigOut:
+def get_config(brand_id: int) -> PipelineConfigOut:
     with session_scope() as session:
         cfg = session.get(PipelineConfig, brand_id)
         if cfg is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"no config row for brand_id={brand_id!r} — run seed_admin_db first",
+                detail=f"no config row for brand_id={brand_id} — run seed_admin_db first",
             )
-        return PipelineConfigOut.model_validate(cfg, from_attributes=True)
+        return PipelineConfigOut.model_validate(cfg)
 
 
 @router.put("", response_model=PipelineConfigOut)
 def update_config(
-    payload: PipelineConfigUpdate, brand_id: str = "icon"
+    payload: PipelineConfigUpdate, brand_id: int
 ) -> PipelineConfigOut:
     with session_scope() as session:
         cfg = session.get(PipelineConfig, brand_id)
         if cfg is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"no config row for brand_id={brand_id!r}",
+                detail=f"no config row for brand_id={brand_id}",
             )
         data = payload.model_dump(exclude_unset=True)
         if "banned_phrases" in data and data["banned_phrases"] is not None:
@@ -46,4 +46,4 @@ def update_config(
             setattr(cfg, k, v)
         cfg.updated_at = datetime.now(tz=timezone.utc)
         session.flush()
-        return PipelineConfigOut.model_validate(cfg, from_attributes=True)
+        return PipelineConfigOut.model_validate(cfg)

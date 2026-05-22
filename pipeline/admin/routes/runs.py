@@ -17,14 +17,14 @@ router = APIRouter()
 
 @router.get("", response_model=list[RunOut])
 def list_runs(
-    brand_id: str | None = None, limit: int = 20, offset: int = 0
+    brand_id: int | None = None, limit: int = 20, offset: int = 0
 ) -> list[RunOut]:
     with session_scope() as session:
         stmt = select(Run).order_by(Run.started_at.desc())
         if brand_id is not None:
-            stmt = stmt.where(Run.brand_id == brand_id)
+            stmt = stmt.where(Run.brand_id_fk == brand_id)
         stmt = stmt.offset(offset).limit(limit)
-        return [RunOut.model_validate(r, from_attributes=True) for r in session.scalars(stmt)]
+        return [RunOut.model_validate(r) for r in session.scalars(stmt)]
 
 
 @router.get("/{run_id}", response_model=RunDetailOut)
@@ -39,8 +39,8 @@ def get_run(run_id: int) -> RunDetailOut:
             )
         )
         return RunDetailOut(
-            run=RunOut.model_validate(r, from_attributes=True),
-            topics=[TopicOut.model_validate(t, from_attributes=True) for t in topics],
+            run=RunOut.model_validate(r),
+            topics=[TopicOut.model_validate(t) for t in topics],
         )
 
 

@@ -9,13 +9,15 @@ from pipeline.admin import db as admin_db
 from pipeline.admin import jobs as admin_jobs
 from pipeline.admin.models import Run, Source, Topic
 from pipeline.common import config as config_module
+from tests.unit.conftest import seed_brand, seed_icon_brand
 
 ADMIN_TOKEN = "test-token-123"
 AUTH = {"X-Admin-Token": ADMIN_TOKEN}
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client_and_brands(tmp_path, monkeypatch):
+    """TestClient + (icon_brand_id, other_brand_id) tuple."""
     monkeypatch.setattr(config_module, "_settings", None)
     monkeypatch.setenv("ADMIN_TRIGGER_SECRET", ADMIN_TOKEN)
     monkeypatch.setenv("ADMIN_DB_PATH", str(tmp_path / "admin.db"))
@@ -24,17 +26,32 @@ def client(tmp_path, monkeypatch):
     engine = admin_db.get_engine(path=tmp_path / "admin.db")
     admin_db.Base.metadata.create_all(engine)
 
-    # Recreate the app *after* env is set so create_app() sees the right
-    # CORS origin and the routes pick up the new session factory.
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        icon_id = seed_icon_brand(session)
+        other_id = seed_brand(session, slug="other", name="Other").id
+        session.commit()
+
     from pipeline.admin.server import create_app
 
-    yield TestClient(create_app())
+    yield TestClient(create_app()), icon_id, other_id
     admin_db.reset_for_tests()
 
 
-def _make_payload(**overrides):
+@pytest.fixture
+def client(client_and_brands):
+    """Backwards-compatible single-brand client fixture."""
+    return client_and_brands[0]
+
+
+@pytest.fixture
+def icon_brand_id(client_and_brands) -> int:
+    return client_and_brands[1]
+
+
+def _make_payload(icon_brand_id: int, **overrides):
     base = {
-        "brand_id": "icon",
+        "brand_id": icon_brand_id,
         "name": "Private Banker International",
         "source_type": "rss",
         "url": "https://www.privatebankerinternational.com/feed/",
@@ -56,13 +73,16 @@ def test_list_empty(client) -> None:
     assert resp.json() == []
 
 
-def test_create_then_get_then_list(client) -> None:
-    resp = client.post("/api/v1/sources", headers=AUTH, json=_make_payload())
+def test_create_then_get_then_list(client, icon_brand_id) -> None:
+    resp = client.post(
+        "/api/v1/sources", headers=AUTH, json=_make_payload(icon_brand_id)
+    )
     assert resp.status_code == 201, resp.text
     created = resp.json()
     assert created["id"] >= 1
     assert created["name"] == "Private Banker International"
     assert created["active"] is True
+    assert created["brand_id"] == icon_brand_id
 
     src_id = created["id"]
     resp = client.get(f"/api/v1/sources/{src_id}", headers=AUTH)
@@ -73,18 +93,25 @@ def test_create_then_get_then_list(client) -> None:
     assert len(resp.json()) == 1
 
 
-def test_list_filters_by_brand_id(client) -> None:
-    client.post("/api/v1/sources", headers=AUTH, json=_make_payload(brand_id="icon"))
-    client.post("/api/v1/sources", headers=AUTH, json=_make_payload(brand_id="other"))
-    resp = client.get("/api/v1/sources?brand_id=icon", headers=AUTH)
+def test_list_filters_by_brand_id(client_and_brands) -> None:
+    client, icon_id, other_id = client_and_brands
+    client.post(
+        "/api/v1/sources", headers=AUTH, json=_make_payload(icon_id)
+    )
+    client.post(
+        "/api/v1/sources",
+        headers=AUTH,
+        json=_make_payload(other_id, url="https://other.example.com/feed"),
+    )
+    resp = client.get(f"/api/v1/sources?brand_id={icon_id}", headers=AUTH)
     assert resp.status_code == 200
     assert len(resp.json()) == 1
-    assert resp.json()[0]["brand_id"] == "icon"
+    assert resp.json()[0]["brand_id"] == icon_id
 
 
-def test_update_partial(client) -> None:
+def test_update_partial(client, icon_brand_id) -> None:
     created = client.post(
-        "/api/v1/sources", headers=AUTH, json=_make_payload()
+        "/api/v1/sources", headers=AUTH, json=_make_payload(icon_brand_id)
     ).json()
     resp = client.put(
         f"/api/v1/sources/{created['id']}",
@@ -95,32 +122,29 @@ def test_update_partial(client) -> None:
     body = resp.json()
     assert body["active"] is False
     assert body["polling_minutes"] == 60
-    # untouched fields preserved
     assert body["name"] == "Private Banker International"
 
 
-def test_delete_clean(client) -> None:
+def test_delete_clean(client, icon_brand_id) -> None:
     created = client.post(
-        "/api/v1/sources", headers=AUTH, json=_make_payload()
+        "/api/v1/sources", headers=AUTH, json=_make_payload(icon_brand_id)
     ).json()
     resp = client.delete(f"/api/v1/sources/{created['id']}", headers=AUTH)
     assert resp.status_code == 204
-    # Subsequent GET → 404
     resp = client.get(f"/api/v1/sources/{created['id']}", headers=AUTH)
     assert resp.status_code == 404
 
 
-def test_delete_blocked_when_topics_reference_source(client, tmp_path) -> None:
+def test_delete_blocked_when_topics_reference_source(client, icon_brand_id) -> None:
     created = client.post(
-        "/api/v1/sources", headers=AUTH, json=_make_payload()
+        "/api/v1/sources", headers=AUTH, json=_make_payload(icon_brand_id)
     ).json()
-    # Attach a Run + Topic referencing this source.
     from datetime import datetime, timezone
 
     factory = admin_db.get_session_factory()
     with factory() as session:
         run = Run(
-            brand_id="icon",
+            brand_id_fk=icon_brand_id,
             triggered_by="manual",
             source_ids=f"[{created['id']}]",
             started_at=datetime.now(tz=timezone.utc),
@@ -143,13 +167,13 @@ def test_delete_blocked_when_topics_reference_source(client, tmp_path) -> None:
     assert "topic" in resp.json()["detail"].lower()
 
 
-def test_create_rejects_invalid_source_type(client) -> None:
+def test_create_rejects_invalid_source_type(client, icon_brand_id) -> None:
     resp = client.post(
         "/api/v1/sources",
         headers=AUTH,
-        json=_make_payload(source_type="podcast"),
+        json=_make_payload(icon_brand_id, source_type="podcast"),
     )
-    assert resp.status_code == 422  # pydantic-level rejection
+    assert resp.status_code == 422
 
 
 def test_unauth_get_returns_401(client) -> None:
@@ -157,13 +181,22 @@ def test_unauth_get_returns_401(client) -> None:
     assert resp.status_code == 401
 
 
+def test_create_rejects_unknown_brand_id(client) -> None:
+    resp = client.post(
+        "/api/v1/sources",
+        headers=AUTH,
+        json=_make_payload(999999),  # no such brand
+    )
+    assert resp.status_code == 422
+    assert "brand" in resp.json()["detail"].lower()
+
+
 # --- Test + Run ---------------------------------------------------------
 
 
-def test_test_parse_returns_headlines(monkeypatch, client) -> None:
-    """``POST /{id}/test`` must NOT write to DB and must call RssSource.fetch."""
+def test_test_parse_returns_headlines(monkeypatch, client, icon_brand_id) -> None:
     created = client.post(
-        "/api/v1/sources", headers=AUTH, json=_make_payload()
+        "/api/v1/sources", headers=AUTH, json=_make_payload(icon_brand_id)
     ).json()
 
     from pipeline.common.models import RawItem
@@ -198,11 +231,11 @@ def test_test_parse_returns_headlines(monkeypatch, client) -> None:
     assert body["headlines"][0]["title"] == "Headline A"
 
 
-def test_test_parse_reports_error_without_raising(monkeypatch, client) -> None:
+def test_test_parse_reports_error_without_raising(monkeypatch, client, icon_brand_id) -> None:
     created = client.post(
         "/api/v1/sources",
         headers=AUTH,
-        json=_make_payload(url="https://invalid.example.com/feed"),
+        json=_make_payload(icon_brand_id, url="https://invalid.example.com/feed"),
     ).json()
 
     from pipeline.sources import rss as rss_mod
@@ -220,10 +253,9 @@ def test_test_parse_reports_error_without_raising(monkeypatch, client) -> None:
     assert "connect timeout" in body["error"]
 
 
-def test_run_creates_run_row_returns_202(monkeypatch, client) -> None:
-    """``POST /{id}/run`` schedules the background task and returns 202."""
+def test_run_creates_run_row_returns_202(monkeypatch, client, icon_brand_id) -> None:
     created = client.post(
-        "/api/v1/sources", headers=AUTH, json=_make_payload()
+        "/api/v1/sources", headers=AUTH, json=_make_payload(icon_brand_id)
     ).json()
 
     called: list[int] = []
@@ -237,11 +269,8 @@ def test_run_creates_run_row_returns_202(monkeypatch, client) -> None:
     assert resp.status_code == 202
     run_id = resp.json()["run_id"]
     assert isinstance(run_id, int) and run_id >= 1
-    # TestClient drains BackgroundTasks before returning — execute should
-    # have been invoked.
     assert called == [run_id]
 
-    # And there is a runs row.
     factory = admin_db.get_session_factory()
     with factory() as session:
         row = session.get(Run, run_id)

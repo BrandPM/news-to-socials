@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from pipeline.admin.db import session_scope
 from pipeline.admin.models import Prompt
@@ -35,7 +36,7 @@ _SAMPLE_TOPIC = {
 
 @router.get("", response_model=list[PromptOut])
 def list_prompts(
-    brand_id: str | None = None,
+    brand_id: int | None = None,
     prompt_type: PromptType | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -43,14 +44,11 @@ def list_prompts(
     with session_scope() as session:
         stmt = select(Prompt).order_by(Prompt.created_at.desc())
         if brand_id is not None:
-            stmt = stmt.where(Prompt.brand_id == brand_id)
+            stmt = stmt.where(Prompt.brand_id_fk == brand_id)
         if prompt_type is not None:
             stmt = stmt.where(Prompt.prompt_type == prompt_type)
         stmt = stmt.offset(offset).limit(limit)
-        return [
-            PromptOut.model_validate(p, from_attributes=True)
-            for p in session.scalars(stmt)
-        ]
+        return [PromptOut.model_validate(p) for p in session.scalars(stmt)]
 
 
 @router.get("/{prompt_id}", response_model=PromptOut)
@@ -59,14 +57,14 @@ def get_prompt(prompt_id: int) -> PromptOut:
         p = session.get(Prompt, prompt_id)
         if p is None:
             raise HTTPException(status_code=404, detail="prompt not found")
-        return PromptOut.model_validate(p, from_attributes=True)
+        return PromptOut.model_validate(p)
 
 
 @router.post("", response_model=PromptOut, status_code=status.HTTP_201_CREATED)
 def create_prompt(payload: PromptIn) -> PromptOut:
     with session_scope() as session:
         p = Prompt(
-            brand_id=payload.brand_id,
+            brand_id_fk=payload.brand_id,
             prompt_type=payload.prompt_type,
             version_name=payload.version_name,
             content=payload.content,
@@ -75,13 +73,19 @@ def create_prompt(payload: PromptIn) -> PromptOut:
             created_by="human",
         )
         session.add(p)
-        session.flush()
-        return PromptOut.model_validate(p, from_attributes=True)
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"brand_id={payload.brand_id} does not reference an existing brand",
+            ) from exc
+        return PromptOut.model_validate(p)
 
 
 @router.post("/{prompt_id}/activate", response_model=PromptOut)
 def activate_prompt(prompt_id: int) -> PromptOut:
-    """Make this prompt the active one for its (brand_id, prompt_type).
+    """Make this prompt the active one for its (brand_id_fk, prompt_type).
 
     Runs in a single transaction so we never end up with two active rows
     (the partial UNIQUE index would reject it anyway, but the transaction
@@ -91,12 +95,10 @@ def activate_prompt(prompt_id: int) -> PromptOut:
         p = session.get(Prompt, prompt_id)
         if p is None:
             raise HTTPException(status_code=404, detail="prompt not found")
-        # Deactivate the current active row first to satisfy the partial
-        # UNIQUE index, then activate the requested one.
         session.execute(
             update(Prompt)
             .where(
-                Prompt.brand_id == p.brand_id,
+                Prompt.brand_id_fk == p.brand_id_fk,
                 Prompt.prompt_type == p.prompt_type,
                 Prompt.is_active.is_(True),
                 Prompt.id != p.id,
@@ -105,7 +107,7 @@ def activate_prompt(prompt_id: int) -> PromptOut:
         )
         p.is_active = True
         session.flush()
-        return PromptOut.model_validate(p, from_attributes=True)
+        return PromptOut.model_validate(p)
 
 
 @router.delete("/{prompt_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -127,8 +129,7 @@ async def test_prompt(prompt_id: int, payload: PromptTestIn) -> PromptTestOut:
     """Render the prompt against a sample topic and return the LLM output.
 
     Doesn't save anything. The sample topic is a fixed string so two
-    test runs of the same prompt are comparable — this becomes a real
-    "snapshot diff" feature in S2.
+    test runs of the same prompt are comparable.
     """
     from pipeline.admin import llm  # noqa: PLC0415
 
@@ -138,11 +139,13 @@ async def test_prompt(prompt_id: int, payload: PromptTestIn) -> PromptTestOut:
             raise HTTPException(status_code=404, detail="prompt not found")
         prompt_content = p.content
         prompt_type = p.prompt_type
+        brand_id_fk = p.brand_id_fk
 
     result = await llm.run_prompt_test(
         prompt_type=prompt_type,
         prompt_content=prompt_content,
         sample_topic=_SAMPLE_TOPIC,
+        brand_id_fk=brand_id_fk,
     )
     return PromptTestOut(
         generated_text=result.text,

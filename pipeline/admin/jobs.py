@@ -36,7 +36,7 @@ from pipeline.admin.models import Run, Source
 
 
 def kick_off_pipeline_run(
-    brand_id: str,
+    brand_id_fk: int,
     source_ids: list[int],
     triggered_by: str,
 ) -> int:
@@ -49,7 +49,7 @@ def kick_off_pipeline_run(
     factory = get_session_factory()
     with factory() as session:
         run = Run(
-            brand_id=brand_id,
+            brand_id_fk=brand_id_fk,
             triggered_by=triggered_by,
             source_ids=json.dumps(source_ids),
             started_at=datetime.now(tz=timezone.utc),

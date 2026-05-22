@@ -48,6 +48,12 @@ dependencies = [
     # CLI
     "typer>=0.12.0",
     "rich>=13.7.0",
+
+    # Encryption — Fernet symmetric (AES-128-CBC + HMAC-SHA256). Used by
+    # pipeline.admin.encryption to encrypt per-brand Sanity/Telegram/Meta
+    # tokens at rest in admin.db. Master key BRANDS_ENCRYPTION_KEY lives
+    # in .env on Mac + VPS. NTS_025 § "Credential encryption".
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

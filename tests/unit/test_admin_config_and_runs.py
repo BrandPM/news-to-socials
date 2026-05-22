@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,13 +11,14 @@ from fastapi.testclient import TestClient
 from pipeline.admin import db as admin_db
 from pipeline.admin.models import PipelineConfig, Run, Source, Topic
 from pipeline.common import config as config_module
+from tests.unit.conftest import seed_icon_brand
 
 ADMIN_TOKEN = "tok-conf"
 AUTH = {"X-Admin-Token": ADMIN_TOKEN}
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client_and_brand(tmp_path, monkeypatch):
     monkeypatch.setattr(config_module, "_settings", None)
     monkeypatch.setenv("ADMIN_TRIGGER_SECRET", ADMIN_TOKEN)
     monkeypatch.setenv("ADMIN_DB_PATH", str(tmp_path / "admin.db"))
@@ -28,18 +28,33 @@ def client(tmp_path, monkeypatch):
     engine = admin_db.get_engine(path=tmp_path / "admin.db")
     admin_db.Base.metadata.create_all(engine)
 
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        icon_id = seed_icon_brand(session)
+        session.commit()
+
     from pipeline.admin.server import create_app
 
-    yield TestClient(create_app())
+    yield TestClient(create_app()), icon_id
     admin_db.reset_for_tests()
 
 
-def _seed_config(banned=("delve into",)) -> None:
+@pytest.fixture
+def client(client_and_brand):
+    return client_and_brand[0]
+
+
+@pytest.fixture
+def icon_brand_id(client_and_brand) -> int:
+    return client_and_brand[1]
+
+
+def _seed_config(icon_brand_id: int, banned=("delve into",)) -> None:
     factory = admin_db.get_session_factory()
     with factory() as session:
         session.add(
             PipelineConfig(
-                brand_id="icon",
+                brand_id_fk=icon_brand_id,
                 scoring_threshold=7,
                 topics_per_run=3,
                 banned_phrases=json.dumps(list(banned)),
@@ -52,9 +67,9 @@ def _seed_config(banned=("delve into",)) -> None:
 # --- Config -------------------------------------------------------------
 
 
-def test_get_config_returns_seeded_row(client) -> None:
-    _seed_config()
-    resp = client.get("/api/v1/config?brand_id=icon", headers=AUTH)
+def test_get_config_returns_seeded_row(client, icon_brand_id) -> None:
+    _seed_config(icon_brand_id)
+    resp = client.get(f"/api/v1/config?brand_id={icon_brand_id}", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
     assert body["scoring_threshold"] == 7
@@ -63,14 +78,15 @@ def test_get_config_returns_seeded_row(client) -> None:
 
 
 def test_get_config_404_when_no_row(client) -> None:
-    resp = client.get("/api/v1/config?brand_id=missing", headers=AUTH)
+    # brand_id 999 doesn't exist — config 404s.
+    resp = client.get("/api/v1/config?brand_id=999", headers=AUTH)
     assert resp.status_code == 404
 
 
-def test_put_config_partial_update(client) -> None:
-    _seed_config()
+def test_put_config_partial_update(client, icon_brand_id) -> None:
+    _seed_config(icon_brand_id)
     resp = client.put(
-        "/api/v1/config?brand_id=icon",
+        f"/api/v1/config?brand_id={icon_brand_id}",
         headers=AUTH,
         json={"scoring_threshold": 8, "banned_phrases": ["foo", "bar"]},
     )
@@ -81,10 +97,10 @@ def test_put_config_partial_update(client) -> None:
     assert body["banned_phrases"] == ["foo", "bar"]
 
 
-def test_put_config_rejects_out_of_range_threshold(client) -> None:
-    _seed_config()
+def test_put_config_rejects_out_of_range_threshold(client, icon_brand_id) -> None:
+    _seed_config(icon_brand_id)
     resp = client.put(
-        "/api/v1/config?brand_id=icon",
+        f"/api/v1/config?brand_id={icon_brand_id}",
         headers=AUTH,
         json={"scoring_threshold": 99},
     )
@@ -94,11 +110,11 @@ def test_put_config_rejects_out_of_range_threshold(client) -> None:
 # --- Runs ---------------------------------------------------------------
 
 
-def _make_run_with_topic(brand_id="icon") -> tuple[int, int]:
+def _make_run_with_topic(brand_id_fk: int) -> tuple[int, int]:
     factory = admin_db.get_session_factory()
     with factory() as session:
         src = Source(
-            brand_id=brand_id,
+            brand_id_fk=brand_id_fk,
             name="x",
             source_type="rss",
             url="https://example.com/feed",
@@ -107,7 +123,7 @@ def _make_run_with_topic(brand_id="icon") -> tuple[int, int]:
         session.add(src)
         session.flush()
         run = Run(
-            brand_id=brand_id,
+            brand_id_fk=brand_id_fk,
             triggered_by="manual",
             source_ids=json.dumps([src.id]),
             started_at=datetime.now(tz=timezone.utc),
@@ -133,14 +149,13 @@ def _make_run_with_topic(brand_id="icon") -> tuple[int, int]:
         return run.id, src.id
 
 
-def test_list_runs_sorted_desc_with_paging(client) -> None:
-    # Create several runs and verify ordering.
+def test_list_runs_sorted_desc_with_paging(client, icon_brand_id) -> None:
     factory = admin_db.get_session_factory()
     with factory() as session:
         for i in range(3):
             session.add(
                 Run(
-                    brand_id="icon",
+                    brand_id_fk=icon_brand_id,
                     triggered_by="manual",
                     source_ids="[]",
                     started_at=datetime.now(tz=timezone.utc) + timedelta(seconds=i),
@@ -148,15 +163,14 @@ def test_list_runs_sorted_desc_with_paging(client) -> None:
                 )
             )
         session.commit()
-    resp = client.get("/api/v1/runs?brand_id=icon&limit=2", headers=AUTH)
+    resp = client.get(f"/api/v1/runs?brand_id={icon_brand_id}&limit=2", headers=AUTH)
     assert resp.status_code == 200
     assert len(resp.json()) == 2
-    # Most recent first.
     assert resp.json()[0]["started_at"] > resp.json()[1]["started_at"]
 
 
-def test_run_detail_includes_topics(client) -> None:
-    run_id, _ = _make_run_with_topic()
+def test_run_detail_includes_topics(client, icon_brand_id) -> None:
+    run_id, _ = _make_run_with_topic(icon_brand_id)
     resp = client.get(f"/api/v1/runs/{run_id}", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
@@ -166,24 +180,23 @@ def test_run_detail_includes_topics(client) -> None:
     assert body["topics"][0]["draft_id"] == "drafts.post-aaa"
 
 
-def test_run_log_returns_stub_when_file_missing(client) -> None:
-    run_id, _ = _make_run_with_topic()
+def test_run_log_returns_stub_when_file_missing(client, icon_brand_id) -> None:
+    run_id, _ = _make_run_with_topic(icon_brand_id)
     resp = client.get(f"/api/v1/runs/{run_id}/log", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
     assert body["source"] == "stub"
 
 
-def test_run_log_reads_real_file_when_present(client, tmp_path, monkeypatch) -> None:
+def test_run_log_reads_real_file_when_present(client, tmp_path, monkeypatch, icon_brand_id) -> None:
     log = tmp_path / "real.log"
     log.write_text(
         "\n".join(f"line-{i}" for i in range(500)) + "\n", encoding="utf-8"
     )
-    # Re-stub get_settings to point at our log file.
     monkeypatch.setenv("ADMIN_LOG_PATH", str(log))
     config_module._settings = None  # clear cache
 
-    run_id, _ = _make_run_with_topic()
+    run_id, _ = _make_run_with_topic(icon_brand_id)
     resp = client.get(f"/api/v1/runs/{run_id}/log?tail=10", headers=AUTH)
     body = resp.json()
     assert body["source"] == "file"

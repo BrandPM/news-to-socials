@@ -23,19 +23,19 @@ router = APIRouter()
 
 
 @router.get("", response_model=list[SourceOut])
-def list_sources(brand_id: str | None = None) -> list[SourceOut]:
+def list_sources(brand_id: int | None = None) -> list[SourceOut]:
     with session_scope() as session:
         stmt = select(Source).order_by(Source.id)
         if brand_id is not None:
-            stmt = stmt.where(Source.brand_id == brand_id)
-        return [SourceOut.model_validate(s, from_attributes=True) for s in session.scalars(stmt)]
+            stmt = stmt.where(Source.brand_id_fk == brand_id)
+        return [SourceOut.model_validate(s) for s in session.scalars(stmt)]
 
 
 @router.post("", response_model=SourceOut, status_code=status.HTTP_201_CREATED)
 def create_source(payload: SourceIn) -> SourceOut:
     with session_scope() as session:
         src = Source(
-            brand_id=payload.brand_id,
+            brand_id_fk=payload.brand_id,
             name=payload.name,
             source_type=payload.source_type,
             url=str(payload.url),
@@ -47,8 +47,14 @@ def create_source(payload: SourceIn) -> SourceOut:
             custom_parser=payload.custom_parser,
         )
         session.add(src)
-        session.flush()
-        return SourceOut.model_validate(src, from_attributes=True)
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"brand_id={payload.brand_id} does not reference an existing brand",
+            ) from exc
+        return SourceOut.model_validate(src)
 
 
 @router.get("/{source_id}", response_model=SourceOut)
@@ -57,7 +63,7 @@ def get_source(source_id: int) -> SourceOut:
         src = session.get(Source, source_id)
         if src is None:
             raise HTTPException(status_code=404, detail="source not found")
-        return SourceOut.model_validate(src, from_attributes=True)
+        return SourceOut.model_validate(src)
 
 
 @router.put("/{source_id}", response_model=SourceOut)
@@ -73,7 +79,7 @@ def update_source(source_id: int, payload: SourceUpdate) -> SourceOut:
             setattr(src, k, v)
         src.updated_at = datetime.now(tz=timezone.utc)
         session.flush()
-        return SourceOut.model_validate(src, from_attributes=True)
+        return SourceOut.model_validate(src)
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -152,9 +158,9 @@ def run_source(source_id: int, background: BackgroundTasks) -> RunTriggerOut:
         src = session.get(Source, source_id)
         if src is None:
             raise HTTPException(status_code=404, detail="source not found")
-        brand_id = src.brand_id
+        brand_id_fk = src.brand_id_fk
     run_id = jobs.kick_off_pipeline_run(
-        brand_id=brand_id, source_ids=[source_id], triggered_by="manual"
+        brand_id_fk=brand_id_fk, source_ids=[source_id], triggered_by="manual"
     )
     background.add_task(jobs.execute_pipeline_run, run_id)
     return RunTriggerOut(run_id=run_id)

@@ -1,8 +1,8 @@
 """Tests for AdminConfigClient — both DB-backed and fallback paths.
 
-The fallback is invariant B from IT_PROJ_NTS_014: pipeline must keep
-working when admin.db is missing or empty. This is what lets the systemd
-timer survive the S2/S3 rollout window.
+The fallback (Admin-UI-Specific Invariant B from NTS_014) keeps the
+pipeline working when admin.db is missing OR the brand row hasn't been
+seeded yet. Step 4 removes the fallback; Step 2 still relies on it.
 """
 
 from __future__ import annotations
@@ -17,17 +17,23 @@ from pipeline.admin import db as admin_db
 from pipeline.admin.config_client import AdminConfigClient
 from pipeline.admin.models import PipelineConfig, Prompt, Run, Source, Topic
 from pipeline.common import config as config_module
+from tests.unit.conftest import seed_icon_brand
 
 
 @pytest.fixture
 def fresh_admin_db(tmp_path, monkeypatch):
-    """Empty (schema-migrated) admin.db bound for the duration of a test."""
+    """Schema-migrated admin.db + seeded Icon brand."""
     monkeypatch.setattr(config_module, "_settings", None)
     monkeypatch.setenv("ADMIN_DB_PATH", str(tmp_path / "admin.db"))
     admin_db.reset_for_tests()
     engine = admin_db.get_engine(path=tmp_path / "admin.db")
     admin_db.Base.metadata.create_all(engine)
-    yield tmp_path / "admin.db"
+
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        icon_id = seed_icon_brand(session)
+        session.commit()
+    yield {"path": tmp_path / "admin.db", "icon_id": icon_id}
     admin_db.reset_for_tests()
 
 
@@ -48,8 +54,6 @@ def test_fallback_when_db_missing(no_admin_db) -> None:
     client = AdminConfigClient()
     assert client.admin_db_available() is False
     sources = client.get_active_sources()
-    # Only Private Banker is active in the seed; Bloomberg / CNBC are
-    # seeded inactive pending Andriy verifying the URLs.
     assert len(sources) == 1
     assert "Private Banker" in sources[0].name
 
@@ -57,19 +61,20 @@ def test_fallback_when_db_missing(no_admin_db) -> None:
 def test_fallback_when_db_present_but_no_active_sources(fresh_admin_db) -> None:
     client = AdminConfigClient()
     assert client.admin_db_available() is True
-    # No rows in sources table at all → fallback.
     sources = client.get_active_sources()
+    # No sources in DB → fallback to seed list.
     assert len(sources) == 1
     assert "Private Banker" in sources[0].name
 
 
 def test_db_drives_sources_when_present(fresh_admin_db) -> None:
+    icon_id = fresh_admin_db["icon_id"]
     factory = admin_db.get_session_factory()
     with factory() as session:
         session.add_all(
             [
                 Source(
-                    brand_id="icon",
+                    brand_id_fk=icon_id,
                     name="Custom Feed A",
                     source_type="rss",
                     url="https://feed-a.example.com/rss",
@@ -77,12 +82,12 @@ def test_db_drives_sources_when_present(fresh_admin_db) -> None:
                     active=True,
                 ),
                 Source(
-                    brand_id="icon",
+                    brand_id_fk=icon_id,
                     name="Custom Feed B",
                     source_type="rss",
                     url="https://feed-b.example.com/rss",
                     primary_category="ma",
-                    active=False,  # inactive — must NOT appear in get_active_sources
+                    active=False,
                 ),
             ]
         )
@@ -91,15 +96,16 @@ def test_db_drives_sources_when_present(fresh_admin_db) -> None:
     sources = AdminConfigClient().get_active_sources()
     assert len(sources) == 1
     assert sources[0].name == "Custom Feed A"
-    assert sources[0].id is not None  # comes from DB, not the fallback
+    assert sources[0].id is not None
 
 
 def test_get_active_prompt_returns_db_row(fresh_admin_db) -> None:
+    icon_id = fresh_admin_db["icon_id"]
     factory = admin_db.get_session_factory()
     with factory() as session:
         session.add(
             Prompt(
-                brand_id="icon",
+                brand_id_fk=icon_id,
                 prompt_type="writer_polish",
                 version_name="v9",
                 content="hello",
@@ -124,11 +130,12 @@ def test_get_config_fallback_uses_seed_threshold(no_admin_db) -> None:
 
 
 def test_get_config_reads_db_row(fresh_admin_db) -> None:
+    icon_id = fresh_admin_db["icon_id"]
     factory = admin_db.get_session_factory()
     with factory() as session:
         session.add(
             PipelineConfig(
-                brand_id="icon",
+                brand_id_fk=icon_id,
                 scoring_threshold=9,
                 topics_per_run=5,
                 banned_phrases=json.dumps(["zzz"]),
@@ -147,11 +154,11 @@ def test_get_config_reads_db_row(fresh_admin_db) -> None:
 
 
 def test_record_run_lifecycle(fresh_admin_db) -> None:
-    # Need a source so the FK on topics is satisfiable.
+    icon_id = fresh_admin_db["icon_id"]
     factory = admin_db.get_session_factory()
     with factory() as session:
         src = Source(
-            brand_id="icon",
+            brand_id_fk=icon_id,
             name="x",
             source_type="rss",
             url="https://example.com/feed",
@@ -196,12 +203,10 @@ def test_record_run_lifecycle(fresh_admin_db) -> None:
 def test_record_run_noop_when_db_unavailable(no_admin_db) -> None:
     client = AdminConfigClient()
     assert client.record_run_start(source_ids=[1], triggered_by="cron") is None
-    # finishing a None run_id is also a no-op (doesn't raise).
     client.record_run_finish(None, status="success")  # type: ignore[arg-type]
 
 
 def test_record_topic_result_noop_without_run_id(no_admin_db) -> None:
-    # No run_id, no source_id → no DB write attempted, no error.
     AdminConfigClient().record_topic_result(
         run_id=None,
         topic_id="t",

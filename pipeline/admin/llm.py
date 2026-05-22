@@ -24,6 +24,7 @@ async def run_prompt_test(
     prompt_type: str,
     prompt_content: str,
     sample_topic: dict[str, Any],
+    brand_id_fk: int | None = None,
 ) -> PromptTestResult:
     """Render the prompt against the sample topic and return the result.
 
@@ -80,19 +81,21 @@ async def run_prompt_test(
 
     # Pull banned-phrase list from the active config (best-effort). If we
     # can't reach it, AI-tells is just 0 — informational, not blocking.
-    try:
-        from pipeline.admin.db import session_scope  # noqa: PLC0415
-        from pipeline.admin.models import PipelineConfig  # noqa: PLC0415
-        import json as _json  # noqa: PLC0415
+    ai_tells = 0
+    if brand_id_fk is not None:
+        try:
+            from pipeline.admin.db import session_scope  # noqa: PLC0415
+            from pipeline.admin.models import PipelineConfig  # noqa: PLC0415
+            import json as _json  # noqa: PLC0415
 
-        with session_scope() as session:
-            cfg = session.get(PipelineConfig, "icon")
-            banned: list[str] = (
-                _json.loads(cfg.banned_phrases) if cfg and cfg.banned_phrases else []
-            )
-        ai_tells = len(find_banned_phrase_hits(text, banned))
-    except Exception:  # noqa: BLE001
-        ai_tells = 0
+            with session_scope() as session:
+                cfg = session.get(PipelineConfig, brand_id_fk)
+                banned: list[str] = (
+                    _json.loads(cfg.banned_phrases) if cfg and cfg.banned_phrases else []
+                )
+            ai_tells = len(find_banned_phrase_hits(text, banned))
+        except Exception:  # noqa: BLE001
+            ai_tells = 0
 
     # Rough cost: gpt-4o is $5/1M in, $15/1M out; gpt-4o-mini is
     # $0.15/1M in, $0.6/1M out. Use the usage object if present.
