@@ -528,6 +528,7 @@ async def run_pipeline(
     with the same fallback semantics.
     """
     from pipeline.admin.config_client import AdminConfigClient, SourceRecord  # noqa: PLC0415
+    from pipeline.admin.cost_recorder import CostContext, cost_context  # noqa: PLC0415
 
     configure_logging()
     settings = get_settings()
@@ -543,6 +544,11 @@ async def run_pipeline(
     client = AdminConfigClient(brand_slug=brand_slug)
     config = client.get_config()
     brand = icon_brand_config()
+
+    # Resolve brand_id_fk so every LLM call inside this run records cost
+    # against the right brand. None when admin.db is unavailable — the
+    # cost recorder treats that as a no-op (per Invariant B fallback).
+    brand_id_fk = client._resolve_brand_id_fk()  # noqa: SLF001
 
     # Apply admin-db overrides on top of the hardcoded BrandConfig so the
     # pipeline picks up Andriy's edits without a code change.
@@ -595,31 +601,34 @@ async def run_pipeline(
     aggregate_stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
     log_lines: list[str] = []
 
-    for src in sources:
-        try:
-            results, stats = await _process_source(
-                source_record=src,
-                brand=brand,
-                language=language,
-                limit=limit,
-                dry_run=dry_run,
-                sanity_publisher=sanity_publisher,
-                client=client,
-                run_id=run_id,
-                min_score=config.scoring_threshold,
-            )
-            aggregate_results.extend(results)
-            for k, v in stats.items():
-                aggregate_stats[k] = aggregate_stats.get(k, 0) + v
-            log_lines.append(
-                f"source {src.name}: fetched={stats['fetched']} "
-                f"scored={stats['scored']} drafted={stats['drafted']} "
-                f"errors={stats['errors']}"
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("source.failed", source=src.name)
-            aggregate_stats["errors"] += 1
-            log_lines.append(f"source {src.name}: FAILED {exc!r}")
+    # Cost-recording context spans the whole run; topic_id / draft_id
+    # are layered in by ``_process_source`` for finer attribution.
+    with cost_context(CostContext(brand_id_fk=brand_id_fk, run_id=run_id)):
+        for src in sources:
+            try:
+                results, stats = await _process_source(
+                    source_record=src,
+                    brand=brand,
+                    language=language,
+                    limit=limit,
+                    dry_run=dry_run,
+                    sanity_publisher=sanity_publisher,
+                    client=client,
+                    run_id=run_id,
+                    min_score=config.scoring_threshold,
+                )
+                aggregate_results.extend(results)
+                for k, v in stats.items():
+                    aggregate_stats[k] = aggregate_stats.get(k, 0) + v
+                log_lines.append(
+                    f"source {src.name}: fetched={stats['fetched']} "
+                    f"scored={stats['scored']} drafted={stats['drafted']} "
+                    f"errors={stats['errors']}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("source.failed", source=src.name)
+                aggregate_stats["errors"] += 1
+                log_lines.append(f"source {src.name}: FAILED {exc!r}")
 
     overall_status = "success" if aggregate_stats["errors"] == 0 else "failed"
     client.record_run_finish(

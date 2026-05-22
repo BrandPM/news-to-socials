@@ -30,6 +30,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -232,6 +233,55 @@ class Run(Base):
             name="ck_runs_status",
         ),
         Index("ix_runs_started_at", "started_at"),
+    )
+
+
+class CostRecord(Base):
+    """One row per paid call (LLM completion, embedding, image gen).
+
+    Granular cost log per NTS_025 C1. Aggregated by ``brand_id`` /
+    ``operation`` / ``created_at`` for the cost dashboards in S4.
+
+    ``run_id`` / ``topic_id`` / ``draft_id`` are ON DELETE SET NULL so
+    deleting a Run doesn't lose the historical cost — it just detaches
+    from the run context.
+    """
+
+    __tablename__ = "cost_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("brands.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    run_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    topic_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("topics.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    operation: Mapped[str] = mapped_column(String, nullable=False)
+    model: Mapped[str | None] = mapped_column(String, nullable=True)
+    tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_cost_records_brand_created", "brand_id_fk", "created_at"),
+        Index("ix_cost_records_run_id", "run_id"),
+        Index("ix_cost_records_topic_id", "topic_id"),
+        Index("ix_cost_records_draft_id", "draft_id"),
     )
 
 

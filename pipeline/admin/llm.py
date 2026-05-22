@@ -97,18 +97,34 @@ async def run_prompt_test(
         except Exception:  # noqa: BLE001
             ai_tells = 0
 
-    # Rough cost: gpt-4o is $5/1M in, $15/1M out; gpt-4o-mini is
-    # $0.15/1M in, $0.6/1M out. Use the usage object if present.
+    # Use the shared pricing table (NTS_025 — single source of truth so
+    # cost dashboards in S4 agree with the per-test returned value).
+    from pipeline.common.pricing import openai_cost  # noqa: PLC0415
+
     usage = getattr(resp, "usage", None)
-    if usage is None:
-        cost = 0.0
-    else:
-        if prompt_type == "writer_polish":
-            cost = (
-                usage.prompt_tokens * 5e-6 + usage.completion_tokens * 15e-6
+    tokens_in = getattr(usage, "prompt_tokens", None)
+    tokens_out = getattr(usage, "completion_tokens", None)
+    cost = openai_cost(model, tokens_in, tokens_out)
+
+    # Record a cost_records row when a brand context is supplied (the
+    # /prompts/{id}/test endpoint passes brand_id_fk explicitly so the
+    # row is attributed to the right brand even though no run is
+    # active). NTS_025 C1.
+    if brand_id_fk is not None:
+        from pipeline.admin.config_client import AdminConfigClient  # noqa: PLC0415
+
+        try:
+            AdminConfigClient.record_cost(
+                brand_id_fk=brand_id_fk,
+                provider="openai",
+                operation="prompt_test",
+                model=model,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost,
             )
-        else:
-            cost = (
-                usage.prompt_tokens * 0.15e-6 + usage.completion_tokens * 0.6e-6
-            )
+        except Exception:  # noqa: BLE001
+            # Cost recording must never break the endpoint.
+            pass
+
     return PromptTestResult(text=text, cost_usd=round(cost, 4), ai_tells_count=ai_tells)

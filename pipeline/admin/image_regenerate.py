@@ -69,20 +69,39 @@ async def regenerate_cover_image(
     )
     visual = _brand_visual_for("icon")
     if custom_prompt:
-        # Override the random pick by replacing the style pool with a
-        # single explicit style — simplest way to honour custom_prompt.
         visual = BrandVisual(
             brand_id=visual.brand_id, image_style_prompts=[custom_prompt]
         )
 
-    # 3. Generate + resize + upload.
-    gen = ImageGenerator()
-    master_url = await gen.generate(fake_topic, visual)
-    master_bytes = await fetch_master(master_url)
-    resized = resize_for_channel(master_bytes, Channel.blog)
-    asset_id = await publisher.upload_cover_image(
-        resized, filename=f"icon-{topic_id}-regen.png"
-    )
+    # 3. Generate + resize + upload — wrap in a cost context so the
+    #    Replicate call inside ImageGenerator records against this draft.
+    #    Brand resolution is naïve here (icon-only); Step 4 broadens this.
+    from pipeline.admin.cost_recorder import CostContext, cost_context  # noqa: PLC0415
+    from pipeline.admin.db import session_scope  # noqa: PLC0415
+    from pipeline.admin.models import Brand  # noqa: PLC0415
+    from sqlalchemy import select  # noqa: PLC0415
+
+    icon_brand_id_fk: int | None = None
+    try:
+        with session_scope() as session:
+            row = session.execute(
+                select(Brand).where(Brand.slug == "icon")
+            ).scalar_one_or_none()
+            icon_brand_id_fk = row.id if row is not None else None
+    except Exception:  # noqa: BLE001
+        icon_brand_id_fk = None
+
+    ctx = CostContext(brand_id_fk=icon_brand_id_fk, draft_id=sanity_draft_id)
+    with cost_context(ctx):
+        gen = ImageGenerator()
+        master_url = await gen.generate(
+            fake_topic, visual, operation="image_regenerate"
+        )
+        master_bytes = await fetch_master(master_url)
+        resized = resize_for_channel(master_bytes, Channel.blog)
+        asset_id = await publisher.upload_cover_image(
+            resized, filename=f"icon-{topic_id}-regen.png"
+        )
 
     # 4. Patch the draft's coverImage reference.
     await client.patch(

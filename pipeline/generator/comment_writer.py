@@ -143,6 +143,28 @@ def _bullet_list(items: list[str]) -> str:
     return "\n".join(f"  - {x}" for x in items)
 
 
+def _record_openai_cost(resp: Any, *, model: str, operation: str) -> None:
+    """Record a cost_records row for an OpenAI ChatCompletion response.
+
+    Safe to call with mocks: missing ``usage`` → cost is 0, row still
+    written iff a brand context is active (otherwise no-op). NTS_025 C1.
+    """
+    from pipeline.admin.cost_recorder import record_cost  # noqa: PLC0415
+    from pipeline.common.pricing import openai_cost  # noqa: PLC0415
+
+    usage = getattr(resp, "usage", None)
+    tokens_in = getattr(usage, "prompt_tokens", None)
+    tokens_out = getattr(usage, "completion_tokens", None)
+    record_cost(
+        provider="openai",
+        operation=operation,
+        model=model,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_usd=openai_cost(model, tokens_in, tokens_out),
+    )
+
+
 def parse_voice_guardrails(voice_profile_yaml: str) -> tuple[list[str], list[str]]:
     """Extract ``banned_phrases`` and ``style_examples.good`` from the YAML.
 
@@ -244,6 +266,7 @@ class CommentWriter:
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
+        _record_openai_cost(resp, model=self.draft_model, operation="draft")
         return self._parse(resp.choices[0].message.content or "{}")
 
     @with_retry()
@@ -266,6 +289,7 @@ class CommentWriter:
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
+        _record_openai_cost(resp, model=self.polish_model, operation="polish")
         return self._parse(resp.choices[0].message.content or "{}")
 
     @with_retry()
@@ -287,6 +311,9 @@ class CommentWriter:
             max_tokens=1500,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
+        )
+        _record_openai_cost(
+            resp, model=self.polish_model, operation="anti_check_retry"
         )
         return self._parse(resp.choices[0].message.content or "{}")
 

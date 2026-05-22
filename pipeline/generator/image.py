@@ -14,6 +14,7 @@ Strategy:
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 
 from replicate.client import Client as ReplicateClient
@@ -52,7 +53,13 @@ class ImageGenerator:
             self._client = ReplicateClient(api_token=settings.replicate_api_token)
 
     @with_retry()
-    async def generate(self, topic: Topic, brand_visual: BrandVisual) -> str:
+    async def generate(
+        self,
+        topic: Topic,
+        brand_visual: BrandVisual,
+        *,
+        operation: str = "image_master",
+    ) -> str:
         if not brand_visual.image_style_prompts:
             raise ValueError(f"brand {brand_visual.brand_id} has no image_style_prompts")
 
@@ -62,6 +69,7 @@ class ImageGenerator:
         log.info("image.generate", brand=brand_visual.brand_id, prompt_len=len(prompt))
         if self._client is None:
             raise RuntimeError("REPLICATE_API_TOKEN missing; cannot generate image")
+        start = time.monotonic()
         output = await self._client.async_run(
             self.model,
             input={
@@ -72,6 +80,18 @@ class ImageGenerator:
                 "output_quality": 90,
                 "safety_tolerance": 2,
             },
+        )
+        duration = round(time.monotonic() - start, 3)
+        # NTS_025 C1: record Replicate cost (one row per generated image).
+        from pipeline.admin.cost_recorder import record_cost  # noqa: PLC0415
+        from pipeline.common.pricing import replicate_image_cost  # noqa: PLC0415
+
+        record_cost(
+            provider="replicate",
+            operation=operation,
+            model=self.model,
+            duration_seconds=duration,
+            cost_usd=replicate_image_cost(self.model),
         )
         # Flux returns a single URL (string) or a list of strings depending
         # on the model version. Normalise.

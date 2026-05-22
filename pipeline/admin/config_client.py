@@ -27,6 +27,7 @@ from pipeline.admin import db as admin_db
 from pipeline.admin import seed_data
 from pipeline.admin.models import (
     Brand,
+    CostRecord,
     PipelineConfig,
     Prompt,
     Run,
@@ -269,6 +270,53 @@ class AdminConfigClient:
                 )
             )
             session.commit()
+
+    # --- cost recording -------------------------------------------------
+
+    @staticmethod
+    def record_cost(
+        *,
+        brand_id_fk: int,
+        provider: str,
+        operation: str,
+        cost_usd: float,
+        run_id: int | None = None,
+        topic_id: int | None = None,
+        draft_id: str | None = None,
+        model: str | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        duration_seconds: float | None = None,
+    ) -> int | None:
+        """Write one ``cost_records`` row. Returns the inserted row id,
+        or ``None`` if admin.db isn't reachable.
+
+        Static because the cost record lives outside the per-instance
+        ``brand_slug`` scope — the brand is supplied explicitly. See
+        ``pipeline.admin.cost_recorder.record_cost`` for the high-level
+        wrapper that pulls brand/run/topic from the context var.
+        """
+        path = Path(get_settings().admin_db_path).expanduser()
+        if not path.exists():
+            return None
+        factory = admin_db.get_session_factory()
+        with factory() as session:
+            row = CostRecord(
+                brand_id_fk=brand_id_fk,
+                run_id=run_id,
+                topic_id=topic_id,
+                draft_id=draft_id,
+                provider=provider,
+                operation=operation,
+                model=model,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                duration_seconds=duration_seconds,
+                cost_usd=cost_usd,
+            )
+            session.add(row)
+            session.commit()
+            return row.id
 
     def get_run_source_ids(self, run_id: int) -> list[int]:
         factory = admin_db.get_session_factory()

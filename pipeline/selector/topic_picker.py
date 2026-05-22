@@ -95,6 +95,23 @@ class TopicPicker:
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
+        # Per NTS_025 C1: record cost for every paid call (no-op if no
+        # cost context is active — see pipeline.admin.cost_recorder).
+        from pipeline.admin.cost_recorder import record_cost  # noqa: PLC0415
+        from pipeline.common.pricing import openai_cost  # noqa: PLC0415
+
+        usage = getattr(resp, "usage", None)
+        tokens_in = getattr(usage, "prompt_tokens", None)
+        tokens_out = getattr(usage, "completion_tokens", None)
+        record_cost(
+            provider="openai",
+            operation="topic_scoring",
+            model=self.model,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=openai_cost(self.model, tokens_in, tokens_out),
+        )
+
         text = resp.choices[0].message.content or "{}"
         try:
             data = json.loads(text)
