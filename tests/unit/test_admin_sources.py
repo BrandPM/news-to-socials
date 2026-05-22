@@ -253,6 +253,111 @@ def test_test_parse_reports_error_without_raising(monkeypatch, client, icon_bran
     assert "connect timeout" in body["error"]
 
 
+def test_run_all_sources_returns_202_with_run_id(monkeypatch, client, icon_brand_id) -> None:
+    """POST /sources/run-all kicks off a pipeline run for every active
+    source of the given brand."""
+    # Seed 2 active + 1 inactive source.
+    client.post(
+        "/api/v1/sources",
+        headers=AUTH,
+        json=_make_payload(icon_brand_id, active=True),
+    )
+    client.post(
+        "/api/v1/sources",
+        headers=AUTH,
+        json=_make_payload(
+            icon_brand_id,
+            url="https://other.example.com/feed",
+            name="Other",
+            active=True,
+        ),
+    )
+    client.post(
+        "/api/v1/sources",
+        headers=AUTH,
+        json=_make_payload(
+            icon_brand_id,
+            url="https://inactive.example.com/feed",
+            name="Inactive",
+            active=False,
+        ),
+    )
+
+    called: list[int] = []
+
+    async def fake_execute(run_id: int) -> None:
+        called.append(run_id)
+
+    monkeypatch.setattr(admin_jobs, "execute_pipeline_run", fake_execute)
+
+    # Brand must be active for run-all (M4). Use the brand-update endpoint.
+    # Activate by directly setting the active=true via PUT /brands/{id}
+    # would need sanity creds — for this test we'll go straight to DB.
+    factory = admin_db.get_session_factory()
+    from pipeline.admin.models import Brand
+
+    with factory() as session:
+        b = session.get(Brand, icon_brand_id)
+        b.active = True
+        b.status = "active"
+        session.commit()
+
+    resp = client.post(
+        "/api/v1/sources/run-all",
+        headers=AUTH,
+        json={"brand_id": icon_brand_id},
+    )
+    assert resp.status_code == 202, resp.text
+    run_id = resp.json()["run_id"]
+
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        row = session.get(Run, run_id)
+        assert row is not None
+        assert row.brand_id_fk == icon_brand_id
+        # Only 2 active sources should be in the run, not the inactive one.
+        import json as _json
+
+        assert len(_json.loads(row.source_ids)) == 2
+
+
+def test_run_all_409_when_brand_not_active(client, icon_brand_id) -> None:
+    """Brand left at status='active'=True but creds absent → still
+    reachable here because the active flag was set by the conftest
+    fixture. We test the M4 'must be active' guard by setting status=paused."""
+    factory = admin_db.get_session_factory()
+    from pipeline.admin.models import Brand
+
+    with factory() as session:
+        b = session.get(Brand, icon_brand_id)
+        b.status = "paused"
+        b.active = False
+        session.commit()
+    resp = client.post(
+        "/api/v1/sources/run-all",
+        headers=AUTH,
+        json={"brand_id": icon_brand_id},
+    )
+    assert resp.status_code == 409
+
+
+def test_run_all_409_when_brand_has_no_active_sources(client, icon_brand_id) -> None:
+    factory = admin_db.get_session_factory()
+    from pipeline.admin.models import Brand
+
+    with factory() as session:
+        b = session.get(Brand, icon_brand_id)
+        b.active = True
+        b.status = "active"
+        session.commit()
+    resp = client.post(
+        "/api/v1/sources/run-all",
+        headers=AUTH,
+        json={"brand_id": icon_brand_id},
+    )
+    assert resp.status_code == 409
+
+
 def test_run_creates_run_row_returns_202(monkeypatch, client, icon_brand_id) -> None:
     created = client.post(
         "/api/v1/sources", headers=AUTH, json=_make_payload(icon_brand_id)

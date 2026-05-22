@@ -13,9 +13,11 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pytest
+from cryptography.fernet import Fernet
 from sqlalchemy import select
 
 from pipeline.admin import db as admin_db
+from pipeline.admin import encryption as enc_mod
 from pipeline.admin.models import PipelineConfig, Run, Source, Topic
 from pipeline.common import config as config_module
 from pipeline.common.models import Language, RawItem
@@ -26,13 +28,17 @@ from tests.unit.conftest import seed_icon_brand
 def fresh_admin_db_with_source(tmp_path, monkeypatch):
     monkeypatch.setattr(config_module, "_settings", None)
     monkeypatch.setenv("ADMIN_DB_PATH", str(tmp_path / "admin.db"))
+    monkeypatch.setenv(
+        "BRANDS_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii")
+    )
+    enc_mod.reset_for_tests()
     admin_db.reset_for_tests()
     engine = admin_db.get_engine(path=tmp_path / "admin.db")
     admin_db.Base.metadata.create_all(engine)
 
     factory = admin_db.get_session_factory()
     with factory() as session:
-        icon_id = seed_icon_brand(session)
+        icon_id = seed_icon_brand(session, with_sanity_creds=True)
         session.add(
             Source(
                 brand_id_fk=icon_id,
@@ -55,6 +61,7 @@ def fresh_admin_db_with_source(tmp_path, monkeypatch):
         session.commit()
     yield {"path": tmp_path / "admin.db", "icon_id": icon_id}
     admin_db.reset_for_tests()
+    enc_mod.reset_for_tests()
 
 
 def _mock_externals(monkeypatch):
@@ -170,27 +177,27 @@ def test_run_pipeline_reads_admin_db_writes_runs_topics(
         assert all(t.draft_id and t.draft_id.startswith("drafts.post-") for t in topics)
 
 
-def test_run_pipeline_falls_back_when_admin_db_missing(tmp_path, monkeypatch) -> None:
-    """The systemd timer must keep working until S3 ships, even if
-    admin.db doesn't exist on the VPS."""
+def test_run_pipeline_raises_when_brand_not_in_admin_db(tmp_path, monkeypatch) -> None:
+    """After Step 4 the fallback to icon_brand_config() is gone — running
+    a brand that isn't in admin.db raises BrandNotReadyError."""
     monkeypatch.setattr(config_module, "_settings", None)
     monkeypatch.setenv("ADMIN_DB_PATH", str(tmp_path / "missing.db"))
     admin_db.reset_for_tests()
 
     _mock_externals(monkeypatch)
 
+    from pipeline.admin.config_client import BrandNotReadyError
     from pipeline.run import run_pipeline
 
-    results = asyncio.run(
-        run_pipeline(
-            brand_slug="icon",
-            language=Language.en,
-            limit=2,
-            dry_run=False,
+    with pytest.raises(BrandNotReadyError):
+        asyncio.run(
+            run_pipeline(
+                brand_slug="icon",
+                language=Language.en,
+                limit=2,
+                dry_run=False,
+            )
         )
-    )
-    assert len(results) == 2
-    assert not (tmp_path / "missing.db").exists()
 
 
 def test_run_pipeline_with_source_id_url_overrides_admin_db(

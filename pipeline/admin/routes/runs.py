@@ -8,8 +8,14 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
 from pipeline.admin.db import session_scope
-from pipeline.admin.models import Run, Topic
-from pipeline.admin.schemas import RunDetailOut, RunLogOut, RunOut, TopicOut
+from pipeline.admin.models import CostRecord, Run, Topic
+from pipeline.admin.schemas import (
+    CostBreakdownItem,
+    RunDetailWithCostOut,
+    RunLogOut,
+    RunOut,
+    TopicOut,
+)
 from pipeline.common.config import get_settings
 
 router = APIRouter()
@@ -27,8 +33,10 @@ def list_runs(
         return [RunOut.model_validate(r) for r in session.scalars(stmt)]
 
 
-@router.get("/{run_id}", response_model=RunDetailOut)
-def get_run(run_id: int) -> RunDetailOut:
+@router.get("/{run_id}", response_model=RunDetailWithCostOut)
+def get_run(run_id: int) -> RunDetailWithCostOut:
+    total = 0.0
+    by_op: dict[str, tuple[float, int]] = {}
     with session_scope() as session:
         r = session.get(Run, run_id)
         if r is None:
@@ -38,10 +46,28 @@ def get_run(run_id: int) -> RunDetailOut:
                 select(Topic).where(Topic.run_id == run_id).order_by(Topic.id)
             )
         )
-        return RunDetailOut(
-            run=RunOut.model_validate(r),
-            topics=[TopicOut.model_validate(t) for t in topics],
+        cost_rows = list(
+            session.scalars(
+                select(CostRecord).where(CostRecord.run_id == run_id)
+            )
         )
+        run_out = RunOut.model_validate(r)
+        topics_out = [TopicOut.model_validate(t) for t in topics]
+        for c in cost_rows:
+            total += c.cost_usd
+            agg = by_op.get(c.operation, (0.0, 0))
+            by_op[c.operation] = (agg[0] + c.cost_usd, agg[1] + 1)
+
+    breakdown = [
+        CostBreakdownItem(operation=op, cost_usd=round(amt, 6), count=n)
+        for op, (amt, n) in sorted(by_op.items())
+    ]
+    return RunDetailWithCostOut(
+        run=run_out,
+        topics=topics_out,
+        cost_total_usd=round(total, 6),
+        cost_breakdown=breakdown,
+    )
 
 
 @router.get("/{run_id}/log", response_model=RunLogOut)

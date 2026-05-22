@@ -12,6 +12,7 @@ from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
 from pipeline.admin.models import Source, Topic
 from pipeline.admin.schemas import (
+    RunAllIn,
     RunTriggerOut,
     SourceIn,
     SourceOut,
@@ -161,6 +162,51 @@ def run_source(source_id: int, background: BackgroundTasks) -> RunTriggerOut:
         brand_id_fk = src.brand_id_fk
     run_id = jobs.kick_off_pipeline_run(
         brand_id_fk=brand_id_fk, source_ids=[source_id], triggered_by="manual"
+    )
+    background.add_task(jobs.execute_pipeline_run, run_id)
+    return RunTriggerOut(run_id=run_id)
+
+
+@router.post(
+    "/run-all",
+    response_model=RunTriggerOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def run_all_sources(payload: RunAllIn, background: BackgroundTasks) -> RunTriggerOut:
+    """Schedule the pipeline for every active source of one brand.
+
+    Refuses brands with status != 'active' (M4) — returns 409 so the UI
+    can show 'Setup required' instead of silently producing nothing.
+    """
+    from pipeline.admin.models import Brand  # noqa: PLC0415
+
+    with session_scope() as session:
+        brand = session.get(Brand, payload.brand_id)
+        if brand is None:
+            raise HTTPException(status_code=404, detail="brand not found")
+        if not brand.active:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"brand {brand.slug!r} is not active "
+                    f"(status={brand.status!r}) — cannot run pipeline"
+                ),
+            )
+        active_sources = session.scalars(
+            select(Source).where(
+                Source.brand_id_fk == payload.brand_id, Source.active.is_(True)
+            )
+        ).all()
+        if not active_sources:
+            raise HTTPException(
+                status_code=409,
+                detail=f"brand {brand.slug!r} has no active sources",
+            )
+        source_ids = [s.id for s in active_sources]
+    run_id = jobs.kick_off_pipeline_run(
+        brand_id_fk=payload.brand_id,
+        source_ids=source_ids,
+        triggered_by="manual",
     )
     background.add_task(jobs.execute_pipeline_run, run_id)
     return RunTriggerOut(run_id=run_id)

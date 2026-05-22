@@ -250,3 +250,199 @@ class JobStatusOut(BaseModel):
     state: Literal["pending", "done", "error"]
     asset_id: str | None = None
     error: str | None = None
+
+
+# --- Brands -------------------------------------------------------------
+
+
+BrandStatus = Literal["draft", "active", "paused", "archived"]
+
+
+class BrandSummary(BaseModel):
+    """Wire format for brand list — NO sensitive credential fields."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    slug: str
+    name: str
+    language: str
+    timezone: str
+    status: BrandStatus
+    active: bool
+
+
+class BrandIn(BaseModel):
+    """Payload for POST /brands. Sensitive fields are encrypted at insert."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str = Field(min_length=1, max_length=64)
+    name: str
+    language: str = "en"
+    timezone: str = "Europe/Madrid"
+    sanity_project_id: str | None = None
+    sanity_dataset: str | None = None
+    sanity_api_version: str | None = "2024-01-01"
+    sanity_api_token: str | None = None
+    sanity_studio_url: str | None = None
+    telegram_bot_token: str | None = None
+    telegram_channel_id: str | None = None
+    meta_app_id: str | None = None
+    meta_app_secret: str | None = None
+    meta_access_token: str | None = None
+    meta_page_id: str | None = None
+    meta_ig_business_id: str | None = None
+    voice_profile_yaml: str | None = None
+
+
+class BrandUpdate(BaseModel):
+    """Payload for PUT /brands/{id}.
+
+    Credential fields follow preserve/clear/replace semantics: missing key
+    → preserve existing value; empty string ``""`` → clear (NULL); any
+    other string → encrypt and replace. Implemented in the route handler.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    language: str | None = None
+    timezone: str | None = None
+    status: BrandStatus | None = None
+    sanity_project_id: str | None = None
+    sanity_dataset: str | None = None
+    sanity_api_version: str | None = None
+    sanity_api_token: str | None = None
+    sanity_studio_url: str | None = None
+    telegram_bot_token: str | None = None
+    telegram_channel_id: str | None = None
+    meta_app_id: str | None = None
+    meta_app_secret: str | None = None
+    meta_access_token: str | None = None
+    meta_page_id: str | None = None
+    meta_ig_business_id: str | None = None
+    voice_profile_yaml: str | None = None
+
+
+class BrandDetail(BaseModel):
+    """Wire format for GET /brands/{id} — sensitive token presence as bools."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    slug: str
+    name: str
+    language: str
+    timezone: str
+    status: BrandStatus
+    active: bool
+    sanity_project_id: str | None
+    sanity_dataset: str | None
+    sanity_api_version: str | None
+    sanity_studio_url: str | None
+    telegram_channel_id: str | None
+    meta_app_id: str | None
+    meta_page_id: str | None
+    meta_ig_business_id: str | None
+    voice_profile_yaml: str | None
+    # "<configured>" booleans for encrypted secrets — never expose plaintext.
+    has_sanity_api_token: bool
+    has_telegram_bot_token: bool
+    has_meta_app_secret: bool
+    has_meta_access_token: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class BrandTestSanityOut(BaseModel):
+    ok: bool
+    error: str | None = None
+    project_id: str | None = None
+    document_count: int | None = None
+
+
+class BrandCloneForTestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str = Field(min_length=1, max_length=64)
+    name: str
+
+
+class BrandCloneForTestOut(BaseModel):
+    id: int
+    slug: str
+
+
+# --- Sources run-all ----------------------------------------------------
+
+
+class RunAllIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    brand_id: int
+
+
+# --- Drafts (full GET) ---------------------------------------------------
+
+
+class CostBreakdownItem(BaseModel):
+    operation: str
+    cost_usd: float
+    count: int
+
+
+class DraftDetailOut(BaseModel):
+    sanity_id: str
+    title: str | None
+    body_markdown: str | None
+    key_takeaway: str | None
+    cover_image_url: str | None
+    generated_by: str | None
+    brand_slug: str | None
+    created_at: str | None
+    cost_total_usd: float
+    cost_breakdown: list[CostBreakdownItem]
+
+
+# --- Cost summary -------------------------------------------------------
+
+
+class CostSummaryByDay(BaseModel):
+    date: str
+    cost_usd: float
+
+
+class CostSummaryOut(BaseModel):
+    total_usd: float
+    by_operation: dict[str, float]
+    by_provider: dict[str, float]
+    by_day: list[CostSummaryByDay]
+
+
+class CostRecordOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    brand_id: int = Field(validation_alias="brand_id_fk")
+    run_id: int | None
+    topic_id: int | None
+    draft_id: str | None
+    provider: str
+    operation: str
+    model: str | None
+    tokens_in: int | None
+    tokens_out: int | None
+    duration_seconds: float | None
+    cost_usd: float
+    created_at: datetime
+
+
+# --- Runs cost extension (for GET /runs/{id}) ---------------------------
+
+
+class RunDetailWithCostOut(BaseModel):
+    run: RunOut
+    topics: list[TopicOut]
+    cost_total_usd: float
+    cost_breakdown: list[CostBreakdownItem]

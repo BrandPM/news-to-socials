@@ -513,21 +513,27 @@ async def run_pipeline(
     *,
     triggered_by: str = "cron",
     existing_run_id: int | None = None,
+    brand_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Run the pipeline for a brand.
+    """Run the pipeline for a brand. After NTS_025 Step 4:
 
-    Source list resolution:
-
-    * If ``source_id`` AND ``source_url`` are both provided, run for that
-      single source (legacy override path used by the systemd timer until S3).
-    * Otherwise read all active sources from admin.db via AdminConfigClient.
-      If admin.db is missing or has no active rows, fall back to the
-      hardcoded seed list — see Admin-UI-Specific Invariant B.
-
-    Config (threshold / voice profile) also reads through AdminConfigClient
-    with the same fallback semantics.
+    * ``brand_id`` (int) is the canonical selector; ``brand_slug``
+      stays as an alternative for CLI ergonomics.
+    * Brand row MUST exist + status='active' + sanity_api_token_enc
+      present, else ``BrandNotReadyError``. **No fallback** to
+      ``icon_brand_config()`` — that was the S1 transition mechanism.
+    * Sanity credentials are decrypted into local variables for the
+      duration of this single run only (M3 carve-out); never stored on
+      long-lived instance attributes.
+    * ``--source-id``/``--source-url`` overrides remain for ad-hoc runs
+      but the brand resolution still goes through admin.db.
     """
-    from pipeline.admin.config_client import AdminConfigClient, SourceRecord  # noqa: PLC0415
+    from pipeline.admin.config_client import (  # noqa: PLC0415
+        AdminConfigClient,
+        BrandNotReadyError,
+        SourceRecord,
+        get_brand,
+    )
     from pipeline.admin.cost_recorder import CostContext, cost_context  # noqa: PLC0415
 
     configure_logging()
@@ -535,34 +541,64 @@ async def run_pipeline(
     if dry_run:
         settings.dry_run = True  # type: ignore[misc]
 
-    if brand_slug != "icon":
-        raise NotImplementedError(
-            f"Brand {brand_slug!r} not supported yet — only Icon in Wave 1. "
-            "Stage 5 will load brand config from a Sanity `brand` collection."
-        )
+    # 1. Resolve brand row from DB. Either id or slug works.
+    from sqlalchemy.exc import SQLAlchemyError  # noqa: PLC0415
 
-    client = AdminConfigClient(brand_slug=brand_slug)
+    try:
+        if brand_id is not None:
+            brand_row = get_brand(brand_id)
+        else:
+            brand_row = get_brand(brand_slug)
+    except (LookupError, SQLAlchemyError) as exc:
+        raise BrandNotReadyError(
+            f"brand {(brand_id or brand_slug)!r} not reachable in admin.db: {exc!s}"
+        ) from exc
+
+    # M4: must be active AND have Sanity creds for a real run. dry-run
+    # may proceed in draft state for smoke tests (no Sanity write happens).
+    if not dry_run:
+        if brand_row.status != "active":
+            raise BrandNotReadyError(
+                f"brand {brand_row.slug!r} status is {brand_row.status!r}; "
+                "expected 'active'. Configure Sanity creds + activate via /brands."
+            )
+        if not brand_row.has_sanity_token or not brand_row.sanity_project_id:
+            raise BrandNotReadyError(
+                f"brand {brand_row.slug!r} has no Sanity credentials configured"
+            )
+
+    # 2. Decrypt creds into LOCAL variables for the duration of this run
+    #    only. References are released when this function returns (M3
+    #    carve-out: GC clears plaintext from memory).
+    sanity_token: str | None = None
+    if brand_row.has_sanity_token:
+        sanity_token = brand_row.decrypted_sanity_token()
+
+    # 3. AdminConfigClient bound to this brand's slug for source/prompt/
+    #    config lookups + run history writes.
+    client = AdminConfigClient(brand_slug=brand_row.slug)
     config = client.get_config()
     brand = icon_brand_config()
+    # Use the brand row's voice profile when present, otherwise fall back
+    # to the hardcoded icon config (placeholder for the four brands that
+    # have no voice profile yet).
+    voice_yaml = (
+        brand_row.voice_profile_yaml
+        or config.voice_profile
+        or brand.voice_profile_yaml
+    )
+    brand = BrandConfig(
+        slug=brand_row.slug,
+        name=brand_row.name,
+        voice_profile_yaml=voice_yaml,
+        visual=brand.visual,
+        context=brand.context,
+        categories=brand.categories,
+    )
 
-    # Resolve brand_id_fk so every LLM call inside this run records cost
-    # against the right brand. None when admin.db is unavailable — the
-    # cost recorder treats that as a no-op (per Invariant B fallback).
-    brand_id_fk = client._resolve_brand_id_fk()  # noqa: SLF001
+    brand_id_fk = brand_row.id
 
-    # Apply admin-db overrides on top of the hardcoded BrandConfig so the
-    # pipeline picks up Andriy's edits without a code change.
-    if config.voice_profile and config.voice_profile != brand.voice_profile_yaml:
-        brand = BrandConfig(
-            slug=brand.slug,
-            name=brand.name,
-            voice_profile_yaml=config.voice_profile,
-            visual=brand.visual,
-            context=brand.context,
-            categories=brand.categories,
-        )
-
-    # Resolve source list.
+    # 4. Resolve source list.
     if source_id is not None and source_url is not None:
         sources = [
             SourceRecord(
@@ -579,7 +615,8 @@ async def run_pipeline(
 
     log.info(
         "pipeline.start",
-        brand=brand_slug,
+        brand=brand_row.slug,
+        brand_id=brand_id_fk,
         sources=[s.name for s in sources],
         language=language.value,
         limit=limit,
@@ -587,7 +624,9 @@ async def run_pipeline(
         threshold=config.scoring_threshold,
     )
 
-    # Record run start (no-op when admin.db is unavailable).
+    # 5. Record run start. For dry_run we still write a runs row (with
+    #    status='dry_run') so the smoke test can see it. For real runs,
+    #    status starts as 'running' and gets flipped on completion.
     run_id = existing_run_id
     if run_id is None:
         run_id = client.record_run_start(
@@ -595,7 +634,25 @@ async def run_pipeline(
             triggered_by=triggered_by,
         )
 
-    sanity_publisher = SanityPublisher() if not dry_run else _DryRunSanityPublisher()
+    # 6. Construct Sanity publisher with this brand's decrypted creds.
+    #    SanityPublisher does NOT retain credentials past the run — only
+    #    the local SanityClient holds them, and it's GC'd when this
+    #    function returns. (M3 carve-out.)
+    if dry_run:
+        sanity_publisher = _DryRunSanityPublisher()
+    else:
+        from pipeline.publisher.sanity import SanityClient  # noqa: PLC0415
+
+        sanity_client = SanityClient(
+            project_id=brand_row.sanity_project_id or "",
+            dataset=brand_row.sanity_dataset or "production",
+            api_version=brand_row.sanity_api_version or "2024-01-01",
+            token=sanity_token or "",
+        )
+        sanity_publisher = SanityPublisher(client=sanity_client)
+    # Release the plaintext-token reference; the publisher holds it for
+    # the lifetime of the run only.
+    sanity_token = None  # noqa: F841
 
     aggregate_results: list[dict[str, Any]] = []
     aggregate_stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
@@ -630,7 +687,12 @@ async def run_pipeline(
                 aggregate_stats["errors"] += 1
                 log_lines.append(f"source {src.name}: FAILED {exc!r}")
 
-    overall_status = "success" if aggregate_stats["errors"] == 0 else "failed"
+    if dry_run:
+        overall_status = "dry_run"
+    elif aggregate_stats["errors"] == 0:
+        overall_status = "success"
+    else:
+        overall_status = "failed"
     client.record_run_finish(
         run_id,
         status=overall_status,
@@ -638,7 +700,7 @@ async def run_pipeline(
         log_excerpt="\n".join(log_lines)[-4000:],
     ) if run_id is not None else None
 
-    log.info("pipeline.done", processed=len(aggregate_results), brand=brand_slug,
+    log.info("pipeline.done", processed=len(aggregate_results), brand=brand_row.slug,
              status=overall_status, stats=aggregate_stats)
     return aggregate_results
 
@@ -724,7 +786,12 @@ class _DryRunSanityPublisher:
 
 @app.command()
 def main(
-    brand: str = typer.Option("icon", help="Brand slug (Wave 1: only 'icon')"),
+    brand_id: int | None = typer.Option(
+        None, "--brand-id", help="Brand id (int) — mutually exclusive with --brand-slug"
+    ),
+    brand_slug: str | None = typer.Option(
+        None, "--brand-slug", help="Brand slug (e.g. 'icon')"
+    ),
     source_id: str | None = typer.Option(
         None, "--source-id", help="Override: run for this source only"
     ),
@@ -733,23 +800,31 @@ def main(
     ),
     language: str = typer.Option("en", help="Language: ru/uk/en/pl"),
     limit: int = typer.Option(3, help="Max topics per source"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Skip Sanity + image generation"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Skip Sanity + image generation"
+    ),
 ) -> None:
-    """Run one pipeline pass.
+    """Run one pipeline pass for a single brand.
 
-    With no flags: reads active sources from admin.db (or falls back to the
-    in-repo seed list when admin.db is missing). With ``--source-id`` +
-    ``--source-url``: runs only that source. Mixed forms (one but not the
-    other) are rejected by the override resolver.
+    Specify exactly one of ``--brand-id`` or ``--brand-slug`` (M2). With
+    ``--source-id`` + ``--source-url``: runs only that source.
     """
+    if (brand_id is None) == (brand_slug is None):
+        typer.echo(
+            "exactly one of --brand-id or --brand-slug must be specified", err=True
+        )
+        sys.exit(2)
     if (source_id is None) != (source_url is None):
-        typer.echo("--source-id and --source-url must be supplied together", err=True)
+        typer.echo(
+            "--source-id and --source-url must be supplied together", err=True
+        )
         sys.exit(2)
 
     try:
         results = asyncio.run(
             run_pipeline(
-                brand_slug=brand,
+                brand_slug=brand_slug or "icon",
+                brand_id=brand_id,
                 source_id=source_id,
                 source_url=source_url,
                 language=Language(language),
@@ -760,6 +835,10 @@ def main(
     except KeyboardInterrupt:
         typer.echo("Interrupted")
         sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        # Brand not ready / encryption errors should fail the CLI cleanly.
+        typer.echo(f"ERROR: {type(exc).__name__}: {exc}", err=True)
+        sys.exit(1)
 
     typer.echo(f"\nProcessed {len(results)} topics:")
     for r in results:

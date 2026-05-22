@@ -55,6 +55,127 @@ class ConfigRecord:
     voice_profile: str
 
 
+class BrandNotReadyError(RuntimeError):
+    """Raised by pipeline entry points when a brand's row is missing,
+    paused/archived/draft, or has empty Sanity credentials. The pipeline
+    refuses to run in that state — no silent fallback (NTS_025 M4)."""
+
+
+@dataclass(frozen=True)
+class BrandRecord:
+    """In-memory snapshot of one brands row.
+
+    ``sanity_api_token`` etc are populated lazily through
+    ``decrypted_sanity_token()`` so plaintext credentials never sit on
+    a long-lived attribute (M3 carve-out).
+    """
+
+    id: int
+    slug: str
+    name: str
+    language: str
+    timezone: str
+    status: str
+    active: bool
+    sanity_project_id: str | None
+    sanity_dataset: str | None
+    sanity_api_version: str | None
+    sanity_api_token_enc: str | None
+    sanity_studio_url: str | None
+    telegram_bot_token_enc: str | None
+    telegram_channel_id: str | None
+    meta_app_id: str | None
+    meta_app_secret_enc: str | None
+    meta_access_token_enc: str | None
+    meta_page_id: str | None
+    meta_ig_business_id: str | None
+    voice_profile_yaml: str | None
+
+    def decrypted_sanity_token(self) -> str | None:
+        from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
+
+        return get_encryption().decrypt_or_none(self.sanity_api_token_enc)
+
+    def decrypted_telegram_token(self) -> str | None:
+        from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
+
+        return get_encryption().decrypt_or_none(self.telegram_bot_token_enc)
+
+    def decrypted_meta_app_secret(self) -> str | None:
+        from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
+
+        return get_encryption().decrypt_or_none(self.meta_app_secret_enc)
+
+    def decrypted_meta_access_token(self) -> str | None:
+        from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
+
+        return get_encryption().decrypt_or_none(self.meta_access_token_enc)
+
+    @property
+    def has_sanity_token(self) -> bool:
+        return bool(self.sanity_api_token_enc)
+
+
+def _brand_row_to_record(row: Brand) -> BrandRecord:
+    return BrandRecord(
+        id=row.id,
+        slug=row.slug,
+        name=row.name,
+        language=row.language,
+        timezone=row.timezone,
+        status=row.status,
+        active=row.active,
+        sanity_project_id=row.sanity_project_id,
+        sanity_dataset=row.sanity_dataset,
+        sanity_api_version=row.sanity_api_version,
+        sanity_api_token_enc=row.sanity_api_token_enc,
+        sanity_studio_url=row.sanity_studio_url,
+        telegram_bot_token_enc=row.telegram_bot_token_enc,
+        telegram_channel_id=row.telegram_channel_id,
+        meta_app_id=row.meta_app_id,
+        meta_app_secret_enc=row.meta_app_secret_enc,
+        meta_access_token_enc=row.meta_access_token_enc,
+        meta_page_id=row.meta_page_id,
+        meta_ig_business_id=row.meta_ig_business_id,
+        voice_profile_yaml=row.voice_profile_yaml,
+    )
+
+
+def get_brand(brand_id_or_slug: int | str) -> BrandRecord:
+    """Fetch a brand by id (int) or slug (str). Raises ``LookupError`` when
+    no brand matches.
+    """
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        if isinstance(brand_id_or_slug, int):
+            row = session.get(Brand, brand_id_or_slug)
+        else:
+            row = session.execute(
+                select(Brand).where(Brand.slug == brand_id_or_slug)
+            ).scalar_one_or_none()
+    if row is None:
+        raise LookupError(f"brand {brand_id_or_slug!r} not found")
+    return _brand_row_to_record(row)
+
+
+def list_brands() -> list[BrandRecord]:
+    """All brands as BrandRecord (no decrypted tokens; call decrypted_*
+    methods on the returned record when you need plaintext)."""
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        rows = session.scalars(select(Brand).order_by(Brand.slug)).all()
+    return [_brand_row_to_record(r) for r in rows]
+
+
+def get_active_brand_ids() -> list[int]:
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        rows = session.scalars(
+            select(Brand.id).where(Brand.active.is_(True))
+        ).all()
+    return list(rows)
+
+
 class AdminConfigClient:
     """Read/write admin.db scoped to a single brand.
 

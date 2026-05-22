@@ -27,7 +27,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pipeline.common.config import get_settings
 
 from .auth import require_admin_token
+from .routes import brands as brands_routes
 from .routes import config as config_routes
+from .routes import cost as cost_routes
 from .routes import drafts as drafts_routes
 from .routes import prompts as prompts_routes
 from .routes import runs as runs_routes
@@ -68,6 +70,10 @@ def create_app() -> FastAPI:
 
     auth = [Depends(require_admin_token)]
     app.include_router(
+        brands_routes.router, prefix="/api/v1/brands",
+        tags=["brands"], dependencies=auth,
+    )
+    app.include_router(
         sources_routes.router, prefix="/api/v1/sources",
         tags=["sources"], dependencies=auth,
     )
@@ -86,6 +92,10 @@ def create_app() -> FastAPI:
     app.include_router(
         drafts_routes.router, prefix="/api/v1/drafts",
         tags=["drafts"], dependencies=auth,
+    )
+    app.include_router(
+        cost_routes.router, prefix="/api/v1/cost",
+        tags=["cost"], dependencies=auth,
     )
     return app
 
