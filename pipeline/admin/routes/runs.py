@@ -11,6 +11,7 @@ from pipeline.admin.db import session_scope
 from pipeline.admin.models import CostRecord, Run, Topic
 from pipeline.admin.schemas import (
     CostBreakdownItem,
+    CostByTopicItem,
     RunDetailWithCostOut,
     RunLogOut,
     RunOut,
@@ -49,6 +50,11 @@ def list_runs(
 def get_run(run_id: int) -> RunDetailWithCostOut:
     total = 0.0
     by_op: dict[str, tuple[float, int]] = {}
+    # S4: per-topic rollup. topic_id is nullable on cost_records (e.g.,
+    # pre-topic scoring batch costs land with topic_id=NULL), so the
+    # "unattributed" bucket is keyed by None and folded into the chart
+    # later as run-level overhead.
+    by_topic: dict[int | None, dict[str, float]] = {}
     with session_scope() as session:
         r = session.get(Run, run_id)
         if r is None:
@@ -69,16 +75,30 @@ def get_run(run_id: int) -> RunDetailWithCostOut:
             total += c.cost_usd
             agg = by_op.get(c.operation, (0.0, 0))
             by_op[c.operation] = (agg[0] + c.cost_usd, agg[1] + 1)
+            topic_bucket = by_topic.setdefault(c.topic_id, {})
+            topic_bucket[c.operation] = (
+                topic_bucket.get(c.operation, 0.0) + c.cost_usd
+            )
 
     breakdown = [
         CostBreakdownItem(operation=op, cost_usd=round(amt, 6), count=n)
         for op, (amt, n) in sorted(by_op.items())
     ]
+    cost_by_topic = [
+        CostByTopicItem(
+            topic_id=tid,
+            by_operation={k: round(v, 6) for k, v in ops.items()},
+            total_usd=round(sum(ops.values()), 6),
+        )
+        for tid, ops in by_topic.items()
+    ]
+    cost_by_topic.sort(key=lambda c: c.total_usd, reverse=True)
     return RunDetailWithCostOut(
         run=run_out,
         topics=topics_out,
         cost_total_usd=round(total, 6),
         cost_breakdown=breakdown,
+        cost_by_topic=cost_by_topic,
     )
 
 

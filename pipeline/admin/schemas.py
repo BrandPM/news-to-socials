@@ -392,6 +392,19 @@ class CostBreakdownItem(BaseModel):
     count: int
 
 
+class CostByTopicItem(BaseModel):
+    """Per-topic cost rollup attached to GET /runs/{id} (added in S4).
+
+    ``topic_id`` may be ``None`` to represent costs incurred at the run
+    level (e.g., pre-topic scoring batch). The frontend renders this as
+    a "Run overhead" row in the per-topic bar chart.
+    """
+
+    topic_id: int | None
+    by_operation: dict[str, float]
+    total_usd: float
+
+
 class DraftDetailOut(BaseModel):
     sanity_id: str
     title: str | None
@@ -481,3 +494,4 @@ class RunDetailWithCostOut(BaseModel):
     topics: list[TopicOut]
     cost_total_usd: float
     cost_breakdown: list[CostBreakdownItem]
+    cost_by_topic: list[CostByTopicItem] = []

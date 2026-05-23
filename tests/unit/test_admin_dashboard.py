@@ -313,3 +313,84 @@ def test_runs_status_filter_rejects_unknown_value(client_and_brand) -> None:
         f"/api/v1/runs?brand_id={bid}&status=garbage", headers=AUTH
     )
     assert resp.status_code == 422
+
+
+# --- /runs/{id} cost_by_topic field --------------------------------------
+
+
+def test_runs_detail_groups_costs_by_topic(client_and_brand) -> None:
+    """Per-topic rollup on /runs/{id} powers the topic bar chart in S4."""
+    client, bid = client_and_brand
+    factory = admin_db.get_session_factory()
+    from pipeline.admin.models import Source, Topic
+
+    with factory() as session:
+        source = Source(
+            brand_id_fk=bid,
+            name="Test",
+            source_type="rss",
+            url="https://example.com/rss",
+            primary_category="business",
+        )
+        session.add(source)
+        session.flush()
+        src_id = source.id
+        run = Run(
+            brand_id_fk=bid,
+            triggered_by="test",
+            source_ids="[]",
+            started_at=datetime.now(tz=timezone.utc),
+            status="success",
+        )
+        session.add(run)
+        session.flush()
+        rid = run.id
+        topics = [
+            Topic(
+                run_id=rid,
+                topic_id=f"t{i}",
+                source_id=src_id,
+                title=f"T{i}",
+                status="passed",
+            )
+            for i in range(2)
+        ]
+        session.add_all(topics)
+        session.flush()
+        t0_id, t1_id = topics[0].id, topics[1].id
+        session.add_all(
+            [
+                CostRecord(
+                    brand_id_fk=bid, run_id=rid, topic_id=t0_id,
+                    provider="openai", operation="draft", cost_usd=0.10,
+                ),
+                CostRecord(
+                    brand_id_fk=bid, run_id=rid, topic_id=t0_id,
+                    provider="openai", operation="polish", cost_usd=0.05,
+                ),
+                CostRecord(
+                    brand_id_fk=bid, run_id=rid, topic_id=t1_id,
+                    provider="openai", operation="draft", cost_usd=0.20,
+                ),
+                # Topic-less record — represents run-level overhead.
+                CostRecord(
+                    brand_id_fk=bid, run_id=rid, topic_id=None,
+                    provider="openai", operation="topic_scoring", cost_usd=0.01,
+                ),
+            ]
+        )
+        session.commit()
+    body = client.get(f"/api/v1/runs/{rid}", headers=AUTH).json()
+    assert "cost_by_topic" in body
+    rollups = body["cost_by_topic"]
+    by_topic = {row["topic_id"]: row for row in rollups}
+    assert by_topic[t0_id]["total_usd"] == pytest.approx(0.15)
+    assert by_topic[t0_id]["by_operation"] == {
+        "draft": pytest.approx(0.10),
+        "polish": pytest.approx(0.05),
+    }
+    assert by_topic[t1_id]["total_usd"] == pytest.approx(0.20)
+    assert by_topic[None]["total_usd"] == pytest.approx(0.01)
+    # Sorted by total desc.
+    totals = [row["total_usd"] for row in rollups]
+    assert totals == sorted(totals, reverse=True)
