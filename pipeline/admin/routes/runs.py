@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
 from pipeline.admin.db import session_scope
@@ -14,6 +14,7 @@ from pipeline.admin.schemas import (
     RunDetailWithCostOut,
     RunLogOut,
     RunOut,
+    RunStatus,
     TopicOut,
 )
 from pipeline.common.config import get_settings
@@ -23,12 +24,23 @@ router = APIRouter()
 
 @router.get("", response_model=list[RunOut])
 def list_runs(
-    brand_id: int | None = None, limit: int = 20, offset: int = 0
+    brand_id: int | None = None,
+    status: RunStatus | None = Query(default=None),
+    limit: int = 20,
+    offset: int = 0,
 ) -> list[RunOut]:
+    """List runs, newest first.
+
+    ``status`` filter added in S4 so the dashboard active-runs panel can
+    poll ``?status=running`` cheaply, and the activity feed can scope to
+    ``success`` / ``failed`` when needed.
+    """
     with session_scope() as session:
         stmt = select(Run).order_by(Run.started_at.desc())
         if brand_id is not None:
             stmt = stmt.where(Run.brand_id_fk == brand_id)
+        if status is not None:
+            stmt = stmt.where(Run.status == status)
         stmt = stmt.offset(offset).limit(limit)
         return [RunOut.model_validate(r) for r in session.scalars(stmt)]
 

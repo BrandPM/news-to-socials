@@ -420,6 +420,41 @@ class CostSummaryOut(BaseModel):
     by_day: list[CostSummaryByDay]
 
 
+class CostTrendDayOut(BaseModel):
+    """One day in the cost-trend series, broken down by operation.
+
+    The frontend stacked-area chart (S4) renders one stacked layer per
+    operation key. Days with zero cost are returned with an empty
+    ``by_operation`` dict so the X-axis has no gaps.
+    """
+
+    date: str
+    by_operation: dict[str, float]
+    total: float
+
+
+class DashboardSummaryOut(BaseModel):
+    """Bundled KPI payload for the /dashboard hero row (S4).
+
+    Bundled so the page mounts with one round-trip instead of four. Each
+    field is independently testable.
+    """
+
+    cost_today_usd: float
+    cost_yesterday_usd: float
+    cost_today_trend_pct: float | None
+    cost_month_usd: float
+    cost_month_forecast_usd: float
+    cost_month_days_progress_pct: float
+    drafts_today: int
+    drafts_this_week: int
+    drafts_prev_week: int
+    last_run_finished_at: datetime | None
+    last_run_status: str | None
+    active_runs_count: int
+    avg_daily_cost_7d_usd: float
+
+
 class CostRecordOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

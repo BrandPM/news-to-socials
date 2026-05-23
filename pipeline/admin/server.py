@@ -30,6 +30,7 @@ from .auth import require_admin_token
 from .routes import brands as brands_routes
 from .routes import config as config_routes
 from .routes import cost as cost_routes
+from .routes import dashboard as dashboard_routes
 from .routes import drafts as drafts_routes
 from .routes import prompts as prompts_routes
 from .routes import runs as runs_routes
@@ -96,6 +97,10 @@ def create_app() -> FastAPI:
     app.include_router(
         cost_routes.router, prefix="/api/v1/cost",
         tags=["cost"], dependencies=auth,
+    )
+    app.include_router(
+        dashboard_routes.router, prefix="/api/v1/dashboard",
+        tags=["dashboard"], dependencies=auth,
     )
     return app
 
