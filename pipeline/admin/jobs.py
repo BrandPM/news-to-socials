@@ -139,3 +139,57 @@ async def execute_image_regenerate(
 def reset_image_jobs_for_tests() -> None:
     with _IMAGE_JOBS_LOCK:
         _IMAGE_JOBS.clear()
+
+
+# --- Text-regenerate jobs (S5 Step 7) -------------------------------------
+
+
+@dataclass
+class TextJob:
+    job_id: str
+    state: str = "pending"  # 'pending' | 'done' | 'error'
+    error: str | None = None
+
+
+_TEXT_JOBS: dict[str, TextJob] = {}
+_TEXT_JOBS_LOCK = threading.Lock()
+
+
+def register_text_job() -> TextJob:
+    job = TextJob(job_id=uuid.uuid4().hex)
+    with _TEXT_JOBS_LOCK:
+        _TEXT_JOBS[job.job_id] = job
+    return job
+
+
+def get_text_job(job_id: str) -> TextJob | None:
+    with _TEXT_JOBS_LOCK:
+        return _TEXT_JOBS.get(job_id)
+
+
+def _set_text_job(job_id: str, **fields: Any) -> None:
+    with _TEXT_JOBS_LOCK:
+        job = _TEXT_JOBS.get(job_id)
+        if job is None:
+            return
+        for k, v in fields.items():
+            setattr(job, k, v)
+
+
+async def execute_text_regenerate(
+    job_id: str,
+    sanity_draft_id: str,
+    brand_id_fk: int,
+) -> None:
+    from pipeline.admin.text_regenerate import regenerate_draft_text  # noqa: PLC0415
+
+    try:
+        await regenerate_draft_text(sanity_draft_id, brand_id_fk)
+        _set_text_job(job_id, state="done")
+    except Exception as exc:  # noqa: BLE001
+        _set_text_job(job_id, state="error", error=f"{type(exc).__name__}: {exc}")
+
+
+def reset_text_jobs_for_tests() -> None:
+    with _TEXT_JOBS_LOCK:
+        _TEXT_JOBS.clear()

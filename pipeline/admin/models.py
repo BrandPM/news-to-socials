@@ -324,6 +324,49 @@ class Topic(Base):
     )
 
 
+class DraftApproval(Base):
+    """One approval row per (Sanity draft, brand). Approve/Reject decisions.
+
+    The default ``status`` ``'draft'`` exists for completeness — the route
+    handler upserts only on approve/reject, so in practice every row has
+    ``approved`` or ``rejected``. ``UNIQUE (sanity_draft_id, brand_id_fk)``
+    keeps the latest decision authoritative; re-approving simply updates
+    ``decided_at``.
+    """
+
+    __tablename__ = "draft_approvals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sanity_draft_id: Mapped[str] = mapped_column(String, nullable=False)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("brands.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    decided_by: Mapped[str] = mapped_column(
+        String, nullable=False, default="admin"
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'approved', 'rejected')",
+            name="ck_draft_approvals_status",
+        ),
+        UniqueConstraint(
+            "sanity_draft_id",
+            "brand_id_fk",
+            name="uq_draft_approvals_draft_brand",
+        ),
+        Index("ix_draft_approvals_sanity_id", "sanity_draft_id"),
+        Index("ix_draft_approvals_brand_status", "brand_id_fk", "status"),
+    )
+
+
 class SourceHealthRecord(Base):
     """One row per source fetch. Powers /sources sparkline + health view.
 

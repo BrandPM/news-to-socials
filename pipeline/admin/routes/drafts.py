@@ -1,15 +1,19 @@
-"""``/api/v1/drafts`` route group — full draft preview + image regenerate."""
+"""``/api/v1/drafts`` route group — preview + image/text regen + approvals."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
-from pipeline.admin.models import Brand, CostRecord
+from pipeline.admin.models import Brand, CostRecord, DraftApproval
 from pipeline.admin.schemas import (
     CostBreakdownItem,
+    DraftApprovalIn,
+    DraftApprovalOut,
     DraftDetailOut,
     ImageRegenerateIn,
     JobAcceptedOut,
@@ -19,8 +23,71 @@ from pipeline.admin.schemas import (
 router = APIRouter()
 
 
+def _normalise_draft_id(sanity_draft_id: str) -> str:
+    if not sanity_draft_id.startswith("drafts."):
+        return f"drafts.{sanity_draft_id}"
+    return sanity_draft_id
+
+
+def _approval_to_out(row: DraftApproval | None) -> DraftApprovalOut | None:
+    if row is None:
+        return None
+    return DraftApprovalOut(
+        status=row.status,  # type: ignore[arg-type]
+        decided_at=row.decided_at,
+        decided_by=row.decided_by,
+        note=row.note,
+    )
+
+
+def _upsert_approval(
+    sanity_draft_id: str,
+    brand_id_fk: int,
+    new_status: str,
+    note: str | None,
+) -> DraftApproval:
+    """Insert or update the approval row for (draft, brand). Returns row."""
+    now = datetime.now(tz=timezone.utc)
+    with session_scope() as session:
+        row = session.execute(
+            select(DraftApproval).where(
+                DraftApproval.sanity_draft_id == sanity_draft_id,
+                DraftApproval.brand_id_fk == brand_id_fk,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = DraftApproval(
+                sanity_draft_id=sanity_draft_id,
+                brand_id_fk=brand_id_fk,
+                status=new_status,
+                decided_at=now,
+                decided_by="admin",
+                note=note,
+            )
+            session.add(row)
+        else:
+            row.status = new_status
+            row.decided_at = now
+            row.note = note
+        session.commit()
+        session.refresh(row)
+        # Detach to outlive the session
+        session.expunge(row)
+        return row
+
+
+def _ensure_brand_owns_draft(brand_id: int) -> Brand:
+    """Returns the brand row or raises 404. Brand-scope guard for mutations."""
+    with session_scope() as session:
+        brand = session.get(Brand, brand_id)
+        if brand is None:
+            raise HTTPException(status_code=404, detail="brand not found")
+        session.expunge(brand)
+        return brand
+
+
 # ---------------------------------------------------------------------------
-# GET /drafts/{sanity_id} — full preview (NTS_024 open question #1)
+# GET /drafts/{sanity_id} — full preview (extended with approval + AI tells)
 # ---------------------------------------------------------------------------
 
 
@@ -33,8 +100,11 @@ async def get_draft(
 
     Cross-brand guard: ``generatedBy.brandSlug`` (when present on the
     draft document) must match the active brand's slug — otherwise 403
-    "cross-brand draft access not allowed". Prevents Brand A's session
-    from peeking at Brand B's drafts.
+    "cross-brand draft access not allowed".
+
+    Extended in S5 Step 7 with ``approval`` (latest decision row from
+    ``draft_approvals``) and ``ai_tells_score`` / ``ai_tells`` (computed
+    on the polished body, no extra LLM call).
     """
     with session_scope() as session:
         brand = session.get(Brand, brand_id)
@@ -52,10 +122,7 @@ async def get_draft(
             detail=f"brand {slug!r} has no Sanity credentials configured",
         )
 
-    if not sanity_draft_id.startswith("drafts."):
-        sanity_draft_id_normalised = f"drafts.{sanity_draft_id}"
-    else:
-        sanity_draft_id_normalised = sanity_draft_id
+    sanity_draft_id_normalised = _normalise_draft_id(sanity_draft_id)
 
     from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
     from pipeline.publisher.sanity import SanityClient  # noqa: PLC0415
@@ -94,7 +161,7 @@ async def get_draft(
             detail=f"draft {sanity_draft_id_normalised!r} not found",
         )
 
-    # --- cross-brand guard: brandSlug on the draft must match active brand ---
+    # --- cross-brand guard ---
     generated_by = doc.get("generatedBy") or {}
     if isinstance(generated_by, dict):
         draft_brand_slug = generated_by.get("brandSlug")
@@ -109,7 +176,6 @@ async def get_draft(
         )
 
     body = doc.get("body")
-    # Portable Text → simple markdown-ish join (UI renders rich preview later).
     body_markdown: str | None = None
     if isinstance(body, list):
         chunks: list[str] = []
@@ -134,9 +200,24 @@ async def get_draft(
     elif isinstance(body, str):
         body_markdown = body
 
-    # --- cost data for this draft -----------------------------------------
+    # --- AI tells score (no extra LLM cost — pure string analysis) ---
+    ai_tells_score: int | None = None
+    ai_tells: list[str] = []
+    if body_markdown:
+        try:
+            from pipeline.generator.anti_ai_check import score_ai_tells  # noqa: PLC0415
+
+            score, tells = score_ai_tells(body_markdown)
+            ai_tells_score = int(round(score))
+            ai_tells = tells
+        except Exception:  # noqa: BLE001
+            ai_tells_score = None
+            ai_tells = []
+
+    # --- cost rollup + approval load ---
     total = 0.0
     by_op: dict[str, tuple[float, int]] = {}
+    approval_out: DraftApprovalOut | None = None
     with session_scope() as session:
         rows = session.scalars(
             select(CostRecord).where(
@@ -147,6 +228,15 @@ async def get_draft(
             total += r.cost_usd
             agg = by_op.get(r.operation, (0.0, 0))
             by_op[r.operation] = (agg[0] + r.cost_usd, agg[1] + 1)
+
+        approval_row = session.execute(
+            select(DraftApproval).where(
+                DraftApproval.sanity_draft_id == sanity_draft_id_normalised,
+                DraftApproval.brand_id_fk == brand_id,
+            )
+        ).scalar_one_or_none()
+        approval_out = _approval_to_out(approval_row)
+
     breakdown = [
         CostBreakdownItem(operation=op, cost_usd=round(c, 6), count=n)
         for op, (c, n) in sorted(by_op.items())
@@ -163,7 +253,39 @@ async def get_draft(
         created_at=doc.get("_createdAt"),
         cost_total_usd=round(total, 6),
         cost_breakdown=breakdown,
+        approval=approval_out,
+        ai_tells_score=ai_tells_score,
+        ai_tells=ai_tells,
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /drafts/{id}/approve and /reject — upsert into draft_approvals
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{sanity_draft_id}/approve", response_model=DraftApprovalOut)
+def approve_draft(
+    sanity_draft_id: str,
+    payload: DraftApprovalIn,
+    brand_id: int = Query(..., description="Active brand id"),
+) -> DraftApprovalOut:
+    _ensure_brand_owns_draft(brand_id)
+    normalised = _normalise_draft_id(sanity_draft_id)
+    row = _upsert_approval(normalised, brand_id, "approved", payload.note)
+    return _approval_to_out(row)  # type: ignore[return-value]
+
+
+@router.post("/{sanity_draft_id}/reject", response_model=DraftApprovalOut)
+def reject_draft(
+    sanity_draft_id: str,
+    payload: DraftApprovalIn,
+    brand_id: int = Query(..., description="Active brand id"),
+) -> DraftApprovalOut:
+    _ensure_brand_owns_draft(brand_id)
+    normalised = _normalise_draft_id(sanity_draft_id)
+    row = _upsert_approval(normalised, brand_id, "rejected", payload.note)
+    return _approval_to_out(row)  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -197,3 +319,37 @@ def regenerate_image_status(job_id: str) -> JobStatusOut:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return JobStatusOut(state=job.state, asset_id=job.asset_id, error=job.error)
+
+
+# ---------------------------------------------------------------------------
+# Text regenerate (S5 Step 7) — re-polish the existing body, patch Sanity
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{sanity_draft_id}/regenerate-text",
+    response_model=JobAcceptedOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def regenerate_text(
+    sanity_draft_id: str,
+    background: BackgroundTasks,
+    brand_id: int = Query(..., description="Active brand id"),
+) -> JobAcceptedOut:
+    _ensure_brand_owns_draft(brand_id)
+    job = jobs.register_text_job()
+    background.add_task(
+        jobs.execute_text_regenerate,
+        job.job_id,
+        _normalise_draft_id(sanity_draft_id),
+        brand_id,
+    )
+    return JobAcceptedOut(job_id=job.job_id)
+
+
+@router.get("/text-jobs/{job_id}/status", response_model=JobStatusOut)
+def regenerate_text_status(job_id: str) -> JobStatusOut:
+    job = jobs.get_text_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return JobStatusOut(state=job.state, asset_id=None, error=job.error)

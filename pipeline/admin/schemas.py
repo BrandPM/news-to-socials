@@ -405,6 +405,23 @@ class CostByTopicItem(BaseModel):
     total_usd: float
 
 
+class DraftApprovalOut(BaseModel):
+    """Approval row exposed on GET /drafts/{id} (S5 Step 7)."""
+
+    status: Literal["draft", "approved", "rejected"]
+    decided_at: datetime
+    decided_by: str
+    note: str | None = None
+
+
+class DraftApprovalIn(BaseModel):
+    """Optional payload for approve/reject (S5 Step 7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = Field(default=None, max_length=2000)
+
+
 class DraftDetailOut(BaseModel):
     sanity_id: str
     title: str | None
@@ -416,6 +433,9 @@ class DraftDetailOut(BaseModel):
     created_at: str | None
     cost_total_usd: float
     cost_breakdown: list[CostBreakdownItem]
+    approval: DraftApprovalOut | None = None
+    ai_tells_score: int | None = None
+    ai_tells: list[str] = []
 
 
 # --- Cost summary -------------------------------------------------------
