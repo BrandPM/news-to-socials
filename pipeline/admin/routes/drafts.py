@@ -15,10 +15,14 @@ from pipeline.admin.schemas import (
     DraftApprovalIn,
     DraftApprovalOut,
     DraftDetailOut,
+    DraftListItem,
+    DraftListOut,
     ImageRegenerateIn,
     JobAcceptedOut,
     JobStatusOut,
 )
+
+SUPPORTED_LANGUAGES = ("en", "ru", "uk", "pl")
 
 router = APIRouter()
 
@@ -87,24 +91,15 @@ def _ensure_brand_owns_draft(brand_id: int) -> Brand:
 
 
 # ---------------------------------------------------------------------------
-# GET /drafts/{sanity_id} — full preview (extended with approval + AI tells)
+# GET /drafts — brand-scoped list, language tabs + sibling lookup (S6.7)
 # ---------------------------------------------------------------------------
 
 
-@router.get("/{sanity_draft_id}", response_model=DraftDetailOut)
-async def get_draft(
-    sanity_draft_id: str,
-    brand_id: int = Query(..., description="Active brand id from the UI session"),
-) -> DraftDetailOut:
-    """Fetch a draft from Sanity using ``brand_id``'s decrypted creds.
+def _build_sanity_client_for_brand(brand_id: int) -> tuple[object, str]:
+    """Return ``(SanityClient, brand_slug)`` or raise the right HTTPException.
 
-    Cross-brand guard: ``generatedBy.brandSlug`` (when present on the
-    draft document) must match the active brand's slug — otherwise 403
-    "cross-brand draft access not allowed".
-
-    Extended in S5 Step 7 with ``approval`` (latest decision row from
-    ``draft_approvals``) and ``ai_tells_score`` / ``ai_tells`` (computed
-    on the polished body, no extra LLM call).
+    Shared by the list endpoint and the detail endpoint so credential
+    resolution and brand-existence guards live in one place.
     """
     with session_scope() as session:
         brand = session.get(Brand, brand_id)
@@ -121,8 +116,6 @@ async def get_draft(
             status_code=409,
             detail=f"brand {slug!r} has no Sanity credentials configured",
         )
-
-    sanity_draft_id_normalised = _normalise_draft_id(sanity_draft_id)
 
     from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
     from pipeline.publisher.sanity import SanityClient  # noqa: PLC0415
@@ -142,10 +135,165 @@ async def get_draft(
         token=token,
     )
     del token  # M3 — release plaintext reference early
+    return client, slug
+
+
+@router.get("", response_model=DraftListOut)
+async def list_drafts(
+    brand_id: int = Query(..., description="Active brand id from the UI session"),
+    language: str | None = Query(
+        default=None,
+        pattern="^(en|ru|uk|pl)$",
+        description="Filter by language (en/ru/uk/pl). Omit for all.",
+    ),
+    topic_id: str | None = Query(
+        default=None,
+        description="When set, returns only drafts that share this topicId — used by the /drafts/[id] siblings panel.",
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> DraftListOut:
+    """List Sanity drafts for ``brand_id``, with language counts.
+
+    S6.7 powers the multilingual /drafts list. Counts in ``by_language``
+    are always brand-wide so the tab strip doesn't jitter as the user
+    clicks a filter. ``items`` is the filtered + paginated slice.
+    """
+    client, brand_slug = _build_sanity_client_for_brand(brand_id)
+
+    # The brand-scope filter relies on the post.ts patch
+    # (``generatedBy.brandSlug``). Older posts that lack the field show
+    # in the list too (the cross-brand guard on the detail route catches
+    # any stray edits). This is the same logic the dedup helper uses.
+    base_filter = (
+        '_type == "post" && _id in path("drafts.**") && '
+        '(generatedBy.brandSlug == $slug || !defined(generatedBy.brandSlug))'
+    )
+    if topic_id:
+        base_filter += " && topicId == $topic"
+
+    selection = (
+        "{_id, title, language, topicId, _createdAt, "
+        '"coverImageUrl": coverImage.asset->url}'
+    )
+
+    counts_groq = (
+        f'*[{base_filter}]{{language}} | '
+        '{"by_language": @[].language}'
+    )
+    # Compose the count query as a faceting GROQ so we get totals in one
+    # round-trip alongside the slice.
+    counts_groq = (
+        '{'
+        f'"total": count(*[{base_filter}]),'
+        f'"en": count(*[{base_filter} && language == "en"]),'
+        f'"ru": count(*[{base_filter} && language == "ru"]),'
+        f'"uk": count(*[{base_filter} && language == "uk"]),'
+        f'"pl": count(*[{base_filter} && language == "pl"])'
+        '}'
+    )
+
+    items_filter = base_filter
+    if language:
+        items_filter += f' && language == "{language}"'
+    items_groq = (
+        f'*[{items_filter}] | order(_createdAt desc) '
+        f'[{offset}...{offset + limit}] {selection}'
+    )
+
+    params: dict[str, object] = {"slug": brand_slug}
+    if topic_id:
+        params["topic"] = topic_id
+
+    try:
+        counts = await client.query(counts_groq, params)  # type: ignore[attr-defined]
+        rows = await client.query(items_groq, params)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sanity query failed: {type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+
+    by_language: dict[str, int] = {}
+    if isinstance(counts, dict):
+        for code in SUPPORTED_LANGUAGES:
+            by_language[code] = int(counts.get(code) or 0)
+        total = int(counts.get("total") or 0)
+    else:
+        total = 0
+
+    items_raw: list[dict] = rows if isinstance(rows, list) else []
+    sanity_ids = [r.get("_id") for r in items_raw if isinstance(r, dict) and r.get("_id")]
+
+    # Bulk-load approval status so the list view renders without N+1.
+    approvals: dict[str, str] = {}
+    if sanity_ids:
+        with session_scope() as session:
+            for row in session.scalars(
+                select(DraftApproval).where(
+                    DraftApproval.brand_id_fk == brand_id,
+                    DraftApproval.sanity_draft_id.in_(sanity_ids),
+                )
+            ):
+                approvals[row.sanity_draft_id] = row.status
+
+    items: list[DraftListItem] = []
+    for raw in items_raw:
+        if not isinstance(raw, dict) or not raw.get("_id"):
+            continue
+        sid = str(raw["_id"])
+        items.append(
+            DraftListItem(
+                sanity_id=sid,
+                title=raw.get("title"),
+                language=str(raw.get("language") or "en"),
+                topic_id=raw.get("topicId"),
+                created_at=raw.get("_createdAt"),
+                cover_image_url=raw.get("coverImageUrl"),
+                approval_status=approvals.get(sid, "draft"),  # type: ignore[arg-type]
+            )
+        )
+
+    # ``has_more`` reflects pagination of the *filtered* slice, not the
+    # brand-wide total — so a language tab knows whether to show
+    # "Load more" while the tab strip keeps showing brand-wide counts.
+    effective_total = by_language.get(language, 0) if language else total
+    return DraftListOut(
+        items=items,
+        total=total,
+        by_language=by_language,
+        has_more=offset + len(items) < effective_total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /drafts/{sanity_id} — full preview (extended with approval + AI tells)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{sanity_draft_id}", response_model=DraftDetailOut)
+async def get_draft(
+    sanity_draft_id: str,
+    brand_id: int = Query(..., description="Active brand id from the UI session"),
+) -> DraftDetailOut:
+    """Fetch a draft from Sanity using ``brand_id``'s decrypted creds.
+
+    Cross-brand guard: ``generatedBy.brandSlug`` (when present on the
+    draft document) must match the active brand's slug — otherwise 403
+    "cross-brand draft access not allowed".
+
+    Extended in S5 Step 7 with ``approval`` (latest decision row from
+    ``draft_approvals``) and ``ai_tells_score`` / ``ai_tells`` (computed
+    on the polished body, no extra LLM call).
+    """
+    client, slug = _build_sanity_client_for_brand(brand_id)
+
+    sanity_draft_id_normalised = _normalise_draft_id(sanity_draft_id)
 
     groq = (
         '*[_id == $id][0]{title, body, keyTakeaway, generatedBy, '
-        '_createdAt, "coverImageUrl": coverImage.asset->url}'
+        'language, topicId, _createdAt, '
+        '"coverImageUrl": coverImage.asset->url}'
     )
     try:
         doc = await client.query(groq, {"id": sanity_draft_id_normalised})
@@ -251,6 +399,8 @@ async def get_draft(
         generated_by=generated_by_str,
         brand_slug=draft_brand_slug or slug,
         created_at=doc.get("_createdAt"),
+        language=doc.get("language"),
+        topic_id=doc.get("topicId"),
         cost_total_usd=round(total, 6),
         cost_breakdown=breakdown,
         approval=approval_out,

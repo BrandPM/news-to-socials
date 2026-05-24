@@ -229,3 +229,209 @@ def test_get_draft_aggregates_cost_records(monkeypatch, client, icon_with_creds)
     assert body["cost_total_usd"] == pytest.approx(0.29)
     ops = {item["operation"] for item in body["cost_breakdown"]}
     assert ops == {"draft", "polish", "image_master"}
+
+
+def test_get_draft_surfaces_language_and_topic_id(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """S6.7 — detail endpoint must return ``language`` and ``topic_id`` so
+    the frontend header can render a language badge + Siblings link
+    without a second round-trip."""
+    bid = icon_with_creds
+    fake_doc = {
+        "title": "Polish credit fund piece",
+        "body": [],
+        "keyTakeaway": None,
+        "generatedBy": {"name": "pipeline", "brandSlug": "icon"},
+        "_createdAt": "2026-05-24T19:15:25Z",
+        "coverImageUrl": None,
+        "language": "pl",
+        "topicId": "6b640357e6a87b25",
+    }
+    from pipeline.publisher import sanity as sanity_mod
+
+    monkeypatch.setattr(
+        sanity_mod.SanityClient, "query", AsyncMock(return_value=fake_doc)
+    )
+    resp = client.get(
+        f"/api/v1/drafts/post-pl?brand_id={bid}", headers=AUTH
+    )
+    body = resp.json()
+    assert body["language"] == "pl"
+    assert body["topic_id"] == "6b640357e6a87b25"
+
+
+# --- S6.7 list endpoint --------------------------------------------------
+
+
+def _make_list_query_mock(counts: dict, items: list[dict]) -> AsyncMock:
+    """Two sequential calls: counts faceting, then items page."""
+    return AsyncMock(side_effect=[counts, items])
+
+
+def test_list_drafts_returns_items_with_language_counts(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    bid = icon_with_creds
+    counts = {"total": 7, "en": 3, "ru": 2, "uk": 1, "pl": 1}
+    items = [
+        {
+            "_id": "drafts.post-pl",
+            "title": "Polski",
+            "language": "pl",
+            "topicId": "topic-1",
+            "_createdAt": "2026-05-24T19:15:25Z",
+            "coverImageUrl": "https://cdn/x.jpg",
+        },
+        {
+            "_id": "drafts.post-uk",
+            "title": "Українська",
+            "language": "uk",
+            "topicId": "topic-1",
+            "_createdAt": "2026-05-24T19:14:55Z",
+            "coverImageUrl": None,
+        },
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    monkeypatch.setattr(
+        sanity_mod.SanityClient, "query", _make_list_query_mock(counts, items)
+    )
+    resp = client.get(f"/api/v1/drafts?brand_id={bid}", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total"] == 7
+    assert body["by_language"] == {"en": 3, "ru": 2, "uk": 1, "pl": 1}
+    assert [it["sanity_id"] for it in body["items"]] == [
+        "drafts.post-pl",
+        "drafts.post-uk",
+    ]
+    assert body["items"][0]["language"] == "pl"
+    assert body["items"][0]["topic_id"] == "topic-1"
+    assert body["items"][0]["approval_status"] == "draft"
+    assert body["has_more"] is True
+
+
+def test_list_drafts_filters_by_language(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """The ``language`` query param narrows the items slice but the
+    ``by_language`` totals stay brand-wide so the tab strip stays stable."""
+    bid = icon_with_creds
+    counts = {"total": 4, "en": 1, "ru": 1, "uk": 1, "pl": 1}
+    items_pl = [
+        {
+            "_id": "drafts.post-pl",
+            "title": "Polski",
+            "language": "pl",
+            "topicId": "topic-1",
+            "_createdAt": "2026-05-24T19:15:25Z",
+            "coverImageUrl": None,
+        }
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    monkeypatch.setattr(
+        sanity_mod.SanityClient, "query", _make_list_query_mock(counts, items_pl)
+    )
+    resp = client.get(
+        f"/api/v1/drafts?brand_id={bid}&language=pl", headers=AUTH
+    )
+    body = resp.json()
+    assert body["total"] == 4
+    assert body["by_language"]["pl"] == 1
+    assert len(body["items"]) == 1
+    assert body["items"][0]["language"] == "pl"
+    assert body["has_more"] is False
+
+
+def test_list_drafts_filters_by_topic_id_for_siblings(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """The detail page's Siblings panel queries with ``topic_id`` to find
+    every language sibling of one topic."""
+    bid = icon_with_creds
+    counts = {"total": 2, "en": 0, "ru": 0, "uk": 1, "pl": 1}
+    items = [
+        {
+            "_id": "drafts.post-pl",
+            "title": "Polski",
+            "language": "pl",
+            "topicId": "shared-topic",
+            "_createdAt": "2026-05-24T19:15:25Z",
+            "coverImageUrl": None,
+        },
+        {
+            "_id": "drafts.post-uk",
+            "title": "Українська",
+            "language": "uk",
+            "topicId": "shared-topic",
+            "_createdAt": "2026-05-24T19:14:55Z",
+            "coverImageUrl": None,
+        },
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    mock = _make_list_query_mock(counts, items)
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", mock)
+    resp = client.get(
+        f"/api/v1/drafts?brand_id={bid}&topic_id=shared-topic", headers=AUTH
+    )
+    body = resp.json()
+    assert body["total"] == 2
+    assert {it["language"] for it in body["items"]} == {"pl", "uk"}
+    # Both Sanity queries were issued with the topic param.
+    first_call = mock.await_args_list[0]
+    assert first_call.args[1]["topic"] == "shared-topic"
+
+
+def test_list_drafts_rejects_unknown_brand(monkeypatch, client) -> None:
+    resp = client.get("/api/v1/drafts?brand_id=99999", headers=AUTH)
+    assert resp.status_code == 404
+
+
+def test_list_drafts_409_when_brand_has_no_sanity_creds(
+    monkeypatch, client
+) -> None:
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        bid = seed_brand(
+            session, slug="neovox", with_sanity_creds=False
+        ).id
+        session.commit()
+    resp = client.get(f"/api/v1/drafts?brand_id={bid}", headers=AUTH)
+    assert resp.status_code == 409
+
+
+def test_list_drafts_merges_approval_status(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """Approval rows for drafts in the slice get folded into
+    ``approval_status`` so the list row can render a badge with no
+    second round-trip."""
+    bid = icon_with_creds
+    counts = {"total": 1, "en": 0, "ru": 0, "uk": 0, "pl": 1}
+    items = [
+        {
+            "_id": "drafts.post-pl-approved",
+            "title": "Polski",
+            "language": "pl",
+            "topicId": "topic-1",
+            "_createdAt": "2026-05-24T19:15:25Z",
+            "coverImageUrl": None,
+        }
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    monkeypatch.setattr(
+        sanity_mod.SanityClient, "query", _make_list_query_mock(counts, items)
+    )
+    # Approve the draft first.
+    client.post(
+        f"/api/v1/drafts/post-pl-approved/approve?brand_id={bid}",
+        headers=AUTH,
+        json={"note": "ok"},
+    )
+    resp = client.get(f"/api/v1/drafts?brand_id={bid}", headers=AUTH)
+    body = resp.json()
+    assert body["items"][0]["approval_status"] == "approved"

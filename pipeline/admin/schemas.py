@@ -446,11 +446,40 @@ class DraftDetailOut(BaseModel):
     generated_by: str | None
     brand_slug: str | None
     created_at: str | None
+    language: str | None = None
+    topic_id: str | None = None
     cost_total_usd: float
     cost_breakdown: list[CostBreakdownItem]
     approval: DraftApprovalOut | None = None
     ai_tells_score: int | None = None
     ai_tells: list[str] = []
+
+
+class DraftListItem(BaseModel):
+    """Row in the multilingual /drafts list view (S6.7)."""
+
+    sanity_id: str
+    title: str | None
+    language: str
+    topic_id: str | None
+    created_at: str | None
+    cover_image_url: str | None = None
+    approval_status: Literal["draft", "approved", "rejected"] = "draft"
+
+
+class DraftListOut(BaseModel):
+    """Paginated drafts list with language counts (S6.7).
+
+    ``by_language`` powers the tab strip — the UI shows
+    ``All (N) | EN (a) | RU (b) | UK (c) | PL (d)``. Counts cover the
+    *brand-wide* set, not the filtered slice, so the strip stays stable
+    as the user clicks tabs.
+    """
+
+    items: list[DraftListItem]
+    total: int
+    by_language: dict[str, int]
+    has_more: bool = False
 
 
 # --- Cost summary -------------------------------------------------------
