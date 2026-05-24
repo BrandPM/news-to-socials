@@ -56,7 +56,11 @@ class Settings(BaseSettings):
     # request except /health. Empty string means admin API is disabled.
     admin_trigger_secret: str = ""
     admin_cors_origin: str = "http://localhost:3000"
-    admin_log_path: Path = Path("/var/log/news-to-socials/run.log")
+    # Where /runs/{id}/log + /runs/{id}/events read structured pipeline
+    # events from. After NTS_025 the pipeline runs inside the admin-api
+    # systemd unit, which redirects stdout to admin-api.log; the legacy
+    # run.log only catches cron-triggered runs predating that move.
+    admin_log_path: Path = Path("/var/log/news-to-socials/admin-api.log")
 
     # Master Fernet key for per-brand credential encryption in admin.db.
     # Same value must be set on Mac + VPS .env. repr=False keeps the key
