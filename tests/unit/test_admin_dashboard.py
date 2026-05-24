@@ -81,6 +81,7 @@ def _add_run(
     drafted: int = 0,
     days_ago: float = 0,
     finished: bool = True,
+    log_excerpt: str | None = None,
 ) -> int:
     factory = admin_db.get_session_factory()
     now = datetime.now(tz=timezone.utc)
@@ -94,6 +95,7 @@ def _add_run(
             finished_at=started + timedelta(seconds=5) if finished else None,
             status=status,
             stats=json.dumps({"drafted": drafted}),
+            log_excerpt=log_excerpt,
         )
         session.add(run)
         session.flush()
@@ -238,6 +240,127 @@ def test_summary_drafts_today_and_week(client_and_brand) -> None:
     ).json()
     assert body["drafts_today"] == 2
     assert body["drafts_this_week"] == 3
+
+
+def test_summary_drafts_by_language_parses_log_excerpt(
+    client_and_brand,
+) -> None:
+    """S6.8 — when runs.log_excerpt has S6-shaped lines, dashboard
+    returns a per-language split for ``drafts_this_week``. The total
+    must still match ``drafts_this_week`` (parser is internal-consistent
+    when each language fires once)."""
+    client, bid = client_and_brand
+    _add_run(
+        bid,
+        status="success",
+        drafted=4,
+        days_ago=0,
+        log_excerpt=(
+            "[en] source 1: fetched=10 scored=1 drafted=1 errors=0\n"
+            "[ru] source 1: fetched=10 scored=1 drafted=1 errors=0\n"
+            "[uk] source 1: fetched=10 scored=1 drafted=1 errors=0\n"
+            "[pl] source 1: fetched=10 scored=1 drafted=1 errors=0"
+        ),
+    )
+    _add_run(
+        bid,
+        status="success",
+        drafted=2,
+        days_ago=2,
+        log_excerpt=(
+            "[en] source 1: fetched=10 scored=2 drafted=1 errors=0\n"
+            "[ru] source 1: fetched=10 scored=2 drafted=1 errors=0"
+        ),
+    )
+    body = client.get(
+        f"/api/v1/dashboard/summary?brand_id={bid}", headers=AUTH
+    ).json()
+    assert body["drafts_this_week"] == 6
+    assert body["drafts_this_week_by_language"] == {
+        "en": 2,
+        "ru": 2,
+        "uk": 1,
+        "pl": 1,
+    }
+
+
+def test_summary_drafts_by_language_empty_for_pre_s6_logs(
+    client_and_brand,
+) -> None:
+    """Pre-S6 runs have log lines without a ``[lang]`` prefix; the
+    parser must skip them quietly rather than emit a default bucket so
+    legacy runs don't synthesise fake EN counts."""
+    client, bid = client_and_brand
+    _add_run(
+        bid,
+        status="success",
+        drafted=2,
+        days_ago=0,
+        log_excerpt="source 1: fetched=10 scored=2 drafted=2 errors=0",
+    )
+    body = client.get(
+        f"/api/v1/dashboard/summary?brand_id={bid}", headers=AUTH
+    ).json()
+    assert body["drafts_this_week"] == 2
+    assert body["drafts_this_week_by_language"] == {}
+
+
+def test_runs_detail_exposes_languages_completed_and_topic_language(
+    client_and_brand,
+) -> None:
+    """S6.8 — /runs/{id} response surfaces ``run.languages_completed``
+    plus ``topic.language`` for the per-topic table."""
+    client, bid = client_and_brand
+    factory = admin_db.get_session_factory()
+    from pipeline.admin.models import Source, Topic
+
+    with factory() as session:
+        source = Source(
+            brand_id_fk=bid,
+            name="S6 source",
+            source_type="rss",
+            url="https://example.com/rss",
+            primary_category="business",
+        )
+        session.add(source)
+        session.flush()
+        src_id = source.id
+        run = Run(
+            brand_id_fk=bid,
+            triggered_by="test",
+            source_ids="[]",
+            started_at=datetime.now(tz=timezone.utc),
+            status="success",
+            languages_completed=json.dumps(["en", "ru", "pl"]),
+        )
+        session.add(run)
+        session.flush()
+        rid = run.id
+        session.add_all(
+            [
+                Topic(
+                    run_id=rid,
+                    topic_id="topic-en",
+                    source_id=src_id,
+                    title="EN topic",
+                    status="passed",
+                    language="en",
+                ),
+                Topic(
+                    run_id=rid,
+                    topic_id="topic-ru",
+                    source_id=src_id,
+                    title="RU topic",
+                    status="passed",
+                    language="ru",
+                ),
+            ]
+        )
+        session.commit()
+    body = client.get(f"/api/v1/runs/{rid}", headers=AUTH).json()
+    assert body["run"]["languages_completed"] == ["en", "ru", "pl"]
+    langs = {t["language"] for t in body["topics"]}
+    assert langs == {"en", "ru"}
 
 
 def test_summary_active_runs_count_only_running(client_and_brand) -> None:

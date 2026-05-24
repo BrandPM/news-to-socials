@@ -208,6 +208,7 @@ class TopicOut(BaseModel):
     filter_reason: str | None
     draft_id: str | None
     created_at: datetime
+    language: str = "en"
 
 
 class RunOut(BaseModel):
@@ -222,6 +223,7 @@ class RunOut(BaseModel):
     status: RunStatus
     stats: dict[str, Any] | None
     log_excerpt: str | None
+    languages_completed: list[str] = []
 
     @field_validator("source_ids", mode="before")
     @classmethod
@@ -236,6 +238,21 @@ class RunOut(BaseModel):
         if isinstance(v, str):
             return json.loads(v) if v else None
         return v
+
+    @field_validator("languages_completed", mode="before")
+    @classmethod
+    def _parse_languages_completed(cls, v: Any) -> Any:
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+            except (ValueError, TypeError):
+                return []
+            return parsed if isinstance(parsed, list) else []
+        if isinstance(v, list):
+            return v
+        return []
 
 
 class RunDetailOut(BaseModel):
@@ -526,6 +543,7 @@ class DashboardSummaryOut(BaseModel):
     drafts_today: int
     drafts_this_week: int
     drafts_prev_week: int
+    drafts_this_week_by_language: dict[str, int] = {}
     last_run_finished_at: datetime | None
     last_run_status: str | None
     active_runs_count: int

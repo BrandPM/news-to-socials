@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter
@@ -21,6 +22,30 @@ from sqlalchemy import func, select
 from pipeline.admin.db import session_scope
 from pipeline.admin.models import CostRecord, Run
 from pipeline.admin.schemas import DashboardSummaryOut
+
+# Matches the log lines run_pipeline writes per (source, language):
+#   [ru] source 1: fetched=10 scored=1 drafted=0 errors=0
+# Captures the language code + the drafted count so the dashboard can
+# split the weekly KPI without a schema change.
+_LOG_DRAFTED_RE = re.compile(
+    r"^\[(?P<lang>[a-z]{2,3})\][^\n]*?drafted=(?P<drafted>\d+)",
+    re.MULTILINE,
+)
+
+
+def _drafts_by_language_from_log(log_excerpt: str | None) -> dict[str, int]:
+    """Parse ``run.log_excerpt`` into ``{lang: drafted_count}``.
+
+    Returns an empty dict if the excerpt is empty or pre-S6 (lines lack
+    the ``[lang]`` prefix). Caller aggregates across multiple runs.
+    """
+    if not log_excerpt:
+        return {}
+    out: dict[str, int] = {}
+    for match in _LOG_DRAFTED_RE.finditer(log_excerpt):
+        lang = match.group("lang")
+        out[lang] = out.get(lang, 0) + int(match.group("drafted"))
+    return out
 
 router = APIRouter()
 
@@ -31,12 +56,18 @@ def _start_of_today_utc(now: datetime) -> datetime:
 
 def _drafts_count_in_window(
     session, brand_id: int, start: datetime, end: datetime
-) -> int:
+) -> tuple[int, dict[str, int]]:
     """Sum the 'drafted' stat across successful runs in [start, end).
 
     Counted from runs.stats JSON rather than from Sanity to keep this
     page tied to pipeline output (Sanity could have manually-created
     documents that aren't pipeline drafts).
+
+    Returns ``(total, by_language)``. The per-language breakdown is
+    parsed out of ``runs.log_excerpt`` — see ``_drafts_by_language_from_log``.
+    Pre-S6 runs have no language prefix in the log; ``by_language`` is
+    empty for those and the caller is expected to display the count as
+    a single "EN" bucket if needed.
     """
     rows = session.scalars(
         select(Run).where(
@@ -47,6 +78,7 @@ def _drafts_count_in_window(
         )
     ).all()
     total = 0
+    by_language: dict[str, int] = {}
     for r in rows:
         if not r.stats:
             continue
@@ -57,7 +89,9 @@ def _drafts_count_in_window(
         drafted = stats.get("drafted") if isinstance(stats, dict) else None
         if isinstance(drafted, int):
             total += drafted
-    return total
+        for lang, count in _drafts_by_language_from_log(r.log_excerpt).items():
+            by_language[lang] = by_language.get(lang, 0) + count
+    return total, by_language
 
 
 @router.get("/summary", response_model=DashboardSummaryOut)
@@ -120,13 +154,13 @@ def dashboard_summary(brand_id: int) -> DashboardSummaryOut:
             )
         ).scalar_one()
 
-        drafts_today = _drafts_count_in_window(
+        drafts_today, _ = _drafts_count_in_window(
             session, brand_id, today_start, today_start + timedelta(days=1)
         )
-        drafts_week = _drafts_count_in_window(
+        drafts_week, drafts_week_by_lang = _drafts_count_in_window(
             session, brand_id, week_start, today_start + timedelta(days=1)
         )
-        drafts_prev_week = _drafts_count_in_window(
+        drafts_prev_week, _ = _drafts_count_in_window(
             session, brand_id, prev_week_start, prev_week_end
         )
 
@@ -158,6 +192,7 @@ def dashboard_summary(brand_id: int) -> DashboardSummaryOut:
         drafts_today=drafts_today,
         drafts_this_week=drafts_week,
         drafts_prev_week=drafts_prev_week,
+        drafts_this_week_by_language=drafts_week_by_lang,
         last_run_finished_at=last_finished_at,
         last_run_status=last_status,
         active_runs_count=int(active_runs_count or 0),
