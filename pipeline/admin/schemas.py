@@ -532,6 +532,34 @@ class RunDetailWithCostOut(BaseModel):
     cost_by_topic: list[CostByTopicItem] = []
 
 
+# --- Threshold simulator (S5 Step 9) ------------------------------------
+
+
+class TopicsSimulateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    brand_id: int
+    threshold: int = Field(ge=1, le=10)
+    days: int = Field(default=30, ge=1, le=180)
+
+
+class ScoreBucket(BaseModel):
+    score: int
+    count: int
+
+
+class TopicsSimulateOut(BaseModel):
+    threshold: int
+    days: int
+    total_scored: int
+    currently_passed: int
+    would_pass: int
+    delta: int
+    swing_in: int
+    swing_out: int
+    score_distribution: list[ScoreBucket]
+
+
 # --- Source health (S5 Step 6) ------------------------------------------
 
 
