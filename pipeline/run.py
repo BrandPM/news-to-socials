@@ -661,8 +661,38 @@ async def run_pipeline(
 
     # 4. Resolve source list.
     if source_id is not None and source_url is not None:
+        # When ``source_id`` is a numeric string, treat it as a DB id and
+        # look up the real row so topic writes carry a valid FK. The
+        # override path stays useful for ad-hoc CLI runs whose source
+        # isn't in admin.db — for those we keep id=None and accept that
+        # per-topic rows won't be recorded.
+        resolved_source_record: SourceRecord | None = None
+        try:
+            db_source_id = int(source_id)
+        except (TypeError, ValueError):
+            db_source_id = None
+        if db_source_id is not None:
+            from sqlalchemy import select  # noqa: PLC0415
+
+            from pipeline.admin import db as admin_db  # noqa: PLC0415
+            from pipeline.admin.models import Source as SourceModel  # noqa: PLC0415
+
+            with admin_db.get_session_factory()() as session:
+                row = session.execute(
+                    select(SourceModel).where(SourceModel.id == db_source_id)
+                ).scalar_one_or_none()
+            if row is not None:
+                resolved_source_record = SourceRecord(
+                    id=row.id,
+                    name=row.name,
+                    source_type=row.source_type,
+                    url=row.url,
+                    primary_category=row.primary_category,
+                    polling_minutes=row.polling_minutes,
+                )
         sources = [
-            SourceRecord(
+            resolved_source_record
+            or SourceRecord(
                 id=None,
                 name=source_id,
                 source_type="rss",

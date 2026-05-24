@@ -300,6 +300,61 @@ def test_run_pipeline_single_language_override_pins_to_one_branch(
         assert completed == ["en"]
 
 
+def test_run_pipeline_for_run_writes_topics_with_real_source_id(
+    fresh_admin_db_with_source, monkeypatch
+):
+    """Regression for IT_PROJ_NTS_050: ``run_pipeline_for_run`` used to
+    pass ``source_id=str(source.id)`` + ``source_url`` into
+    ``run_pipeline``, which routed through the override branch and
+    hard-coded ``SourceRecord.id=None``. That made every
+    ``record_topic_result`` call silently no-op, so the topics table
+    stayed empty across every production run (see run 10).
+
+    With the fix, the override path looks up the real DB row and
+    preserves ``source.id`` so per-topic rows land with a valid FK.
+    """
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    _set_brand_languages(icon_id, ["en", "uk"])
+    _mock_externals(monkeypatch)
+
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        src = session.scalars(
+            select(Source).where(Source.brand_id_fk == icon_id)
+        ).first()
+        assert src is not None
+        run = Run(
+            brand_id_fk=icon_id,
+            triggered_by="manual",
+            source_ids=json.dumps([src.id]),
+            started_at=__import__("datetime").datetime.now(
+                tz=__import__("datetime").timezone.utc
+            ),
+            status="running",
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+        src_id = src.id
+
+    from pipeline.run import run_pipeline_for_run
+
+    asyncio.run(run_pipeline_for_run(run_id))
+
+    with factory() as session:
+        topics = list(
+            session.scalars(select(Topic).where(Topic.run_id == run_id))
+        )
+        # 2 fake items × 2 languages = 4 topic rows. All must point at
+        # the real source.id (FK preserved), not None.
+        assert len(topics) == 4, f"got {len(topics)} topics, expected 4"
+        for t in topics:
+            assert t.source_id == src_id, (
+                f"topic.source_id={t.source_id} but expected {src_id}"
+            )
+            assert t.status == "passed"
+
+
 def test_run_pipeline_failure_in_one_language_is_isolated(
     fresh_admin_db_with_source, monkeypatch
 ):
