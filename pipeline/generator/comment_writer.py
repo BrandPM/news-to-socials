@@ -46,7 +46,31 @@ class _DraftJSON(BaseModel):
     key_takeaway: str = ""
 
 
+_LANGUAGE_NAMES = {
+    "en": "English",
+    "ru": "Russian",
+    "uk": "Ukrainian",
+    "pl": "Polish",
+}
+
+
+def _language_name(language: str | Language) -> str:
+    """Map a 2-letter code to the language name we use inside the prompt.
+
+    The prompts ship the *name* rather than the code because the LLM
+    follows "Write everything in Russian" much more reliably than
+    "Language: ru" — see NTS_022 (Variant A) for the test results behind
+    that choice.
+    """
+    code = language.value if isinstance(language, Language) else str(language)
+    return _LANGUAGE_NAMES.get(code, code)
+
+
 _DRAFT_PROMPT = """\
+OUTPUT LANGUAGE: {language_name}. Write the title, body, and key
+takeaway in {language_name} only. Do not switch to English unless
+quoting directly from the source (≤15 words per quote).
+
 You write an original expert commentary from the brand below on the news peg.
 This is NOT a rewrite. The news peg is just an excuse to share the brand's
 informed perspective.
@@ -86,6 +110,8 @@ where ``body`` is markdown including the H2 headings.
 
 
 _POLISH_PROMPT = """\
+OUTPUT LANGUAGE: {language_name}. The polished output must remain in {language_name}. Do NOT translate or shift to English.
+
 Rewrite this draft to sound more natural and less AI-generated, preserving
 its meaning. Pay special attention to these tells found in the draft:
 {ai_tells}
@@ -116,6 +142,8 @@ where ``body`` is markdown with H2 headings.
 
 
 _BANNED_PHRASE_RETRY_PROMPT = """\
+OUTPUT LANGUAGE: {language_name}. The rewrite must remain in {language_name}. Do NOT translate.
+
 The previous polish still uses the following banned phrases:
 {hit_phrases}
 
@@ -266,7 +294,9 @@ class CommentWriter:
         log.info("comment_writer.draft_ai_score", topic=topic.id, score=score, tells=tells)
 
         # --- Stage 2: polish (always; injects voice guardrails) ---
-        polished = await self._polish(draft, tells, banned_phrases, good_examples)
+        polished = await self._polish(
+            draft, tells, banned_phrases, good_examples, language
+        )
 
         # --- Banned-phrase retry (one extra pass, cap to avoid runaways) ---
         hits = find_banned_phrase_hits(polished.body, banned_phrases)
@@ -277,7 +307,7 @@ class CommentWriter:
                 hits=hits,
             )
             polished = await self._retry_for_banned_phrases(
-                polished, hits, banned_phrases, good_examples
+                polished, hits, banned_phrases, good_examples, language
             )
             remaining = find_banned_phrase_hits(polished.body, banned_phrases)
             log.info(
@@ -305,6 +335,7 @@ class CommentWriter:
             url=topic.raw.url,
             summary=topic.raw.summary[:1000],
             language=language.value,
+            language_name=_language_name(language),
         )
         resp = await self.client.chat.completions.create(
             model=self.draft_model,
@@ -322,12 +353,14 @@ class CommentWriter:
         ai_tells: list[str],
         banned_phrases: list[str],
         good_examples: list[str],
+        language: Language = Language.en,
     ) -> _DraftJSON:
         prompt = _POLISH_PROMPT.format(
             ai_tells=", ".join(ai_tells) if ai_tells else "no specific tells noted",
             banned_phrases=_bullet_list(banned_phrases) or "  (none specified)",
             good_examples=_bullet_list(good_examples) or "  (none specified)",
             draft_json=draft.model_dump_json(),
+            language_name=_language_name(language),
         )
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
@@ -345,12 +378,14 @@ class CommentWriter:
         hit_phrases: list[str],
         banned_phrases: list[str],
         good_examples: list[str],
+        language: Language = Language.en,
     ) -> _DraftJSON:
         prompt = _BANNED_PHRASE_RETRY_PROMPT.format(
             hit_phrases=_bullet_list(hit_phrases),
             banned_phrases=_bullet_list(banned_phrases),
             good_examples=_bullet_list(good_examples) or "  (none specified)",
             draft_json=draft.model_dump_json(),
+            language_name=_language_name(language),
         )
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
