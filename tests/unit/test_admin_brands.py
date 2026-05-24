@@ -67,6 +67,36 @@ def test_create_brand_default_status_is_draft(client) -> None:
     assert body["has_sanity_api_token"] is False
 
 
+def test_brand_list_surfaces_languages_array(client) -> None:
+    """S6.8 — BrandSummary.languages is exposed as a list, parsed from
+    the JSON-as-TEXT column. New brands default to ['en']; Icon may have
+    a multi-language roster after migration 006's UPDATE clause."""
+    _create(client)
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        row = session.execute(select(Brand).where(Brand.slug == "neovox")).scalar_one()
+        row.languages = '["en","ru","uk","pl"]'
+        session.commit()
+    resp = client.get("/api/v1/brands", headers=AUTH)
+    assert resp.status_code == 200
+    by_slug = {b["slug"]: b for b in resp.json()}
+    assert by_slug["neovox"]["languages"] == ["en", "ru", "uk", "pl"]
+
+
+def test_brand_list_languages_defaults_to_en_when_missing(client) -> None:
+    """An empty or malformed ``languages`` column must not crash the
+    summary — it falls back to ['en'] so the dashboard tab strip
+    still has something to render."""
+    _create(client)
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        row = session.execute(select(Brand).where(Brand.slug == "neovox")).scalar_one()
+        row.languages = ""  # simulates a hand-edited / pre-S6 row
+        session.commit()
+    resp = client.get("/api/v1/brands", headers=AUTH).json()
+    assert resp[0]["languages"] == ["en"]
+
+
 def test_create_brand_encrypts_sanity_token(client) -> None:
     body = _create(
         client,
