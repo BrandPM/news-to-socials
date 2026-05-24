@@ -89,6 +89,13 @@ class Brand(Base):
     # Brand voice + style guidance (plaintext)
     voice_profile_yaml: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # S6 — languages the pipeline fans out drafts into. JSON-as-TEXT
+    # because SQLite has no native JSON column type. Application reads
+    # via ``json.loads(brand.languages)``.
+    languages: Mapped[str] = mapped_column(
+        Text, nullable=False, default='["en"]', server_default='["en"]'
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=_utcnow
     )
@@ -220,6 +227,12 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String, nullable=False)
     stats: Mapped[str | None] = mapped_column(Text, nullable=True)
     log_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # S6 — JSON array of language codes the run finished fanout for.
+    # Pipeline appends to this as each language branch completes so the
+    # admin can see progress without joining against topics.
+    languages_completed: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
 
     topics: Mapped[list["Topic"]] = relationship(
         back_populates="run",
@@ -307,6 +320,12 @@ class Topic(Base):
     status: Mapped[str] = mapped_column(String, nullable=False)
     filter_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # S6 — language code for this topic's draft branch ("en", "ru", "uk",
+    # "pl"). Same topic_id can appear N times in a run (one per language),
+    # each row owns its own Sanity draft via ``draft_id``.
+    language: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="en", server_default="en"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=_utcnow
     )
@@ -320,7 +339,10 @@ class Topic(Base):
             "'filtered_dup', 'filtered_score', 'failed')",
             name="ck_topics_status",
         ),
-        UniqueConstraint("run_id", "topic_id", name="uq_topics_run_topic"),
+        UniqueConstraint(
+            "run_id", "topic_id", "language", name="uq_topics_run_topic_lang"
+        ),
+        Index("ix_topics_topic_lang", "topic_id", "language"),
     )
 
 
