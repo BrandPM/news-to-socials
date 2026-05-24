@@ -165,24 +165,68 @@ def _record_openai_cost(resp: Any, *, model: str, operation: str) -> None:
     )
 
 
-def parse_voice_guardrails(voice_profile_yaml: str) -> tuple[list[str], list[str]]:
-    """Extract ``banned_phrases`` and ``style_examples.good`` from the YAML.
+def parse_voice_guardrails(
+    voice_profile_yaml: str,
+    language: str | Language = Language.en,
+) -> tuple[list[str], list[str]]:
+    """Extract ``banned_phrases`` and ``style_examples.good`` for ``language``.
 
     Returns ``(banned_phrases, good_examples)``. Missing keys → empty lists.
     Malformed YAML is logged and treated as no guardrails so a bad voice
     profile never crashes the pipeline.
+
+    Two YAML shapes are accepted:
+
+    * **Flat** (pre-S6, EN-only)::
+
+          banned_phrases: ["lorem", "ipsum"]
+          style_examples:
+            good: ["..."]
+            bad: ["..."]
+
+      Returned for any ``language`` the caller asks for — every language
+      reads the same set so the EN-only deployment still works.
+
+    * **Per-language** (S6+, Icon's RU/UK/PL fanout)::
+
+          voice:
+            en: { banned_phrases: [...], style_examples: {good: [...]} }
+            ru: { banned_phrases: [...], style_examples: {good: [...]} }
+            uk: { banned_phrases: [...], style_examples: {good: [...]} }
+            pl: { banned_phrases: [...], style_examples: {good: [...]} }
+
+      Returned for the requested language. If the requested section is
+      absent we fall back to the EN section; if EN is also absent we
+      fall back to top-level (flat) keys; if those are absent too we
+      return empty lists.
     """
     try:
         data = yaml.safe_load(voice_profile_yaml) or {}
     except yaml.YAMLError as exc:
         log.warning("comment_writer.voice_profile_parse_failed", err=str(exc))
         return [], []
+    if not isinstance(data, dict):
+        return [], []
 
-    banned = data.get("banned_phrases") or []
-    examples = data.get("style_examples") or []
+    lang_key = language.value if isinstance(language, Language) else str(language)
+    voice = data.get("voice")
+    section: dict | None = None
+    if isinstance(voice, dict):
+        candidate = voice.get(lang_key)
+        if isinstance(candidate, dict):
+            section = candidate
+        elif lang_key != "en":
+            # Fall back to EN within the per-language map before giving up.
+            fallback = voice.get("en")
+            if isinstance(fallback, dict):
+                section = fallback
+    if section is None:
+        # Flat / legacy shape.
+        section = data
+
+    banned = section.get("banned_phrases") or []
+    examples = section.get("style_examples") or []
     good: list[str] = []
-    # ``style_examples`` was historically a flat list; current form is
-    # ``{good: [...], bad: [...]}``. Support both.
     if isinstance(examples, dict):
         good = list(examples.get("good") or [])
     elif isinstance(examples, list):
@@ -210,7 +254,9 @@ class CommentWriter:
         voice_profile_yaml: str,
         language: Language,
     ) -> Draft:
-        banned_phrases, good_examples = parse_voice_guardrails(voice_profile_yaml)
+        banned_phrases, good_examples = parse_voice_guardrails(
+            voice_profile_yaml, language
+        )
 
         # --- Stage 1: draft ---
         draft = await self._draft(topic, voice_profile_yaml, language)
