@@ -401,10 +401,13 @@ async def _process_source(
     run_id: int | None,
     min_score: int,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Run the source → score → dedup → generate stages for ONE source.
+    """Run the source → score → dedup → generate stages for ONE source and
+    ONE language.
 
     Returns ``(results, stats)``. Per-topic outcomes are also written to
-    the ``topics`` table when ``run_id`` is set.
+    the ``topics`` table when ``run_id`` is set. S6 fanout calls this
+    once per language; failure inside the call is isolated to that one
+    (source × language) branch via the orchestrator's try/except.
     """
     from pipeline.sources.rss import RssSource  # noqa: PLC0415
 
@@ -489,12 +492,13 @@ async def _process_source(
                     score=int(topic.relevance_score),
                     status="passed",
                     draft_id=None,
+                    language=language.value,
                 )
             else:
                 draft_id = await sanity_publisher.publish_draft(post)
-                results.append({"topic_id": topic.id, "draft_id": draft_id, "category": category, "title": post.title})
+                results.append({"topic_id": topic.id, "draft_id": draft_id, "category": category, "title": post.title, "language": language.value})
                 stats["drafted"] += 1
-                log.info("topic.published_as_draft", topic=topic.id, draft_id=draft_id)
+                log.info("topic.published_as_draft", topic=topic.id, draft_id=draft_id, language=language.value)
                 client.record_topic_result(
                     run_id=run_id,
                     topic_id=topic.id,
@@ -504,11 +508,12 @@ async def _process_source(
                     score=int(topic.relevance_score),
                     status="passed",
                     draft_id=draft_id,
+                    language=language.value,
                 )
         except Exception as exc:  # noqa: BLE001
             log.error("topic.failed", topic=topic.id, err=str(exc))
             stats["errors"] += 1
-            results.append({"topic_id": topic.id, "status": "failed", "error": str(exc)})
+            results.append({"topic_id": topic.id, "status": "failed", "error": str(exc), "language": language.value})
             client.record_topic_result(
                 run_id=run_id,
                 topic_id=topic.id,
@@ -518,15 +523,51 @@ async def _process_source(
                 score=int(topic.relevance_score),
                 status="failed",
                 filter_reason=str(exc),
+                language=language.value,
             )
     return results, stats
+
+
+def _languages_for_brand(
+    brand_row, override: Language | None = None
+) -> list[Language]:
+    """Resolve the list of target languages for one pipeline run.
+
+    Precedence:
+      1. ``override`` (the legacy single-``language`` argument on
+         ``run_pipeline``). Honoured so existing CLI invocations still
+         work — a caller that asks for a specific language gets only that
+         language, even if the brand publishes more.
+      2. ``brand_row.languages`` (JSON column added in migration 006).
+      3. ``[Language.en]`` as a final safety net.
+    """
+    if override is not None:
+        return [override]
+    raw = getattr(brand_row, "languages", None) or '["en"]'
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, TypeError):
+        decoded = ["en"]
+    if not isinstance(decoded, list) or not decoded:
+        decoded = ["en"]
+    out: list[Language] = []
+    seen: set[str] = set()
+    for code in decoded:
+        if not isinstance(code, str) or code in seen:
+            continue
+        try:
+            out.append(Language(code))
+            seen.add(code)
+        except ValueError:
+            log.warning("pipeline.unknown_brand_language", code=code)
+    return out or [Language.en]
 
 
 async def run_pipeline(
     brand_slug: str = "icon",
     source_id: str | None = None,
     source_url: str | None = None,
-    language: Language = Language.en,
+    language: Language | None = None,
     limit: int = 3,
     dry_run: bool = False,
     *,
@@ -616,6 +657,7 @@ async def run_pipeline(
     )
 
     brand_id_fk = brand_row.id
+    languages = _languages_for_brand(brand_row, override=language)
 
     # 4. Resolve source list.
     if source_id is not None and source_url is not None:
@@ -637,7 +679,7 @@ async def run_pipeline(
         brand=brand_row.slug,
         brand_id=brand_id_fk,
         sources=[s.name for s in sources],
-        language=language.value,
+        languages=[l.value for l in languages],
         limit=limit,
         dry_run=dry_run,
         threshold=config.scoring_threshold,
@@ -679,33 +721,56 @@ async def run_pipeline(
 
     # Cost-recording context spans the whole run; topic_id / draft_id
     # are layered in by ``_process_source`` for finer attribution.
+    #
+    # S6.4 fanout: outer loop over languages, inner loop over sources.
+    # Failure in one (language, source) branch is isolated via the
+    # try/except below so the remaining branches still run. Each
+    # finished language is appended to runs.languages_completed so the
+    # admin UI can show fanout progress as it happens.
     with cost_context(CostContext(brand_id_fk=brand_id_fk, run_id=run_id)):
-        for src in sources:
-            try:
-                results, stats = await _process_source(
-                    source_record=src,
-                    brand=brand,
-                    brand_id_fk=brand_id_fk,
-                    language=language,
-                    limit=limit,
-                    dry_run=dry_run,
-                    sanity_publisher=sanity_publisher,
-                    client=client,
-                    run_id=run_id,
-                    min_score=config.scoring_threshold,
-                )
-                aggregate_results.extend(results)
-                for k, v in stats.items():
-                    aggregate_stats[k] = aggregate_stats.get(k, 0) + v
-                log_lines.append(
-                    f"source {src.name}: fetched={stats['fetched']} "
-                    f"scored={stats['scored']} drafted={stats['drafted']} "
-                    f"errors={stats['errors']}"
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.exception("source.failed", source=src.name)
-                aggregate_stats["errors"] += 1
-                log_lines.append(f"source {src.name}: FAILED {exc!r}")
+        for lang in languages:
+            lang_errors = 0
+            for src in sources:
+                try:
+                    results, stats = await _process_source(
+                        source_record=src,
+                        brand=brand,
+                        brand_id_fk=brand_id_fk,
+                        language=lang,
+                        limit=limit,
+                        dry_run=dry_run,
+                        sanity_publisher=sanity_publisher,
+                        client=client,
+                        run_id=run_id,
+                        min_score=config.scoring_threshold,
+                    )
+                    aggregate_results.extend(results)
+                    for k, v in stats.items():
+                        aggregate_stats[k] = aggregate_stats.get(k, 0) + v
+                    log_lines.append(
+                        f"[{lang.value}] source {src.name}: fetched={stats['fetched']} "
+                        f"scored={stats['scored']} drafted={stats['drafted']} "
+                        f"errors={stats['errors']}"
+                    )
+                    lang_errors += stats.get("errors", 0)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "source.failed", source=src.name, language=lang.value
+                    )
+                    aggregate_stats["errors"] += 1
+                    lang_errors += 1
+                    log_lines.append(
+                        f"[{lang.value}] source {src.name}: FAILED {exc!r}"
+                    )
+            # Mark the language as completed regardless of per-source
+            # outcomes — the UI cares about "did fanout reach this lang"
+            # rather than "was every source successful for it".
+            client.mark_language_completed(run_id, lang.value)
+            log.info(
+                "pipeline.language_done",
+                language=lang.value,
+                errors=lang_errors,
+            )
 
     if dry_run:
         overall_status = "dry_run"
@@ -779,7 +844,7 @@ async def run_pipeline_for_run(run_id: int) -> None:
             brand_slug=brand_slug,
             source_id=str(source.id),
             source_url=source.url,
-            language=Language.en,
+            # language=None → fan out to every language the brand publishes.
             limit=3,
             dry_run=False,
             existing_run_id=run_id,

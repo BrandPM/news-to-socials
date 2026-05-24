@@ -91,6 +91,9 @@ class BrandRecord:
     meta_page_id: str | None
     meta_ig_business_id: str | None
     voice_profile_yaml: str | None
+    # S6 — JSON-encoded list of language codes this brand publishes in.
+    # Default ``["en"]`` so legacy brands keep their single-language run.
+    languages: str = '["en"]'
 
     def decrypted_sanity_token(self) -> str | None:
         from pipeline.admin.encryption import get_encryption  # noqa: PLC0415
@@ -139,6 +142,7 @@ def _brand_row_to_record(row: Brand) -> BrandRecord:
         meta_page_id=row.meta_page_id,
         meta_ig_business_id=row.meta_ig_business_id,
         voice_profile_yaml=row.voice_profile_yaml,
+        languages=row.languages or '["en"]',
     )
 
 
@@ -371,6 +375,7 @@ class AdminConfigClient:
         status: str,
         filter_reason: str | None = None,
         draft_id: str | None = None,
+        language: str = "en",
     ) -> None:
         """Record a per-topic row. No-ops when run_id or source_id is None
         (fallback path doesn't have DB rows to FK against)."""
@@ -389,9 +394,39 @@ class AdminConfigClient:
                     status=status,
                     filter_reason=filter_reason,
                     draft_id=draft_id,
+                    language=language,
                 )
             )
             session.commit()
+
+    def mark_language_completed(
+        self, run_id: int | None, language: str
+    ) -> None:
+        """Append ``language`` to ``runs.languages_completed`` if not present.
+
+        S6 fanout calls this once per language as that language's branch
+        finishes (success OR failure isolated to one language). Use a
+        SELECT-for-UPDATE-like pattern within a single session so concurrent
+        gather() branches don't lose appends. SQLite serialises writes, so
+        the JSON read-modify-write is safe enough at our scale.
+        """
+        if run_id is None:
+            return
+        factory = admin_db.get_session_factory()
+        with factory() as session:
+            row = session.get(Run, run_id)
+            if row is None:
+                return
+            try:
+                current = json.loads(row.languages_completed or "[]")
+                if not isinstance(current, list):
+                    current = []
+            except (ValueError, TypeError):
+                current = []
+            if language not in current:
+                current.append(language)
+                row.languages_completed = json.dumps(current)
+                session.commit()
 
     # --- cost recording -------------------------------------------------
 
