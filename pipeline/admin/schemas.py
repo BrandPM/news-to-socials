@@ -135,6 +135,21 @@ class PromptOut(BaseModel):
         return v
 
 
+class PromptDiffOut(BaseModel):
+    """Side-by-side diff of two prompts (S5 Step 8).
+
+    ``unified_diff`` is the standard --- / +++ / @@ form so the UI can
+    render it line-by-line with familiar +/- gutter colors. Both source
+    prompts are returned in full so the UI doesn't need a second roundtrip.
+    """
+
+    a: PromptOut
+    b: PromptOut
+    unified_diff: str
+    same_brand: bool
+    same_prompt_type: bool
+
+
 class PromptTestIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

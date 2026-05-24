@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from pipeline.admin.db import session_scope
 from pipeline.admin.models import Prompt
 from pipeline.admin.schemas import (
+    PromptDiffOut,
     PromptIn,
     PromptOut,
     PromptTestIn,
@@ -49,6 +50,57 @@ def list_prompts(
             stmt = stmt.where(Prompt.prompt_type == prompt_type)
         stmt = stmt.offset(offset).limit(limit)
         return [PromptOut.model_validate(p) for p in session.scalars(stmt)]
+
+
+@router.get("/diff", response_model=PromptDiffOut)
+def diff_prompts(a: int, b: int) -> PromptDiffOut:
+    """Unified diff between two prompt versions (S5 Step 8).
+
+    Allows ``a == b`` for the "current vs current" no-op case; the UI
+    uses that to show a blank diff after a single-prompt edit reverted.
+    Cross-brand or cross-type comparisons are allowed but flagged via
+    the ``same_brand`` / ``same_prompt_type`` booleans so the UI can
+    warn before the operator activates the wrong thing.
+    """
+    import difflib  # noqa: PLC0415
+
+    with session_scope() as session:
+        prompt_a = session.get(Prompt, a)
+        prompt_b = session.get(Prompt, b)
+        if prompt_a is None or prompt_b is None:
+            missing = [
+                pid
+                for pid, row in ((a, prompt_a), (b, prompt_b))
+                if row is None
+            ]
+            raise HTTPException(
+                status_code=404,
+                detail=f"prompt(s) not found: {missing}",
+            )
+        a_out = PromptOut.model_validate(prompt_a)
+        b_out = PromptOut.model_validate(prompt_b)
+        same_brand = prompt_a.brand_id_fk == prompt_b.brand_id_fk
+        same_type = prompt_a.prompt_type == prompt_b.prompt_type
+        content_a = prompt_a.content or ""
+        content_b = prompt_b.content or ""
+        version_a = prompt_a.version_name
+        version_b = prompt_b.version_name
+
+    diff_lines = difflib.unified_diff(
+        content_a.splitlines(keepends=False),
+        content_b.splitlines(keepends=False),
+        fromfile=f"#{a} {version_a}",
+        tofile=f"#{b} {version_b}",
+        lineterm="",
+        n=3,
+    )
+    return PromptDiffOut(
+        a=a_out,
+        b=b_out,
+        unified_diff="\n".join(diff_lines),
+        same_brand=same_brand,
+        same_prompt_type=same_type,
+    )
 
 
 @router.get("/{prompt_id}", response_model=PromptOut)
