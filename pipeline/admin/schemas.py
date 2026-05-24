@@ -299,9 +299,28 @@ class BrandSummary(BaseModel):
     slug: str
     name: str
     language: str
+    languages: list[str] = ["en"]
     timezone: str
     status: BrandStatus
     active: bool
+
+    @field_validator("languages", mode="before")
+    @classmethod
+    def _parse_languages(cls, v: Any) -> Any:
+        # Brand.languages is JSON-as-TEXT; loaded via from_attributes the
+        # raw value is a string. Surface as a list so the frontend can
+        # iterate without knowing about the storage shape.
+        if v is None or v == "":
+            return ["en"]
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+            except (ValueError, TypeError):
+                return ["en"]
+            return parsed if isinstance(parsed, list) and parsed else ["en"]
+        if isinstance(v, list):
+            return v or ["en"]
+        return ["en"]
 
 
 class BrandIn(BaseModel):
