@@ -265,6 +265,29 @@ class RunLogOut(BaseModel):
     source: Literal["file", "stub"]
 
 
+class RunEventOut(BaseModel):
+    """One normalized line from the pipeline log, scoped to a single run.
+
+    ``kind`` is the original ``event`` field (e.g. ``pipeline.start``,
+    ``source.fetched``, ``score.done``, ``dedup.sanity_hit``,
+    ``topic.published_as_draft``, ``image.failed``). ``data`` carries the
+    remaining JSON keys verbatim so the timeline UI can pull
+    event-specific fields without a new endpoint per event type.
+    """
+
+    timestamp: datetime
+    level: str
+    kind: str
+    data: dict[str, Any] = {}
+
+
+class RunEventsOut(BaseModel):
+    events: list[RunEventOut]
+    total: int
+    truncated: bool = False
+    source: Literal["file", "stub"]
+
+
 # --- Drafts / image regenerate ------------------------------------------
 
 
@@ -590,12 +613,36 @@ class CostRecordOut(BaseModel):
 # --- Runs cost extension (for GET /runs/{id}) ---------------------------
 
 
+class RunKpis(BaseModel):
+    """Authoritative per-run KPI summary used by /runs/[id] hero metrics.
+
+    Computed in the runs route from cost_records + topics so each number
+    has a single source of truth. The legacy ``run.stats`` dict is kept
+    for back-compat but the frontend should prefer this block.
+
+    - ``fetched``: RSS items pulled from sources (from ``stats.fetched``)
+    - ``scored``: LLM scoring calls (``cost_records`` ``operation='topic_scoring'``)
+    - ``passed``: topics row count with ``status='passed'``
+    - ``drafts``: distinct ``draft_id`` values across passed topics
+      (falls back to ``stats.drafted`` while topics table is empty —
+      handled by the route, not the schema)
+    - ``errors``: ``stats.errors`` (failed source/lang branches)
+    """
+
+    fetched: int
+    scored: int
+    passed: int
+    drafts: int
+    errors: int
+
+
 class RunDetailWithCostOut(BaseModel):
     run: RunOut
     topics: list[TopicOut]
     cost_total_usd: float
     cost_breakdown: list[CostBreakdownItem]
     cost_by_topic: list[CostByTopicItem] = []
+    kpis: RunKpis
 
 
 # --- Notifications (S5 Step 10) -----------------------------------------
