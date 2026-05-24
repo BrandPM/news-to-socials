@@ -532,6 +532,24 @@ class RunDetailWithCostOut(BaseModel):
     cost_by_topic: list[CostByTopicItem] = []
 
 
+# --- Notifications (S5 Step 10) -----------------------------------------
+
+
+class NotificationItemOut(BaseModel):
+    id: str
+    kind: Literal["run_failed", "source_unhealthy", "draft_rejected"]
+    severity: Literal["warning", "danger"]
+    title: str
+    description: str
+    href: str | None = None
+    created_at: datetime
+
+
+class NotificationsListOut(BaseModel):
+    items: list[NotificationItemOut]
+    count: int
+
+
 # --- Threshold simulator (S5 Step 9) ------------------------------------
 
 

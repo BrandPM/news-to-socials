@@ -35,6 +35,7 @@ from .routes import drafts as drafts_routes
 from .routes import prompts as prompts_routes
 from .routes import runs as runs_routes
 from .routes import sources as sources_routes
+from .routes import notifications as notifications_routes
 from .routes import topics as topics_routes
 
 
@@ -106,6 +107,10 @@ def create_app() -> FastAPI:
     app.include_router(
         topics_routes.router, prefix="/api/v1/topics",
         tags=["topics"], dependencies=auth,
+    )
+    app.include_router(
+        notifications_routes.router, prefix="/api/v1/notifications",
+        tags=["notifications"], dependencies=auth,
     )
     return app
 
