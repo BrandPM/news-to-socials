@@ -322,3 +322,38 @@ class Topic(Base):
         ),
         UniqueConstraint("run_id", "topic_id", name="uq_topics_run_topic"),
     )
+
+
+class SourceHealthRecord(Base):
+    """One row per source fetch. Powers /sources sparkline + health view.
+
+    Brand-scoped via ``brand_id_fk`` so the health endpoint can enforce
+    brand isolation. ``source_id`` is CASCADE so deleting a source cleans
+    its history; ``brand_id_fk`` is RESTRICT so a brand cannot be deleted
+    while history exists (consistent with the rest of the brand graph).
+    """
+
+    __tablename__ = "source_health_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("sources.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("brands.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    articles_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_msg: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    __table_args__ = (
+        Index("ix_health_source_fetched", "source_id", "fetched_at"),
+        Index("ix_health_brand_fetched", "brand_id_fk", "fetched_at"),
+    )

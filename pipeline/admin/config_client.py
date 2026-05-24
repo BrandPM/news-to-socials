@@ -32,6 +32,7 @@ from pipeline.admin.models import (
     Prompt,
     Run,
     Source,
+    SourceHealthRecord,
     Topic,
 )
 from pipeline.common.config import get_settings
@@ -434,6 +435,40 @@ class AdminConfigClient:
                 tokens_out=tokens_out,
                 duration_seconds=duration_seconds,
                 cost_usd=cost_usd,
+            )
+            session.add(row)
+            session.commit()
+            return row.id
+
+    # --- source health (S5 Step 6) --------------------------------------
+
+    @staticmethod
+    def record_source_health(
+        *,
+        source_id: int,
+        brand_id_fk: int,
+        success: bool,
+        articles_count: int,
+        error_msg: str | None = None,
+    ) -> int | None:
+        """Write one ``source_health_records`` row. Returns the inserted
+        row id or ``None`` if admin.db isn't reachable.
+
+        Static because we call it from the pipeline runtime where the
+        per-instance ``brand_slug`` isn't necessarily set (cron path).
+        """
+        path = Path(get_settings().admin_db_path).expanduser()
+        if not path.exists():
+            return None
+        factory = admin_db.get_session_factory()
+        with factory() as session:
+            row = SourceHealthRecord(
+                source_id=source_id,
+                brand_id_fk=brand_id_fk,
+                fetched_at=datetime.now(tz=timezone.utc),
+                success=success,
+                articles_count=articles_count,
+                error_msg=(error_msg[:500] if error_msg else None),
             )
             session.add(row)
             session.commit()

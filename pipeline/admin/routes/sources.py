@@ -10,10 +10,12 @@ from sqlalchemy.exc import IntegrityError
 
 from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
-from pipeline.admin.models import Source, Topic
+from pipeline.admin.models import Source, SourceHealthRecord, Topic
 from pipeline.admin.schemas import (
     RunAllIn,
     RunTriggerOut,
+    SourceHealthDayOut,
+    SourceHealthOut,
     SourceIn,
     SourceOut,
     SourceTestOut,
@@ -210,3 +212,93 @@ def run_all_sources(payload: RunAllIn, background: BackgroundTasks) -> RunTrigge
     )
     background.add_task(jobs.execute_pipeline_run, run_id)
     return RunTriggerOut(run_id=run_id)
+
+
+# --- Health series (S5 Step 6) ------------------------------------------
+
+
+@router.get("/{source_id}/health", response_model=SourceHealthOut)
+def source_health(
+    source_id: int,
+    brand_id: int,
+    days: int = 7,
+) -> SourceHealthOut:
+    """Per-day fetch health for the source's sparkline.
+
+    Brand-scoped: 404 if the source belongs to a different brand than
+    ``brand_id``. ``days`` is clamped to [1, 90].
+    """
+    from datetime import timedelta
+
+    days = max(1, min(90, days))
+    with session_scope() as session:
+        src = session.get(Source, source_id)
+        if src is None:
+            raise HTTPException(status_code=404, detail="source not found")
+        if src.brand_id_fk != brand_id:
+            raise HTTPException(
+                status_code=404, detail="source not found for that brand"
+            )
+
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        rows = (
+            session.query(SourceHealthRecord)
+            .filter(
+                SourceHealthRecord.source_id == source_id,
+                SourceHealthRecord.fetched_at >= cutoff,
+            )
+            .order_by(SourceHealthRecord.fetched_at.asc())
+            .all()
+        )
+
+        # Bucket by UTC date.
+        buckets: dict[str, dict[str, int]] = {}
+        for i in range(days):
+            d = (datetime.now(tz=timezone.utc) - timedelta(days=days - 1 - i)).date()
+            buckets[d.isoformat()] = {
+                "fetches": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "articles_total": 0,
+            }
+        for r in rows:
+            key = r.fetched_at.date().isoformat()
+            if key not in buckets:
+                continue
+            b = buckets[key]
+            b["fetches"] += 1
+            if r.success:
+                b["success_count"] += 1
+            else:
+                b["failure_count"] += 1
+            b["articles_total"] += r.articles_count or 0
+
+        last_fetch = rows[-1] if rows else None
+        last_error: str | None = None
+        for r in reversed(rows):
+            if not r.success and r.error_msg:
+                last_error = r.error_msg
+                break
+        total = sum(b["fetches"] for b in buckets.values())
+        succ = sum(b["success_count"] for b in buckets.values())
+        success_rate = (succ / total * 100.0) if total > 0 else 0.0
+
+        series = [
+            SourceHealthDayOut(
+                date=date,
+                fetches=b["fetches"],
+                success_count=b["success_count"],
+                failure_count=b["failure_count"],
+                articles_total=b["articles_total"],
+            )
+            for date, b in buckets.items()
+        ]
+
+        return SourceHealthOut(
+            source_id=source_id,
+            days=days,
+            success_rate_pct=round(success_rate, 1),
+            last_fetch_at=last_fetch.fetched_at if last_fetch else None,
+            last_error=last_error,
+            series=series,
+        )

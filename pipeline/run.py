@@ -392,6 +392,7 @@ async def _process_source(
     *,
     source_record,  # config_client.SourceRecord
     brand: BrandConfig,
+    brand_id_fk: int,
     language: Language,
     limit: int,
     dry_run: bool,
@@ -419,9 +420,27 @@ async def _process_source(
         url=source_record.url,
     )
 
-    raw_items = list(await source.fetch())
-    stats["fetched"] = len(raw_items)
-    log.info("source.fetched", count=len(raw_items), source=source.name)
+    try:
+        raw_items = list(await source.fetch())
+        stats["fetched"] = len(raw_items)
+        log.info("source.fetched", count=len(raw_items), source=source.name)
+        if source_record.id is not None:
+            client.record_source_health(
+                source_id=source_record.id,
+                brand_id_fk=brand_id_fk,
+                success=True,
+                articles_count=len(raw_items),
+            )
+    except Exception as exc:  # noqa: BLE001 — record then re-raise
+        if source_record.id is not None:
+            client.record_source_health(
+                source_id=source_record.id,
+                brand_id_fk=brand_id_fk,
+                success=False,
+                articles_count=0,
+                error_msg=f"{type(exc).__name__}: {exc}",
+            )
+        raise
     if not raw_items:
         log.warning("source.empty", source=source.name)
         return [], stats
@@ -666,6 +685,7 @@ async def run_pipeline(
                 results, stats = await _process_source(
                     source_record=src,
                     brand=brand,
+                    brand_id_fk=brand_id_fk,
                     language=language,
                     limit=limit,
                     dry_run=dry_run,

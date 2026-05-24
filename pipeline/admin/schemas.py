@@ -495,3 +495,27 @@ class RunDetailWithCostOut(BaseModel):
     cost_total_usd: float
     cost_breakdown: list[CostBreakdownItem]
     cost_by_topic: list[CostByTopicItem] = []
+
+
+# --- Source health (S5 Step 6) ------------------------------------------
+
+
+class SourceHealthDayOut(BaseModel):
+    """One day's bucket of health stats."""
+
+    date: str  # ISO date YYYY-MM-DD
+    fetches: int
+    success_count: int
+    failure_count: int
+    articles_total: int
+
+
+class SourceHealthOut(BaseModel):
+    """``GET /api/v1/sources/{id}/health`` response."""
+
+    source_id: int
+    days: int
+    success_rate_pct: float
+    last_fetch_at: datetime | None
+    last_error: str | None
+    series: list[SourceHealthDayOut]
