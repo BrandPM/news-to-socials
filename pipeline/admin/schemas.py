@@ -553,6 +553,64 @@ class DraftDetailOut(BaseModel):
     ai_tells: list[str] = []
 
 
+class PublishedDocOut(BaseModel):
+    """Slim view of a published Sanity post (no ``drafts.`` prefix).
+
+    Returned by ``GET /drafts/{id}`` when the draft has already been
+    promoted to published (state ``published_only`` / ``both``). Only the
+    fields the admin's "Published" view needs — slug, title, language,
+    cover — so we don't pay the AI-tells / cost rollup cost on what is
+    just a success page.
+    """
+
+    sanity_id: str
+    title: str | None = None
+    slug: str | None = None
+    language: str | None = None
+    cover_image_url: str | None = None
+    brand_slug: str | None = None
+    updated_at: str | None = None
+
+
+class PublicationInfoOut(BaseModel):
+    """When/how a draft became published. Combines the Sanity-side id with
+    the local ``draft_approvals`` timeline. ``live_url`` is constructed
+    server-side from the published slug + the brand's public URL pattern.
+    """
+
+    sanity_published_id: str
+    published_at: datetime | None = None
+    approver: str | None = None
+    note: str | None = None
+    live_url: str | None = None
+
+
+DraftLifecycleState = Literal[
+    "draft_only", "published_only", "both", "neither"
+]
+
+
+class DraftStateOut(BaseModel):
+    """Lifecycle-aware wrapper around the legacy ``DraftDetailOut`` shape.
+
+    IT_PROJ_NTS_052: after ``approve`` (NTS_051 chain) the draft document
+    is deleted from Sanity, leaving the published mirror behind. The
+    admin /drafts/[id] page used to render a misleading "Draft not
+    found" error for these — the new ``state`` field lets the UI choose
+    between a draft-preview view, a published success view, or a real
+    not-found error.
+
+    Returned for every non-error case (200). Only ``state='neither'``
+    becomes a 404.
+    """
+
+    sanity_id: str
+    state: DraftLifecycleState
+    draft: DraftDetailOut | None = None
+    published: PublishedDocOut | None = None
+    publication_info: PublicationInfoOut | None = None
+
+
 class DraftListItem(BaseModel):
     """Row in the multilingual /drafts list view (S6.7)."""
 

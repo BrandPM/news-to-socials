@@ -243,6 +243,13 @@ def test_approve_note_too_long_rejected(client, icon_with_creds) -> None:
 # --- GET /drafts/{id} extension (approval + AI tells) ---------------------
 
 
+def _wrap_draft(doc: dict | None) -> AsyncMock:
+    """IT_PROJ_NTS_052: GET /drafts/{id} now returns
+    ``{"draft": ..., "published": ...}`` from a single GROQ. Wraps the
+    legacy single-doc helper so the approval tests keep their setup."""
+    return AsyncMock(return_value={"draft": doc, "published": None})
+
+
 def test_get_draft_includes_approval_when_present(
     monkeypatch, client, icon_with_creds
 ) -> None:
@@ -252,7 +259,7 @@ def test_get_draft_includes_approval_when_present(
     monkeypatch.setattr(
         sanity_mod.SanityClient,
         "query",
-        AsyncMock(return_value=_draft_doc()),
+        _wrap_draft(_draft_doc()),
     )
     client.post(
         f"/api/v1/drafts/post-app/approve?brand_id={bid}",
@@ -263,9 +270,11 @@ def test_get_draft_includes_approval_when_present(
     resp = client.get(f"/api/v1/drafts/post-app?brand_id={bid}", headers=AUTH)
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["approval"] is not None
-    assert body["approval"]["status"] == "approved"
-    assert body["approval"]["note"] == "ship it"
+    draft = body["draft"]
+    assert draft is not None
+    assert draft["approval"] is not None
+    assert draft["approval"]["status"] == "approved"
+    assert draft["approval"]["note"] == "ship it"
 
 
 def test_get_draft_approval_is_null_when_undecided(
@@ -277,12 +286,12 @@ def test_get_draft_approval_is_null_when_undecided(
     monkeypatch.setattr(
         sanity_mod.SanityClient,
         "query",
-        AsyncMock(return_value=_draft_doc()),
+        _wrap_draft(_draft_doc()),
     )
     resp = client.get(f"/api/v1/drafts/post-und?brand_id={bid}", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["approval"] is None
+    assert body["draft"]["approval"] is None
 
 
 def test_get_draft_includes_ai_tells_score(
@@ -294,15 +303,15 @@ def test_get_draft_includes_ai_tells_score(
     monkeypatch.setattr(
         sanity_mod.SanityClient,
         "query",
-        AsyncMock(return_value=_draft_doc(body_text="A pleasant body.")),
+        _wrap_draft(_draft_doc(body_text="A pleasant body.")),
     )
     resp = client.get(f"/api/v1/drafts/post-ai?brand_id={bid}", headers=AUTH)
     assert resp.status_code == 200
-    body = resp.json()
-    assert "ai_tells_score" in body
-    assert "ai_tells" in body
+    draft = resp.json()["draft"]
+    assert "ai_tells_score" in draft
+    assert "ai_tells" in draft
     # Score may be 0 for short clean body — the contract is the keys present.
-    assert isinstance(body["ai_tells"], list)
+    assert isinstance(draft["ai_tells"], list)
 
 
 def test_get_draft_approval_brand_scoped(
@@ -315,7 +324,7 @@ def test_get_draft_approval_brand_scoped(
     monkeypatch.setattr(
         sanity_mod.SanityClient,
         "query",
-        AsyncMock(return_value=_draft_doc(brand_slug="other")),
+        _wrap_draft(_draft_doc(brand_slug="other")),
     )
     # Approve under "icon".
     client.post(
@@ -328,7 +337,7 @@ def test_get_draft_approval_brand_scoped(
         f"/api/v1/drafts/post-leak?brand_id={other_id}", headers=AUTH
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["approval"] is None
+    assert resp.json()["draft"]["approval"] is None
 
 
 # --- IT_PROJ_NTS_051 Task 3 — approve publishes, reject deletes -----------

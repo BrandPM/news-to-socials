@@ -19,9 +19,12 @@ from pipeline.admin.schemas import (
     DraftDetailOut,
     DraftListItem,
     DraftListOut,
+    DraftStateOut,
     ImageRegenerateIn,
     JobAcceptedOut,
     JobStatusOut,
+    PublicationInfoOut,
+    PublishedDocOut,
 )
 from pipeline.common.config import get_settings
 from pipeline.common.logging import get_logger
@@ -292,93 +295,83 @@ async def list_drafts(
 
 
 # ---------------------------------------------------------------------------
-# GET /drafts/{sanity_id} — full preview (extended with approval + AI tells)
+# GET /drafts/{sanity_id} — lifecycle-aware (draft / published / both)
 # ---------------------------------------------------------------------------
 
 
-@router.get("/{sanity_draft_id}", response_model=DraftDetailOut)
-async def get_draft(
-    sanity_draft_id: str,
-    brand_id: int = Query(..., description="Active brand id from the UI session"),
-) -> DraftDetailOut:
-    """Fetch a draft from Sanity using ``brand_id``'s decrypted creds.
-
-    Cross-brand guard: ``generatedBy.brandSlug`` (when present on the
-    draft document) must match the active brand's slug — otherwise 403
-    "cross-brand draft access not allowed".
-
-    Extended in S5 Step 7 with ``approval`` (latest decision row from
-    ``draft_approvals``) and ``ai_tells_score`` / ``ai_tells`` (computed
-    on the polished body, no extra LLM call).
+def _portable_text_to_markdown(body: object) -> str | None:
+    """Flatten Sanity portable-text into the same lightweight markdown the
+    admin preview renderer understands. Returns ``None`` if there is no
+    body content to flatten. Extracted so the published-doc branch can
+    skip it cleanly (the success view has no body).
     """
-    client, slug = _build_sanity_client_for_brand(brand_id)
+    if isinstance(body, str):
+        return body
+    if not isinstance(body, list):
+        return None
+    chunks: list[str] = []
+    for block in body:
+        if not isinstance(block, dict):
+            continue
+        if block.get("_type") != "block":
+            continue
+        style = block.get("style", "normal")
+        text_parts = [
+            c.get("text", "")
+            for c in block.get("children", [])
+            if isinstance(c, dict)
+        ]
+        joined = "".join(text_parts)
+        if style == "h2":
+            chunks.append(f"## {joined}")
+        elif style == "h3":
+            chunks.append(f"### {joined}")
+        else:
+            chunks.append(joined)
+    return "\n\n".join(chunks) if chunks else None
 
-    sanity_draft_id_normalised = _normalise_draft_id(sanity_draft_id)
 
-    groq = (
-        '*[_id == $id][0]{title, body, keyTakeaway, generatedBy, '
-        'language, topicId, _createdAt, '
-        '"coverImageUrl": coverImage.asset->url}'
-    )
-    try:
-        doc = await client.query(groq, {"id": sanity_draft_id_normalised})
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=502,
-            detail=f"Sanity query failed: {type(exc).__name__}: {str(exc)[:200]}",
-        ) from exc
+def _build_live_url(brand_slug: str, slug: str | None) -> str | None:
+    """Public URL for the published post. Currently only Icon Finance has
+    one — other brands return ``None`` rather than guessing a domain
+    we can't verify. Worth promoting to a Brand column when a second
+    brand needs the link.
+    """
+    if not slug:
+        return None
+    if brand_slug == "icon":
+        return f"https://icon.finance/insights/{slug}"
+    return None
 
-    if not doc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"draft {sanity_draft_id_normalised!r} not found",
-        )
 
-    # --- cross-brand guard ---
+def _build_draft_detail_out(
+    doc: dict,
+    sanity_draft_id_normalised: str,
+    brand_id: int,
+    fallback_brand_slug: str,
+) -> DraftDetailOut:
+    """Build the full DraftDetailOut from a Sanity draft doc. Includes the
+    AI-tells score + cost rollup + approval row — the ``draft_only`` /
+    ``both`` view needs all of it."""
     generated_by = doc.get("generatedBy") or {}
     if isinstance(generated_by, dict):
         draft_brand_slug = generated_by.get("brandSlug")
-        generated_by_str = generated_by.get("name") or generated_by.get("brandSlug")
+        generated_by_str = generated_by.get("name") or generated_by.get(
+            "brandSlug"
+        )
     else:
         draft_brand_slug = None
         generated_by_str = str(generated_by) if generated_by else None
-    if draft_brand_slug and draft_brand_slug != slug:
-        raise HTTPException(
-            status_code=403,
-            detail="cross-brand draft access not allowed",
-        )
 
-    body = doc.get("body")
-    body_markdown: str | None = None
-    if isinstance(body, list):
-        chunks: list[str] = []
-        for block in body:
-            if not isinstance(block, dict):
-                continue
-            if block.get("_type") == "block":
-                style = block.get("style", "normal")
-                text_parts = [
-                    c.get("text", "")
-                    for c in block.get("children", [])
-                    if isinstance(c, dict)
-                ]
-                joined = "".join(text_parts)
-                if style == "h2":
-                    chunks.append(f"## {joined}")
-                elif style == "h3":
-                    chunks.append(f"### {joined}")
-                else:
-                    chunks.append(joined)
-        body_markdown = "\n\n".join(chunks)
-    elif isinstance(body, str):
-        body_markdown = body
+    body_markdown = _portable_text_to_markdown(doc.get("body"))
 
-    # --- AI tells score (no extra LLM cost — pure string analysis) ---
     ai_tells_score: int | None = None
     ai_tells: list[str] = []
     if body_markdown:
         try:
-            from pipeline.generator.anti_ai_check import score_ai_tells  # noqa: PLC0415
+            from pipeline.generator.anti_ai_check import (  # noqa: PLC0415
+                score_ai_tells,
+            )
 
             score, tells = score_ai_tells(body_markdown)
             ai_tells_score = int(round(score))
@@ -387,7 +380,6 @@ async def get_draft(
             ai_tells_score = None
             ai_tells = []
 
-    # --- cost rollup + approval load ---
     total = 0.0
     by_op: dict[str, tuple[float, int]] = {}
     approval_out: DraftApprovalOut | None = None
@@ -422,7 +414,7 @@ async def get_draft(
         key_takeaway=doc.get("keyTakeaway"),
         cover_image_url=doc.get("coverImageUrl"),
         generated_by=generated_by_str,
-        brand_slug=draft_brand_slug or slug,
+        brand_slug=draft_brand_slug or fallback_brand_slug,
         created_at=doc.get("_createdAt"),
         language=doc.get("language"),
         topic_id=doc.get("topicId"),
@@ -431,6 +423,158 @@ async def get_draft(
         approval=approval_out,
         ai_tells_score=ai_tells_score,
         ai_tells=ai_tells,
+    )
+
+
+@router.get("/{sanity_draft_id}", response_model=DraftStateOut)
+async def get_draft(
+    sanity_draft_id: str,
+    brand_id: int = Query(..., description="Active brand id from the UI session"),
+) -> DraftStateOut:
+    """Fetch a draft + its published mirror from Sanity in one round-trip.
+
+    Returns a lifecycle envelope so the admin UI can distinguish:
+
+    * ``draft_only``     — Sanity has ``drafts.{id}`` but not ``{id}``;
+                            the legacy preview / approve / reject UI.
+    * ``published_only`` — Sanity has ``{id}`` only; draft was already
+                            approved → published → drafts.{id} deleted
+                            (the NTS_051 chain). UI shows the success
+                            view with live + Studio deep-links.
+    * ``both``           — Rare. Operator opened a published post for
+                            re-edit so Studio re-created drafts.{id}.
+                            UI shows the draft preview plus a warning.
+    * ``neither``        — Genuine 404 (typo, deleted in Studio).
+
+    Cross-brand guard: ``generatedBy.brandSlug`` on either doc, when
+    present, must match the active brand's slug — otherwise 403.
+    """
+    client, slug = _build_sanity_client_for_brand(brand_id)
+
+    sanity_draft_id_normalised = _normalise_draft_id(sanity_draft_id)
+    sanity_published_id = sanity_draft_id_normalised[len("drafts.") :]
+
+    # Single round-trip for both docs. Sanity returns null per branch
+    # when nothing matches the predicate.
+    groq = (
+        "{"
+        '"draft": *[_id == $draft_id][0]{title, body, keyTakeaway, '
+        'generatedBy, language, topicId, _createdAt, '
+        '"coverImageUrl": coverImage.asset->url},'
+        '"published": *[_id == $pub_id][0]{_id, title, language, '
+        '_createdAt, _updatedAt, generatedBy, '
+        '"slug": slug.current, '
+        '"coverImageUrl": coverImage.asset->url}'
+        "}"
+    )
+    try:
+        combined = await client.query(
+            groq,
+            {
+                "draft_id": sanity_draft_id_normalised,
+                "pub_id": sanity_published_id,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sanity query failed: {type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+
+    if not isinstance(combined, dict):
+        combined = {}
+    draft_doc = combined.get("draft")
+    published_doc = combined.get("published")
+
+    # Determine lifecycle state.
+    has_draft = isinstance(draft_doc, dict) and bool(draft_doc)
+    has_published = isinstance(published_doc, dict) and bool(published_doc)
+    if has_draft and has_published:
+        state: str = "both"
+    elif has_draft:
+        state = "draft_only"
+    elif has_published:
+        state = "published_only"
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no draft or published document found for "
+                f"{sanity_published_id!r} under brand {slug!r}"
+            ),
+        )
+
+    # Cross-brand guard. If either doc has a brandSlug set and it does
+    # not match, refuse — same rule that protected the legacy endpoint.
+    for doc in (draft_doc, published_doc):
+        if not isinstance(doc, dict):
+            continue
+        gb = doc.get("generatedBy")
+        if isinstance(gb, dict) and gb.get("brandSlug") and gb.get(
+            "brandSlug"
+        ) != slug:
+            raise HTTPException(
+                status_code=403,
+                detail="cross-brand draft access not allowed",
+            )
+
+    draft_out: DraftDetailOut | None = None
+    if has_draft:
+        draft_out = _build_draft_detail_out(
+            draft_doc,  # type: ignore[arg-type]
+            sanity_draft_id_normalised,
+            brand_id,
+            fallback_brand_slug=slug,
+        )
+
+    published_out: PublishedDocOut | None = None
+    publication_info: PublicationInfoOut | None = None
+    if has_published:
+        pub_generated_by = published_doc.get("generatedBy")  # type: ignore[union-attr]
+        pub_brand_slug = (
+            pub_generated_by.get("brandSlug")
+            if isinstance(pub_generated_by, dict)
+            else None
+        ) or slug
+        pub_slug = published_doc.get("slug")  # type: ignore[union-attr]
+        published_out = PublishedDocOut(
+            sanity_id=str(published_doc.get("_id") or sanity_published_id),  # type: ignore[union-attr]
+            title=published_doc.get("title"),  # type: ignore[union-attr]
+            slug=pub_slug,
+            language=published_doc.get("language"),  # type: ignore[union-attr]
+            cover_image_url=published_doc.get("coverImageUrl"),  # type: ignore[union-attr]
+            brand_slug=pub_brand_slug,
+            updated_at=published_doc.get("_updatedAt"),  # type: ignore[union-attr]
+        )
+
+        # ``draft_approvals`` is keyed on ``drafts.{id}`` (the value at
+        # approve-time). Load it for the published view's timestamps and
+        # approver name.
+        with session_scope() as session:
+            approval_row = session.execute(
+                select(DraftApproval).where(
+                    DraftApproval.sanity_draft_id
+                    == sanity_draft_id_normalised,
+                    DraftApproval.brand_id_fk == brand_id,
+                )
+            ).scalar_one_or_none()
+            if approval_row is not None:
+                session.expunge(approval_row)
+
+        publication_info = PublicationInfoOut(
+            sanity_published_id=sanity_published_id,
+            published_at=approval_row.published_at if approval_row else None,
+            approver=approval_row.decided_by if approval_row else None,
+            note=approval_row.note if approval_row else None,
+            live_url=_build_live_url(pub_brand_slug, pub_slug),
+        )
+
+    return DraftStateOut(
+        sanity_id=sanity_published_id,
+        state=state,  # type: ignore[arg-type]
+        draft=draft_out,
+        published=published_out,
+        publication_info=publication_info,
     )
 
 
