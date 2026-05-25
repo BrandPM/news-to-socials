@@ -585,20 +585,46 @@ class PublicationInfoOut(BaseModel):
     live_url: str | None = None
 
 
+class RejectionInfoOut(BaseModel):
+    """When/why a draft was rejected. IT_PROJ_NTS_052 Content hub: the
+    Rejected tab + /drafts/[id] rejected view both consume this — the UI
+    shows the timestamp + optional reason, and offers Restore (un-reject)
+    or Delete permanently. The Sanity doc itself stays with
+    ``status: "rejected"`` until the operator explicitly deletes it.
+    """
+
+    rejected_at: datetime | None = None
+    reason: str | None = None
+    rejected_by: str | None = None
+
+
+# IT_PROJ_NTS_052 Content hub: state names align with the three tabs the
+# admin UI shows (``pending`` / ``published`` / ``rejected``) plus
+# ``neither`` for the genuine-404 case. A doc that has both a published
+# mirror AND an open ``drafts.*`` (operator re-edit) reports
+# ``state='pending'`` with ``publication_info`` populated — the UI uses
+# the publication_info signal to show the "Editing published post"
+# warning above the draft preview.
 DraftLifecycleState = Literal[
-    "draft_only", "published_only", "both", "neither"
+    "pending", "published", "rejected", "neither"
 ]
 
 
 class DraftStateOut(BaseModel):
     """Lifecycle-aware wrapper around the legacy ``DraftDetailOut`` shape.
 
-    IT_PROJ_NTS_052: after ``approve`` (NTS_051 chain) the draft document
-    is deleted from Sanity, leaving the published mirror behind. The
-    admin /drafts/[id] page used to render a misleading "Draft not
-    found" error for these — the new ``state`` field lets the UI choose
-    between a draft-preview view, a published success view, or a real
-    not-found error.
+    IT_PROJ_NTS_052 Content hub: ``state`` drives the per-status view
+    inside /drafts/[id]:
+
+    * ``pending``   — ``drafts.{id}`` exists; not flagged rejected. May
+                       also have a published mirror (re-edit case →
+                       ``publication_info`` populated for warning UI).
+    * ``published`` — only the published doc exists; ``drafts.{id}`` was
+                       removed by the approve chain (NTS_051).
+    * ``rejected``  — ``drafts.{id}`` exists with ``status='rejected'``;
+                       Restore returns it to pending.
+    * ``neither``   — genuine 404 (typo / hard-deleted in Studio). The
+                       endpoint surfaces this as HTTP 404.
 
     Returned for every non-error case (200). Only ``state='neither'``
     becomes a 404.
@@ -609,10 +635,37 @@ class DraftStateOut(BaseModel):
     draft: DraftDetailOut | None = None
     published: PublishedDocOut | None = None
     publication_info: PublicationInfoOut | None = None
+    rejection_info: RejectionInfoOut | None = None
+
+
+class DraftListSibling(BaseModel):
+    """Lightweight sibling-draft pointer attached to each list item
+    (IT_PROJ_NTS_052 Content hub). The Pending/Rejected tabs show one
+    card per draft with language chips for its siblings so an operator
+    can see at a glance which languages are still in-flight without
+    opening the detail page.
+    """
+
+    sanity_id: str
+    language: str
+    status: Literal["pending", "published", "rejected"]
+
+
+# IT_PROJ_NTS_052 — explicit status used by the Content hub. Distinct
+# from ``approval_status`` (legacy DB-side approval row) because a
+# Sanity draft can be ``pending`` (no approval row) OR ``rejected``
+# (flagged in Sanity) OR ``published`` (lives at non-drafts.* id) —
+# whereas the old ``approval_status`` only ever read the DB row.
+DraftStatus = Literal["pending", "published", "rejected"]
 
 
 class DraftListItem(BaseModel):
-    """Row in the multilingual /drafts list view (S6.7)."""
+    """Row in the multilingual /drafts list view (S6.7).
+
+    IT_PROJ_NTS_052 Content hub adds: ``status`` (the three-tab kind),
+    ``published_at`` / ``rejected_at`` timestamps, ``live_url`` for
+    published rows, and a ``siblings`` array for per-language fanout.
+    """
 
     sanity_id: str
     title: str | None
@@ -626,19 +679,30 @@ class DraftListItem(BaseModel):
     # backfill runs.
     slug: str | None = None
 
+    # IT_PROJ_NTS_052 Content hub additions.
+    status: DraftStatus = "pending"
+    published_at: datetime | None = None
+    rejected_at: datetime | None = None
+    rejection_reason: str | None = None
+    live_url: str | None = None
+    siblings: list[DraftListSibling] = []
+
 
 class DraftListOut(BaseModel):
-    """Paginated drafts list with language counts (S6.7).
+    """Paginated drafts list with language counts (S6.7) + status counts
+    (IT_PROJ_NTS_052).
 
-    ``by_language`` powers the tab strip — the UI shows
-    ``All (N) | EN (a) | RU (b) | UK (c) | PL (d)``. Counts cover the
-    *brand-wide* set, not the filtered slice, so the strip stays stable
-    as the user clicks tabs.
+    ``by_language`` powers the language tab strip (brand-wide; stays
+    stable as the user filters). ``by_status`` powers the Content hub
+    Pending / Published / Rejected tabs and DOES reflect the active
+    language filter — switching to RU updates the per-status counts to
+    "how many RU pending / published / rejected".
     """
 
     items: list[DraftListItem]
     total: int
     by_language: dict[str, int]
+    by_status: dict[str, int] = {}
     has_more: bool = False
 
 

@@ -170,11 +170,27 @@ class SanityClient:
         log.info("sanity.draft_created", id=draft_id)
         return draft_id
 
-    async def patch(self, doc_id: str, set_fields: dict[str, Any]) -> dict[str, Any]:
-        """Update fields on an existing document (draft or published)."""
-        result = await self.mutate(
-            [{"patch": {"id": doc_id, "set": set_fields}}]
-        )
+    async def patch(
+        self,
+        doc_id: str,
+        set_fields: dict[str, Any] | None = None,
+        unset_fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Update fields on an existing document (draft or published).
+
+        ``set_fields`` writes/overwrites the keys. ``unset_fields`` removes
+        them (used by IT_PROJ_NTS_052's unreject — clears ``status`` +
+        ``rejected_at`` to return the doc to a pending state). At least
+        one of the two must be provided.
+        """
+        if not set_fields and not unset_fields:
+            raise ValueError("patch requires at least set_fields or unset_fields")
+        patch_body: dict[str, Any] = {"id": doc_id}
+        if set_fields:
+            patch_body["set"] = set_fields
+        if unset_fields:
+            patch_body["unset"] = unset_fields
+        result = await self.mutate([{"patch": patch_body}])
         return result
 
     # --- Asset upload -----------------------------------------------------

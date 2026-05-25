@@ -19,12 +19,14 @@ from pipeline.admin.schemas import (
     DraftDetailOut,
     DraftListItem,
     DraftListOut,
+    DraftListSibling,
     DraftStateOut,
     ImageRegenerateIn,
     JobAcceptedOut,
     JobStatusOut,
     PublicationInfoOut,
     PublishedDocOut,
+    RejectionInfoOut,
 )
 from pipeline.common.config import get_settings
 from pipeline.common.logging import get_logger
@@ -164,9 +166,63 @@ def _build_sanity_client_for_brand(brand_id: int) -> tuple[object, str]:
     return client, slug
 
 
+def _status_filter_clause(status: str) -> str:
+    """GROQ fragment that scopes ``*[…]`` to one of the three tabs.
+
+    Sanity stores rejection as a ``status`` field on the draft document
+    (IT_PROJ_NTS_052). Pending is encoded by *absence* of that field
+    (back-compat with every draft written before this commit) OR an
+    explicit ``status == "pending"``. Published is the absence of the
+    ``drafts.`` prefix entirely.
+    """
+    if status == "pending":
+        return (
+            '_type == "post" && _id in path("drafts.**") && '
+            '(!defined(status) || status == "pending")'
+        )
+    if status == "published":
+        # ``!(_id in path("drafts.**"))`` matches non-drafts; pair with
+        # the type guard so non-post documents don't bleed in.
+        return '_type == "post" && !(_id in path("drafts.**"))'
+    if status == "rejected":
+        return (
+            '_type == "post" && _id in path("drafts.**") && '
+            'status == "rejected"'
+        )
+    raise HTTPException(
+        status_code=422,
+        detail=f"invalid status {status!r}; expected pending|published|rejected",
+    )
+
+
+def _selection_for_status(status: str) -> str:
+    """GROQ projection per tab.
+
+    Pending / rejected stay on the ``drafts.*`` shape (no slug yet on
+    fresh drafts, but populated by NTS_051 backfill).  The published
+    branch also pulls ``slug.current`` for the ``Open live`` link
+    construction. ``rejection`` block is selected for rejected items so
+    the card UI can render the timestamp + reason inline.
+    """
+    base = (
+        "{_id, title, language, topicId, _createdAt, "
+        '"coverImageUrl": coverImage.asset->url, '
+        '"slug": slug.current'
+    )
+    if status == "rejected":
+        base += ', "rejectedAt": rejectedAt, "rejectionReason": rejectionReason'
+    base += "}"
+    return base
+
+
 @router.get("", response_model=DraftListOut)
 async def list_drafts(
     brand_id: int = Query(..., description="Active brand id from the UI session"),
+    status: str = Query(
+        default="pending",
+        pattern="^(pending|published|rejected)$",
+        description="Content hub tab — Pending, Published or Rejected.",
+    ),
     language: str | None = Query(
         default=None,
         pattern="^(en|ru|uk|pl)$",
@@ -179,45 +235,51 @@ async def list_drafts(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> DraftListOut:
-    """List Sanity drafts for ``brand_id``, with language counts.
+    """List Sanity drafts for ``brand_id``, scoped by Content-hub status.
 
-    S6.7 powers the multilingual /drafts list. Counts in ``by_language``
-    are always brand-wide so the tab strip doesn't jitter as the user
-    clicks a filter. ``items`` is the filtered + paginated slice.
+    IT_PROJ_NTS_052 wraps S6.7's multilingual list with a three-tab
+    breakdown (Pending / Published / Rejected). Each tab issues a
+    distinct GROQ — see :func:`_status_filter_clause` — so we never
+    confuse "rejected and kept in Sanity" with "deleted from Sanity".
+
+    Counts:
+    * ``by_language`` covers the brand-wide pending set (back-compat
+      with the existing language-tab strip on /drafts).
+    * ``by_status`` covers the active language filter so the three-tab
+      counts reflect what the operator is currently looking at.
+
+    ``items`` is the filtered + paginated slice for the active tab.
     """
     client, brand_slug = _build_sanity_client_for_brand(brand_id)
 
-    # The brand-scope filter relies on the post.ts patch
-    # (``generatedBy.brandSlug``). Older posts that lack the field show
-    # in the list too (the cross-brand guard on the detail route catches
-    # any stray edits). This is the same logic the dedup helper uses.
-    base_filter = (
-        '_type == "post" && _id in path("drafts.**") && '
-        '(generatedBy.brandSlug == $slug || !defined(generatedBy.brandSlug))'
+    # Brand scope: brandSlug match OR legacy docs without the field.
+    brand_clause = (
+        "(generatedBy.brandSlug == $slug || !defined(generatedBy.brandSlug))"
     )
+
+    base_filter = f"{_status_filter_clause(status)} && {brand_clause}"
     if topic_id:
         base_filter += " && topicId == $topic"
 
-    selection = (
-        "{_id, title, language, topicId, _createdAt, "
-        '"coverImageUrl": coverImage.asset->url, '
-        '"slug": slug.current}'
-    )
-
+    # Per-status count breakdown for the three Content-hub tabs. Honours
+    # the current language filter so EN-only viewers see EN-only counts.
+    lang_clause = f' && language == "{language}"' if language else ""
+    pending_clause = _status_filter_clause("pending")
+    published_clause = _status_filter_clause("published")
+    rejected_clause = _status_filter_clause("rejected")
     counts_groq = (
-        f'*[{base_filter}]{{language}} | '
-        '{"by_language": @[].language}'
-    )
-    # Compose the count query as a faceting GROQ so we get totals in one
-    # round-trip alongside the slice.
-    counts_groq = (
-        '{'
+        "{"
         f'"total": count(*[{base_filter}]),'
+        f'"pending": count(*[{pending_clause} && {brand_clause}{lang_clause}]),'
+        f'"published": count(*[{published_clause} && {brand_clause}{lang_clause}]),'
+        f'"rejected": count(*[{rejected_clause} && {brand_clause}{lang_clause}]),'
+        # by_language stays scoped to the active tab so the language
+        # strip lines up with the tab the operator is on.
         f'"en": count(*[{base_filter} && language == "en"]),'
         f'"ru": count(*[{base_filter} && language == "ru"]),'
         f'"uk": count(*[{base_filter} && language == "uk"]),'
         f'"pl": count(*[{base_filter} && language == "pl"])'
-        '}'
+        "}"
     )
 
     items_filter = base_filter
@@ -225,7 +287,7 @@ async def list_drafts(
         items_filter += f' && language == "{language}"'
     items_groq = (
         f'*[{items_filter}] | order(_createdAt desc) '
-        f'[{offset}...{offset + limit}] {selection}'
+        f'[{offset}...{offset + limit}] {_selection_for_status(status)}'
     )
 
     params: dict[str, object] = {"slug": brand_slug}
@@ -242,9 +304,12 @@ async def list_drafts(
         ) from exc
 
     by_language: dict[str, int] = {}
+    by_status: dict[str, int] = {}
     if isinstance(counts, dict):
         for code in SUPPORTED_LANGUAGES:
             by_language[code] = int(counts.get(code) or 0)
+        for key in ("pending", "published", "rejected"):
+            by_status[key] = int(counts.get(key) or 0)
         total = int(counts.get("total") or 0)
     else:
         total = 0
@@ -254,6 +319,7 @@ async def list_drafts(
 
     # Bulk-load approval status so the list view renders without N+1.
     approvals: dict[str, str] = {}
+    approval_rows: dict[str, DraftApproval] = {}
     if sanity_ids:
         with session_scope() as session:
             for row in session.scalars(
@@ -263,12 +329,88 @@ async def list_drafts(
                 )
             ):
                 approvals[row.sanity_draft_id] = row.status
+                session.expunge(row)
+                approval_rows[row.sanity_draft_id] = row
+
+    # Sibling lookup: one extra GROQ for every topic the current page
+    # touches, returning the language + status mix per topic. Bulk so the
+    # response stays one-round-trip-ish even on a 50-item page.
+    siblings_by_topic: dict[str, list[dict]] = {}
+    topic_ids = sorted({
+        str(r.get("topicId")) for r in items_raw
+        if isinstance(r, dict) and r.get("topicId")
+    })
+    if topic_ids:
+        siblings_groq = (
+            '*[_type == "post" && topicId in $topics && '
+            f"{brand_clause}]"
+            '{_id, language, topicId, '
+            '"isDraft": _id in path("drafts.**"), '
+            '"rejected": defined(status) && status == "rejected"}'
+        )
+        try:
+            sib_rows = await client.query(  # type: ignore[attr-defined]
+                siblings_groq, {"slug": brand_slug, "topics": topic_ids}
+            )
+        except Exception:  # noqa: BLE001
+            sib_rows = []
+        if isinstance(sib_rows, list):
+            for s in sib_rows:
+                if not isinstance(s, dict):
+                    continue
+                tid = str(s.get("topicId") or "")
+                if not tid:
+                    continue
+                siblings_by_topic.setdefault(tid, []).append(s)
 
     items: list[DraftListItem] = []
     for raw in items_raw:
         if not isinstance(raw, dict) or not raw.get("_id"):
             continue
         sid = str(raw["_id"])
+        approval_row = approval_rows.get(sid)
+
+        slug_val = raw.get("slug")
+        live_url: str | None = None
+        published_at = None
+        rejected_at = None
+        rejection_reason = None
+        if status == "published":
+            live_url = _build_live_url(brand_slug, slug_val)
+            if approval_row is not None:
+                published_at = approval_row.published_at
+        elif status == "rejected":
+            # Prefer Sanity-side timestamp/reason (source of truth for
+            # the doc), fall back to the local DraftApproval row.
+            rejected_at = raw.get("rejectedAt")
+            rejection_reason = raw.get("rejectionReason")
+            if approval_row is not None:
+                if rejected_at is None:
+                    rejected_at = approval_row.decided_at
+                if rejection_reason is None:
+                    rejection_reason = approval_row.note
+
+        # Siblings: drop the row itself, normalise status.
+        tid = raw.get("topicId")
+        sibs: list[DraftListSibling] = []
+        if tid:
+            for s in siblings_by_topic.get(str(tid), []):
+                if s.get("_id") == sid:
+                    continue
+                if s.get("isDraft") and s.get("rejected"):
+                    s_status: str = "rejected"
+                elif s.get("isDraft"):
+                    s_status = "pending"
+                else:
+                    s_status = "published"
+                sibs.append(
+                    DraftListSibling(
+                        sanity_id=str(s.get("_id")),
+                        language=str(s.get("language") or "en"),
+                        status=s_status,  # type: ignore[arg-type]
+                    )
+                )
+
         items.append(
             DraftListItem(
                 sanity_id=sid,
@@ -278,7 +420,13 @@ async def list_drafts(
                 created_at=raw.get("_createdAt"),
                 cover_image_url=raw.get("coverImageUrl"),
                 approval_status=approvals.get(sid, "draft"),  # type: ignore[arg-type]
-                slug=raw.get("slug"),
+                slug=slug_val,
+                status=status,  # type: ignore[arg-type]
+                published_at=published_at,
+                rejected_at=rejected_at,
+                rejection_reason=rejection_reason,
+                live_url=live_url,
+                siblings=sibs,
             )
         )
 
@@ -290,6 +438,7 @@ async def list_drafts(
         items=items,
         total=total,
         by_language=by_language,
+        by_status=by_status,
         has_more=offset + len(items) < effective_total,
     )
 
@@ -433,18 +582,20 @@ async def get_draft(
 ) -> DraftStateOut:
     """Fetch a draft + its published mirror from Sanity in one round-trip.
 
-    Returns a lifecycle envelope so the admin UI can distinguish:
+    Returns a Content-hub lifecycle envelope so the admin UI can pick
+    the right per-state view:
 
-    * ``draft_only``     — Sanity has ``drafts.{id}`` but not ``{id}``;
-                            the legacy preview / approve / reject UI.
-    * ``published_only`` — Sanity has ``{id}`` only; draft was already
-                            approved → published → drafts.{id} deleted
-                            (the NTS_051 chain). UI shows the success
-                            view with live + Studio deep-links.
-    * ``both``           — Rare. Operator opened a published post for
-                            re-edit so Studio re-created drafts.{id}.
-                            UI shows the draft preview plus a warning.
-    * ``neither``        — Genuine 404 (typo, deleted in Studio).
+    * ``pending``   — ``drafts.{id}`` exists, not flagged rejected. UI
+                       shows the preview + approve/reject controls.
+                       ``publication_info`` is populated iff a published
+                       mirror also exists (rare re-edit case → warning).
+    * ``published`` — only the published doc exists; the approve chain
+                       deleted ``drafts.{id}`` (NTS_051). UI shows the
+                       success card with live + Studio deep-links.
+    * ``rejected``  — ``drafts.{id}`` exists with ``status='rejected'``.
+                       UI shows the rejection panel with Restore / Delete
+                       permanently.
+    * ``neither``   — genuine 404 (typo, hard-deleted in Studio).
 
     Cross-brand guard: ``generatedBy.brandSlug`` on either doc, when
     present, must match the active brand's slug — otherwise 403.
@@ -455,11 +606,14 @@ async def get_draft(
     sanity_published_id = sanity_draft_id_normalised[len("drafts.") :]
 
     # Single round-trip for both docs. Sanity returns null per branch
-    # when nothing matches the predicate.
+    # when nothing matches the predicate. Pull ``status`` + ``rejectedAt``
+    # on the draft branch so the Content-hub rejected-state view has
+    # everything it needs without a second query.
     groq = (
         "{"
         '"draft": *[_id == $draft_id][0]{title, body, keyTakeaway, '
-        'generatedBy, language, topicId, _createdAt, '
+        'generatedBy, language, topicId, _createdAt, status, '
+        'rejectedAt, rejectionReason, rejectedBy, '
         '"coverImageUrl": coverImage.asset->url},'
         '"published": *[_id == $pub_id][0]{_id, title, language, '
         '_createdAt, _updatedAt, generatedBy, '
@@ -489,13 +643,13 @@ async def get_draft(
     # Determine lifecycle state.
     has_draft = isinstance(draft_doc, dict) and bool(draft_doc)
     has_published = isinstance(published_doc, dict) and bool(published_doc)
-    if has_draft and has_published:
-        state: str = "both"
-    elif has_draft:
-        state = "draft_only"
-    elif has_published:
-        state = "published_only"
-    else:
+    is_rejected = (
+        has_draft
+        and isinstance(draft_doc, dict)
+        and draft_doc.get("status") == "rejected"
+    )
+
+    if not has_draft and not has_published:
         raise HTTPException(
             status_code=404,
             detail=(
@@ -503,6 +657,16 @@ async def get_draft(
                 f"{sanity_published_id!r} under brand {slug!r}"
             ),
         )
+
+    if is_rejected:
+        state: str = "rejected"
+    elif has_draft:
+        # The re-edit "both" case also lands here: state stays "pending"
+        # but ``publication_info`` is populated below so the UI can show
+        # the "Editing published post" warning.
+        state = "pending"
+    else:
+        state = "published"
 
     # Cross-brand guard. If either doc has a brandSlug set and it does
     # not match, refuse — same rule that protected the legacy endpoint.
@@ -569,12 +733,51 @@ async def get_draft(
             live_url=_build_live_url(pub_brand_slug, pub_slug),
         )
 
+    rejection_info: RejectionInfoOut | None = None
+    if is_rejected and isinstance(draft_doc, dict):
+        # Prefer Sanity-side fields (the doc IS the source of truth for
+        # the rejection record); fall back to the DraftApproval row
+        # written at reject-time.
+        rejected_at_raw = draft_doc.get("rejectedAt")
+        rejected_at_parsed: datetime | None = None
+        if isinstance(rejected_at_raw, str) and rejected_at_raw:
+            try:
+                rejected_at_parsed = datetime.fromisoformat(
+                    rejected_at_raw.replace("Z", "+00:00")
+                )
+            except ValueError:
+                rejected_at_parsed = None
+        reason = draft_doc.get("rejectionReason")
+        rejected_by = draft_doc.get("rejectedBy")
+        if rejected_at_parsed is None or reason is None or rejected_by is None:
+            with session_scope() as session:
+                row = session.execute(
+                    select(DraftApproval).where(
+                        DraftApproval.sanity_draft_id
+                        == sanity_draft_id_normalised,
+                        DraftApproval.brand_id_fk == brand_id,
+                    )
+                ).scalar_one_or_none()
+                if row is not None:
+                    if rejected_at_parsed is None:
+                        rejected_at_parsed = row.decided_at
+                    if reason is None:
+                        reason = row.note
+                    if rejected_by is None:
+                        rejected_by = row.decided_by
+        rejection_info = RejectionInfoOut(
+            rejected_at=rejected_at_parsed,
+            reason=reason,
+            rejected_by=rejected_by,
+        )
+
     return DraftStateOut(
         sanity_id=sanity_published_id,
         state=state,  # type: ignore[arg-type]
         draft=draft_out,
         published=published_out,
         publication_info=publication_info,
+        rejection_info=rejection_info,
     )
 
 
@@ -789,34 +992,162 @@ async def reject_draft(
     payload: DraftApprovalIn,
     brand_id: int = Query(..., description="Active brand id"),
 ) -> DraftApprovalOut:
-    """Record rejection and (optionally) delete the draft from Sanity.
+    """Record rejection AND mark the Sanity draft ``status='rejected'``.
 
-    Deletion is gated on ``DELETE_REJECTED_FROM_SANITY=true`` (default).
-    Failure to delete in Sanity does NOT fail the request — the local
-    rejection row is the source of truth; the Sanity-side delete is a
-    cleanup convenience.
+    IT_PROJ_NTS_052 Content hub: rejection no longer deletes the
+    document. Instead we PATCH ``drafts.{id}`` to add
+    ``status: "rejected"`` + ``rejectedAt`` (and ``rejectionReason``
+    when the operator provided a note). The Rejected tab queries on
+    that field; Restore unsets it. The legacy delete path is kept
+    behind ``DELETE_REJECTED_FROM_SANITY=true`` for environments that
+    explicitly want the old behaviour (default now ``false``).
+
+    Sanity-side write failures don't fail the request — the local
+    DraftApproval row is the source of truth for audit, the Sanity
+    patch is the consumable signal for the UI's Rejected tab.
     """
     _ensure_brand_owns_draft(brand_id)
     normalised = _normalise_draft_id(sanity_draft_id)
     row = _upsert_approval(normalised, brand_id, "rejected", payload.note)
 
-    if get_settings().delete_rejected_from_sanity:
-        try:
-            from pipeline.publisher.sanity import SanityPublisher  # noqa: PLC0415
+    settings = get_settings()
+    sanity_client, _ = _build_sanity_client_for_brand(brand_id)
+    from pipeline.publisher.sanity import SanityPublisher  # noqa: PLC0415
 
-            sanity_client, _ = _build_sanity_client_for_brand(brand_id)
-            publisher = SanityPublisher(client=sanity_client)
+    publisher = SanityPublisher(client=sanity_client)
+
+    if settings.delete_rejected_from_sanity:
+        # Back-compat: legacy NTS_051 path — hard delete.
+        try:
             await publisher.delete_draft(normalised)
         except Exception as exc:  # noqa: BLE001
-            # delete_draft already swallows internally but if the
-            # client build itself fails we still want a successful reject.
             log.warning(
                 "reject.delete_failed",
                 draft_id=normalised,
                 err=f"{type(exc).__name__}: {exc!s}",
             )
+    else:
+        # NTS_052 default: PATCH ``status`` + ``rejectedAt`` so the doc
+        # stays in Sanity for audit / Restore. Best-effort: failures log
+        # but do not bubble — the local approval row is authoritative.
+        set_fields: dict[str, object] = {
+            "status": "rejected",
+            "rejectedAt": row.decided_at.isoformat(),
+            "rejectedBy": row.decided_by,
+        }
+        if payload.note:
+            set_fields["rejectionReason"] = payload.note
+        try:
+            await sanity_client.patch(normalised, set_fields=set_fields)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "reject.patch_failed",
+                draft_id=normalised,
+                err=f"{type(exc).__name__}: {exc!s}",
+            )
 
     return _approval_to_out(row)  # type: ignore[return-value]
+
+
+@router.post("/{sanity_draft_id}/unreject", response_model=DraftApprovalOut)
+async def unreject_draft(
+    sanity_draft_id: str,
+    brand_id: int = Query(..., description="Active brand id"),
+) -> DraftApprovalOut:
+    """Move a rejected draft back to pending.
+
+    IT_PROJ_NTS_052 Content hub: the Rejected tab's "Restore" action
+    clears the Sanity-side rejection flag and resets the local approval
+    row. After this call the draft is identical to one that was never
+    rejected — it shows up in the Pending tab and the approve/reject
+    controls are live again.
+    """
+    _ensure_brand_owns_draft(brand_id)
+    normalised = _normalise_draft_id(sanity_draft_id)
+
+    # Reset the DB row to ``draft`` so audit history is preserved (the
+    # row stays, ``decided_at`` updates) but the tab logic flips.
+    row = _upsert_approval(normalised, brand_id, "draft", None)
+
+    sanity_client, _ = _build_sanity_client_for_brand(brand_id)
+    try:
+        await sanity_client.patch(
+            normalised,
+            unset_fields=[
+                "status",
+                "rejectedAt",
+                "rejectionReason",
+                "rejectedBy",
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "unreject.patch_failed",
+            draft_id=normalised,
+            err=f"{type(exc).__name__}: {exc!s}",
+        )
+
+    return _approval_to_out(row)  # type: ignore[return-value]
+
+
+@router.delete("/{sanity_draft_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def permanently_delete_draft(
+    sanity_draft_id: str,
+    brand_id: int = Query(..., description="Active brand id"),
+) -> None:
+    """Permanently remove a rejected draft from Sanity.
+
+    IT_PROJ_NTS_052 Content hub explicit-cleanup action. Safety gate:
+    only documents currently flagged ``status='rejected'`` can be
+    permanently deleted via this endpoint — any other state returns
+    400 so an operator can't accidentally lose a pending or published
+    document by hitting Delete in the wrong UI.
+
+    The local DraftApproval row is left in place as an audit trail.
+    """
+    _ensure_brand_owns_draft(brand_id)
+    normalised = _normalise_draft_id(sanity_draft_id)
+    sanity_client, _ = _build_sanity_client_for_brand(brand_id)
+
+    # Guard: re-read the Sanity doc and confirm it's rejected before
+    # deleting. We do NOT trust the local DB row — Sanity is source of
+    # truth for the doc's existence + status.
+    try:
+        doc = await sanity_client.query(  # type: ignore[attr-defined]
+            '*[_id == $id][0]{_id, status, "isDraft": _id in path("drafts.**")}',
+            {"id": normalised},
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sanity query failed: {type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+
+    if not isinstance(doc, dict) or not doc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no document found for {normalised!r}",
+        )
+    if not doc.get("isDraft") or doc.get("status") != "rejected":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "refusing to delete: document is not in the rejected "
+                "state. Reject it first, then retry."
+            ),
+        )
+
+    from pipeline.publisher.sanity import SanityPublisher  # noqa: PLC0415
+
+    publisher = SanityPublisher(client=sanity_client)
+    try:
+        await publisher.delete_draft(normalised)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sanity delete failed: {type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+    return None
 
 
 # ---------------------------------------------------------------------------

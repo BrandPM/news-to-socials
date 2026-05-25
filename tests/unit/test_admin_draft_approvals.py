@@ -425,19 +425,29 @@ def test_approve_returns_502_when_sanity_publish_fails(
     assert rows[0].published_at is None
 
 
-def test_reject_deletes_draft_from_sanity_when_flag_on(
+def test_reject_patches_status_field_by_default(
     monkeypatch, client, icon_with_creds
 ) -> None:
-    """With DELETE_REJECTED_FROM_SANITY=true (default), reject removes
-    the draft document from Sanity so Studio's tray stays clean."""
+    """IT_PROJ_NTS_052 Content hub: reject's default path PATCHes the
+    Sanity draft with ``status: "rejected"`` + ``rejectedAt`` instead of
+    deleting it. The Rejected tab queries on that field; Restore unsets
+    it (see test_unreject_clears_status_field)."""
     bid = icon_with_creds
+    patches: list[tuple[str, dict, list[str] | None]] = []
     deleted: list[str] = []
 
     from pipeline.publisher import sanity as sanity_mod
 
+    async def capture_patch(
+        self, doc_id, set_fields=None, unset_fields=None
+    ):  # noqa: ANN001
+        patches.append((doc_id, set_fields or {}, unset_fields))
+        return {}
+
     async def capture_delete(self, draft_id):  # noqa: ANN001
         deleted.append(draft_id)
 
+    monkeypatch.setattr(sanity_mod.SanityClient, "patch", capture_patch)
     monkeypatch.setattr(
         sanity_mod.SanityPublisher, "delete_draft", capture_delete
     )
@@ -448,20 +458,28 @@ def test_reject_deletes_draft_from_sanity_when_flag_on(
         json={"note": "off-brand"},
     )
     assert resp.status_code == 200
-    assert deleted == ["drafts.post-junk"]
+    assert deleted == []  # default flow does NOT delete
+    assert len(patches) == 1
+    doc_id, set_fields, _ = patches[0]
+    assert doc_id == "drafts.post-junk"
+    assert set_fields["status"] == "rejected"
+    assert set_fields["rejectionReason"] == "off-brand"
+    assert "rejectedAt" in set_fields
 
 
-def test_reject_skips_sanity_delete_when_flag_off(
+def test_reject_deletes_draft_from_sanity_when_flag_on(
     monkeypatch, client, icon_with_creds
 ) -> None:
-    """Operators who want rejected drafts kept in Studio set the env
-    flag to false; we honour that and don't touch Sanity."""
+    """Back-compat: with the legacy ``DELETE_REJECTED_FROM_SANITY=true``
+    env flag, reject reverts to NTS_051 behaviour and hard-deletes the
+    draft document. Used by environments that don't want a Rejected tab
+    audit trail."""
     bid = icon_with_creds
     deleted: list[str] = []
 
     from pipeline.common import config as config_module
 
-    monkeypatch.setenv("DELETE_REJECTED_FROM_SANITY", "false")
+    monkeypatch.setenv("DELETE_REJECTED_FROM_SANITY", "true")
     config_module._settings = None  # re-read settings
 
     from pipeline.publisher import sanity as sanity_mod
@@ -469,17 +487,195 @@ def test_reject_skips_sanity_delete_when_flag_off(
     async def capture_delete(self, draft_id):  # noqa: ANN001
         deleted.append(draft_id)
 
+    async def capture_patch(
+        self, doc_id, set_fields=None, unset_fields=None
+    ):  # noqa: ANN001
+        # Shouldn't be called in the legacy delete path.
+        raise AssertionError("patch should not be called when flag is on")
+
+    monkeypatch.setattr(
+        sanity_mod.SanityPublisher, "delete_draft", capture_delete
+    )
+    monkeypatch.setattr(sanity_mod.SanityClient, "patch", capture_patch)
+
+    resp = client.post(
+        f"/api/v1/drafts/post-legacy-junk/reject?brand_id={bid}",
+        headers=AUTH,
+        json={"note": "off-brand"},
+    )
+    assert resp.status_code == 200
+    assert deleted == ["drafts.post-legacy-junk"]
+
+
+def test_reject_preserves_doc_and_records_db_row_when_sanity_patch_fails(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """A Sanity 5xx during the PATCH must NOT lose the rejection — the
+    local DraftApproval row is the source of truth for the audit log."""
+    bid = icon_with_creds
+
+    from pipeline.publisher import sanity as sanity_mod
+
+    async def boom_patch(
+        self, doc_id, set_fields=None, unset_fields=None
+    ):  # noqa: ANN001
+        raise RuntimeError("503 sanity unreachable")
+
+    monkeypatch.setattr(sanity_mod.SanityClient, "patch", boom_patch)
+
+    resp = client.post(
+        f"/api/v1/drafts/post-flaky/reject?brand_id={bid}",
+        headers=AUTH,
+        json={"note": "fyi"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "rejected"
+
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        rows = session.query(DraftApproval).all()
+    assert len(rows) == 1 and rows[0].status == "rejected"
+
+
+def test_unreject_clears_status_field_and_resets_db_row(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """Restore action: the previously rejected draft returns to
+    ``draft`` (pending) — Sanity ``status`` + ``rejectedAt`` are unset
+    and the DB row's status flips back."""
+    bid = icon_with_creds
+
+    from pipeline.publisher import sanity as sanity_mod
+
+    patches: list[tuple[str, dict | None, list[str] | None]] = []
+
+    async def capture_patch(
+        self, doc_id, set_fields=None, unset_fields=None
+    ):  # noqa: ANN001
+        patches.append((doc_id, set_fields, unset_fields))
+        return {}
+
+    monkeypatch.setattr(sanity_mod.SanityClient, "patch", capture_patch)
+
+    # Reject first (so there's a row to flip).
+    client.post(
+        f"/api/v1/drafts/post-restore/reject?brand_id={bid}",
+        headers=AUTH,
+        json={"note": "wrong"},
+    )
+
+    resp = client.post(
+        f"/api/v1/drafts/post-restore/unreject?brand_id={bid}", headers=AUTH
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "draft"
+
+    # The unreject patch should be the most recent — set_fields None,
+    # unset_fields contains the rejection markers.
+    assert patches, "expected at least one patch call"
+    last_doc, last_set, last_unset = patches[-1]
+    assert last_doc == "drafts.post-restore"
+    assert last_set is None
+    assert last_unset is not None
+    assert "status" in last_unset
+    assert "rejectedAt" in last_unset
+
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        rows = session.query(DraftApproval).all()
+    assert len(rows) == 1 and rows[0].status == "draft"
+
+
+def test_unreject_unknown_brand_returns_404(client) -> None:
+    resp = client.post(
+        "/api/v1/drafts/post-x/unreject?brand_id=9999", headers=AUTH
+    )
+    assert resp.status_code == 404
+
+
+def test_permanent_delete_only_works_when_rejected(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """Safety gate: DELETE /drafts/{id} refuses unless Sanity confirms
+    the doc is currently in the rejected state."""
+    bid = icon_with_creds
+    deleted: list[str] = []
+
+    from pipeline.publisher import sanity as sanity_mod
+
+    async def query_pending(self, groq, params=None):  # noqa: ANN001
+        return {
+            "_id": "drafts.post-pending-x",
+            "status": None,
+            "isDraft": True,
+        }
+
+    async def capture_delete(self, draft_id):  # noqa: ANN001
+        deleted.append(draft_id)
+
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", query_pending)
     monkeypatch.setattr(
         sanity_mod.SanityPublisher, "delete_draft", capture_delete
     )
 
-    resp = client.post(
-        f"/api/v1/drafts/post-keep/reject?brand_id={bid}",
-        headers=AUTH,
-        json={"note": "audit it"},
+    resp = client.delete(
+        f"/api/v1/drafts/post-pending-x?brand_id={bid}", headers=AUTH
     )
-    assert resp.status_code == 200
-    assert deleted == []  # flag off → no Sanity call
+    assert resp.status_code == 400
+    assert "rejected" in resp.json()["detail"].lower()
+    assert deleted == []
+
+
+def test_permanent_delete_succeeds_for_rejected_doc(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """Happy path: the doc is currently rejected → delete proceeds and
+    returns 204."""
+    bid = icon_with_creds
+    deleted: list[str] = []
+
+    from pipeline.publisher import sanity as sanity_mod
+
+    async def query_rejected(self, groq, params=None):  # noqa: ANN001
+        return {
+            "_id": "drafts.post-bye",
+            "status": "rejected",
+            "isDraft": True,
+        }
+
+    async def capture_delete(self, draft_id):  # noqa: ANN001
+        deleted.append(draft_id)
+
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", query_rejected)
+    monkeypatch.setattr(
+        sanity_mod.SanityPublisher, "delete_draft", capture_delete
+    )
+
+    resp = client.delete(
+        f"/api/v1/drafts/post-bye?brand_id={bid}", headers=AUTH
+    )
+    assert resp.status_code == 204
+    assert deleted == ["drafts.post-bye"]
+
+
+def test_permanent_delete_returns_404_when_doc_missing(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """Hitting DELETE on an id Sanity has no record of → 404."""
+    bid = icon_with_creds
+
+    from pipeline.publisher import sanity as sanity_mod
+
+    async def query_empty(self, groq, params=None):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", query_empty)
+
+    resp = client.delete(
+        f"/api/v1/drafts/post-ghost?brand_id={bid}", headers=AUTH
+    )
+    assert resp.status_code == 404
 
 
 def test_approve_all_siblings_publishes_each_and_reports_per_language(

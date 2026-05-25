@@ -169,10 +169,11 @@ def test_get_draft_fetches_and_returns_detail(monkeypatch, client, icon_with_cre
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["state"] == "draft_only"
+    assert body["state"] == "pending"
     assert body["sanity_id"] == "post-aaa"
     assert body["published"] is None
     assert body["publication_info"] is None
+    assert body["rejection_info"] is None
     draft = body["draft"]
     assert draft["title"] == "India credit fund regime"
     assert "## Mezzanine repricing" in draft["body_markdown"]
@@ -285,7 +286,7 @@ def test_get_draft_state_published_only_surfaces_publication_info(
 ) -> None:
     """After approve→publish (NTS_051) the draft is gone and only the
     published mirror remains. The endpoint must return
-    ``state='published_only'`` with the slug + a constructed live URL +
+    ``state='published'`` with the slug + a constructed live URL +
     the local approval timestamp.
     """
     bid = icon_with_creds
@@ -335,7 +336,7 @@ def test_get_draft_state_published_only_surfaces_publication_info(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["state"] == "published_only"
+    assert body["state"] == "published"
     assert body["sanity_id"] == "post-eb99cfa3d8bf"
     assert body["draft"] is None
     assert body["published"]["slug"] == "eu-credit-fund-framework-lands"
@@ -378,7 +379,7 @@ def test_get_draft_state_published_only_without_approval_row(
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["state"] == "published_only"
+    assert body["state"] == "published"
     info = body["publication_info"]
     assert info["published_at"] is None
     assert info["approver"] is None
@@ -389,8 +390,9 @@ def test_get_draft_state_both_returns_draft_plus_publication_info(
     monkeypatch, client, icon_with_creds
 ) -> None:
     """Operator re-opened a published post in Studio → drafts.{id} reappears
-    next to {id}. Endpoint returns state='both' so the UI can render the
-    draft preview with an "editing published" warning."""
+    next to {id}. Endpoint returns state='pending' (the open draft) with
+    ``publication_info`` populated so the UI can show the draft preview
+    with an "editing published" warning above it."""
     bid = icon_with_creds
     fake_draft = {
         "title": "Edited again",
@@ -428,7 +430,10 @@ def test_get_draft_state_both_returns_draft_plus_publication_info(
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["state"] == "both"
+    # NTS_052: "both" collapsed into ``pending`` with publication_info
+    # populated — the publication_info presence is what triggers the
+    # warning banner above the draft preview.
+    assert body["state"] == "pending"
     assert body["draft"]["title"] == "Edited again"
     assert body["published"]["sanity_id"] == "post-both"
     assert body["publication_info"]["sanity_published_id"] == "post-both"
@@ -483,9 +488,15 @@ def test_get_draft_state_published_cross_brand_returns_403(
 # --- S6.7 list endpoint --------------------------------------------------
 
 
-def _make_list_query_mock(counts: dict, items: list[dict]) -> AsyncMock:
-    """Two sequential calls: counts faceting, then items page."""
-    return AsyncMock(side_effect=[counts, items])
+def _make_list_query_mock(
+    counts: dict, items: list[dict], siblings: list[dict] | None = None
+) -> AsyncMock:
+    """Three sequential calls: counts faceting, items page, siblings.
+
+    NTS_052 adds a per-page siblings GROQ so the list cards can show
+    language fanout chips. Tests that don't care about siblings can omit
+    the kwarg and get an empty list back."""
+    return AsyncMock(side_effect=[counts, items, siblings or []])
 
 
 def test_list_drafts_returns_items_with_language_counts(
@@ -665,3 +676,237 @@ def test_list_drafts_merges_approval_status(
     resp = client.get(f"/api/v1/drafts?brand_id={bid}", headers=AUTH)
     body = resp.json()
     assert body["items"][0]["approval_status"] == "approved"
+
+
+# --- IT_PROJ_NTS_052 Content hub: status-aware list & detail -------------
+
+
+def _capture_groq_mock(
+    counts: dict, items: list[dict], siblings: list[dict] | None = None
+) -> AsyncMock:
+    """Like _make_list_query_mock but records the GROQ strings on .calls
+    so the test can assert which status clause Sanity was queried with.
+    """
+    return AsyncMock(side_effect=[counts, items, siblings or []])
+
+
+def test_list_drafts_status_published_uses_non_drafts_groq(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """status=published narrows the GROQ to non-``drafts.*`` documents
+    and surfaces ``live_url`` per item. Card UI uses that for the Open
+    live → button."""
+    bid = icon_with_creds
+    counts = {
+        "total": 1,
+        "pending": 0,
+        "published": 1,
+        "rejected": 0,
+        "en": 1,
+        "ru": 0,
+        "uk": 0,
+        "pl": 0,
+    }
+    items = [
+        {
+            "_id": "post-pub-live",
+            "title": "Live post",
+            "language": "en",
+            "topicId": "t-live",
+            "_createdAt": "2026-05-25T08:00:00Z",
+            "coverImageUrl": None,
+            "slug": "live-post",
+        }
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    mock = _capture_groq_mock(counts, items)
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", mock)
+
+    resp = client.get(
+        f"/api/v1/drafts?brand_id={bid}&status=published", headers=AUTH
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["by_status"] == {"pending": 0, "published": 1, "rejected": 0}
+    assert body["items"][0]["status"] == "published"
+    assert body["items"][0]["live_url"] == (
+        "https://icon.finance/insights/live-post"
+    )
+    # Counts GROQ + items GROQ both must reference the non-drafts clause.
+    # (counts call is index 0, items call is index 1.)
+    counts_groq = mock.await_args_list[0].args[0]
+    items_groq = mock.await_args_list[1].args[0]
+    assert '!(_id in path("drafts.**"))' in counts_groq
+    assert '!(_id in path("drafts.**"))' in items_groq
+
+
+def test_list_drafts_status_rejected_filters_on_status_field(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """status=rejected only matches ``drafts.*`` docs whose Sanity
+    ``status`` field is ``"rejected"``."""
+    bid = icon_with_creds
+    counts = {
+        "total": 1,
+        "pending": 4,
+        "published": 9,
+        "rejected": 1,
+        "en": 1,
+        "ru": 0,
+        "uk": 0,
+        "pl": 0,
+    }
+    items = [
+        {
+            "_id": "drafts.post-bad",
+            "title": "Bad post",
+            "language": "en",
+            "topicId": None,
+            "_createdAt": "2026-05-24T09:00:00Z",
+            "coverImageUrl": None,
+            "slug": "bad",
+            "rejectedAt": "2026-05-25T10:00:00Z",
+            "rejectionReason": "off-brand tone",
+        }
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    mock = _capture_groq_mock(counts, items)
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", mock)
+
+    resp = client.get(
+        f"/api/v1/drafts?brand_id={bid}&status=rejected", headers=AUTH
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    item = body["items"][0]
+    assert item["status"] == "rejected"
+    assert item["rejected_at"].startswith("2026-05-25T10:00")
+    assert item["rejection_reason"] == "off-brand tone"
+    items_groq = mock.await_args_list[1].args[0]
+    assert 'status == "rejected"' in items_groq
+
+
+def test_list_drafts_invalid_status_returns_422(client, icon_with_creds) -> None:
+    bid = icon_with_creds
+    resp = client.get(
+        f"/api/v1/drafts?brand_id={bid}&status=wat", headers=AUTH
+    )
+    assert resp.status_code == 422
+
+
+def test_list_drafts_includes_siblings_per_item(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """The siblings sub-query is folded into each list item so the card
+    UI can show language-chip fanout without a per-card round-trip."""
+    bid = icon_with_creds
+    counts = {
+        "total": 1,
+        "pending": 1,
+        "published": 0,
+        "rejected": 0,
+        "en": 1,
+        "ru": 0,
+        "uk": 0,
+        "pl": 0,
+    }
+    items = [
+        {
+            "_id": "drafts.post-en-multi",
+            "title": "EN root",
+            "language": "en",
+            "topicId": "t-multi",
+            "_createdAt": "2026-05-24T08:00:00Z",
+            "coverImageUrl": None,
+            "slug": "en-multi",
+        }
+    ]
+    siblings = [
+        {
+            "_id": "drafts.post-en-multi",
+            "language": "en",
+            "topicId": "t-multi",
+            "isDraft": True,
+            "rejected": False,
+        },
+        {
+            "_id": "drafts.post-ru-multi",
+            "language": "ru",
+            "topicId": "t-multi",
+            "isDraft": True,
+            "rejected": False,
+        },
+        {
+            "_id": "post-uk-multi",
+            "language": "uk",
+            "topicId": "t-multi",
+            "isDraft": False,
+            "rejected": False,
+        },
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    monkeypatch.setattr(
+        sanity_mod.SanityClient,
+        "query",
+        _capture_groq_mock(counts, items, siblings=siblings),
+    )
+
+    resp = client.get(f"/api/v1/drafts?brand_id={bid}", headers=AUTH)
+    body = resp.json()
+    sibs = body["items"][0]["siblings"]
+    # The item itself filtered out; expect ru pending + uk published.
+    by_lang = {s["language"]: s["status"] for s in sibs}
+    assert by_lang == {"ru": "pending", "uk": "published"}
+
+
+def test_get_draft_state_rejected_surfaces_rejection_info(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """A draft with Sanity ``status='rejected'`` returns state='rejected'
+    + rejection_info populated."""
+    bid = icon_with_creds
+    fake_draft = {
+        "title": "Rejected piece",
+        "body": [
+            {
+                "_type": "block",
+                "style": "normal",
+                "children": [{"text": "Body text."}],
+            }
+        ],
+        "keyTakeaway": None,
+        "generatedBy": {"brandSlug": "icon"},
+        "_createdAt": "2026-05-24T07:00:00Z",
+        "coverImageUrl": None,
+        "language": "en",
+        "topicId": None,
+        "status": "rejected",
+        "rejectedAt": "2026-05-25T11:22:33Z",
+        "rejectionReason": "ai-tells too high",
+        "rejectedBy": "admin",
+    }
+    from pipeline.publisher import sanity as sanity_mod
+
+    monkeypatch.setattr(
+        sanity_mod.SanityClient,
+        "query",
+        _state_query_mock(draft=fake_draft, published=None),
+    )
+
+    resp = client.get(
+        f"/api/v1/drafts/post-rejected?brand_id={bid}", headers=AUTH
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "rejected"
+    assert body["rejection_info"] is not None
+    rej = body["rejection_info"]
+    assert rej["reason"] == "ai-tells too high"
+    assert rej["rejected_at"].startswith("2026-05-25T11:22")
+    assert rej["rejected_by"] == "admin"
+    # The draft envelope is still populated so the rejected-view can
+    # show the read-only preview.
+    assert body["draft"]["title"] == "Rejected piece"
