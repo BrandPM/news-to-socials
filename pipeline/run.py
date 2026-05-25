@@ -348,39 +348,55 @@ async def dedup_filter(
     return survivors
 
 
-async def generate_with_image(
+async def generate_image_for_topic(
     topic: Topic,
     brand: BrandConfig,
-    language: Language,
     sanity_publisher: SanityPublisher,
-) -> tuple[Draft, str | None]:
-    """Generate the post text + master image + upload image to Sanity assets."""
+) -> str | None:
+    """Generate the master image for ``topic`` and upload to Sanity assets.
+
+    S6 cost fix: image generation is language-independent, so we run it
+    ONCE per topic and reuse the resulting asset id across every language
+    draft for that topic. Previously this was called per (topic, language)
+    pair, producing 4× duplicate Replicate calls and 4× duplicate Sanity
+    asset uploads. Now: ``topic.id`` (URL hash) is the natural cache key
+    shared across languages.
+
+    Returns the Sanity asset ``_id`` on success, ``None`` on dry-run or
+    image failure. Image failures are isolated — the caller still produces
+    the language drafts, just without a cover (operator can add one
+    manually in Studio).
+    """
     settings = get_settings()
-
-    # Text generation
-    writer = CommentWriter()
-    draft = await writer.write(topic, brand.voice_profile_yaml, language)
-
-    # Image generation + upload (skip on dry-run)
     if settings.dry_run:
         log.info("image.dry_run", topic=topic.id)
-        return draft, None
+        return None
 
     try:
         gen = ImageGenerator()
         master_url = await gen.generate(topic, brand.visual)
         master_bytes = await fetch_master(master_url)
-        # We resize for the blog channel (1792x1008) — the cover used on /insights.
+        # Blog channel cover (1792x1008) — used on /insights.
         resized = resize_for_channel(master_bytes, Channel.blog)
-        asset_id = await sanity_publisher.upload_cover_image(
+        return await sanity_publisher.upload_cover_image(
             resized, filename=f"{brand.slug}-{topic.id}.png"
         )
-        return draft, asset_id
     except Exception:  # noqa: BLE001
         # log.exception captures the traceback so silent image failures
         # surface in /var/log/news-to-socials/run.log (IT_PROJ_NTS_013 Defect 1).
         log.exception("image.failed", topic=topic.id)
-        return draft, None  # Continue without image; Andriy can add manually.
+        return None  # Continue without image; Andriy can add manually.
+
+
+async def generate_draft_for_language(
+    topic: Topic,
+    brand: BrandConfig,
+    language: Language,
+) -> Draft:
+    """Generate the per-language post text. No image work — that's hoisted
+    above this call in the orchestrator (see :func:`generate_image_for_topic`)."""
+    writer = CommentWriter()
+    return await writer.write(topic, brand.voice_profile_yaml, language)
 
 
 # --------------------------------------------------------------------------
@@ -388,44 +404,41 @@ async def generate_with_image(
 # --------------------------------------------------------------------------
 
 
-async def _process_source(
+async def _build_topics_for_source(
     *,
-    source_record,  # config_client.SourceRecord
+    source_record,
     brand: BrandConfig,
     brand_id_fk: int,
-    language: Language,
+    client,
     limit: int,
-    dry_run: bool,
-    sanity_publisher,
-    client,  # AdminConfigClient
-    run_id: int | None,
     min_score: int,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Run the source → score → dedup → generate stages for ONE source and
-    ONE language.
+) -> tuple[list[Topic], int]:
+    """Fetch + score + embed a single RSS source.
 
-    Returns ``(results, stats)``. Per-topic outcomes are also written to
-    the ``topics`` table when ``run_id`` is set. S6 fanout calls this
-    once per language; failure inside the call is isolated to that one
-    (source × language) branch via the orchestrator's try/except.
+    Returns ``(topics, fetched_count)``. The Topic objects carry embeddings
+    + entities but have NOT been dedup-filtered — that's the caller's
+    job because the dedup set is per-language. ``source.fetch()`` runs
+    ONCE per source now (S6 fix); previously the per-language outer loop
+    re-fetched the same RSS 4×.
     """
     from pipeline.sources.rss import RssSource  # noqa: PLC0415
 
-    stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
     if source_record.source_type != "rss":
-        # web / telegram sources not implemented yet (S3+).
         log.warning("source.unsupported_type", type=source_record.source_type)
-        return [], stats
+        return []
 
     source = RssSource(
-        source_id=str(source_record.id) if source_record.id is not None else source_record.name,
+        source_id=(
+            str(source_record.id)
+            if source_record.id is not None
+            else source_record.name
+        ),
         name=source_record.name,
         url=source_record.url,
     )
 
     try:
         raw_items = list(await source.fetch())
-        stats["fetched"] = len(raw_items)
         log.info("source.fetched", count=len(raw_items), source=source.name)
         if source_record.id is not None:
             client.record_source_health(
@@ -444,88 +457,250 @@ async def _process_source(
                 error_msg=f"{type(exc).__name__}: {exc}",
             )
         raise
+    fetched_count = len(raw_items)
     if not raw_items:
         log.warning("source.empty", source=source.name)
-        return [], stats
+        return [], 0
 
     scored = await score_relevant_topics(
         raw_items, brand, min_score=min_score, limit_pool=limit * 4
     )
-    stats["scored"] = len(scored)
     if not scored:
-        return [], stats
+        return [], fetched_count
 
-    deduper = Deduper(DedupConfig())
-    topics = await dedup_filter(scored, language, deduper, sanity_publisher, brand)
+    topics: list[Topic] = []
+    for item, score in scored:
+        text = f"{item.title}\n{item.summary or ''}"
+        url_hash = hashlib.sha1(str(item.url).encode("utf-8")).hexdigest()
+        topic_id = url_hash[:16]
+        try:
+            embedding = await _embed(text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("embed.failed", url=str(item.url), err=str(exc))
+            continue
+        topics.append(
+            Topic(
+                id=topic_id,
+                brand_id=brand.slug,
+                raw=item,
+                relevance_score=float(score),
+                embedding=embedding.tolist(),
+                entities=sorted(extract_entities(text)),
+            )
+        )
+    return topics, fetched_count
+
+
+async def _process_source(
+    *,
+    source_record,  # config_client.SourceRecord
+    brand: BrandConfig,
+    brand_id_fk: int,
+    languages: list[Language],
+    limit: int,
+    dry_run: bool,
+    sanity_publisher,
+    client,  # AdminConfigClient
+    run_id: int | None,
+    min_score: int,
+    deduper: Deduper,
+) -> tuple[list[dict[str, Any]], dict[str, int], set[str]]:
+    """Process ONE source for ALL ``languages`` in a single pass.
+
+    S6 multilingual + cost fix (IT_PROJ_NTS_051):
+
+    * fetch + score happen ONCE per source (was 4× — outer loop was on
+      languages, so each language re-fetched the same RSS).
+    * Image generation happens ONCE per topic (was 4× — same article
+      yielded a fresh Replicate image per language). The asset id is
+      shared across every language draft for that topic.
+    * Per-language dedup still runs per topic+language, against the
+      brand-wide ``Deduper`` carried across all sources in the run.
+    * Failure isolation: a per-(topic, language) error is logged into
+      ``stats['errors']`` but does NOT abort siblings.
+
+    Returns ``(results, stats, languages_attempted)``. The third value
+    lets the orchestrator know which languages this source contributed
+    to so ``runs.languages_completed`` can be aggregated centrally.
+    """
+    stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
+    topics, fetched_count = await _build_topics_for_source(
+        source_record=source_record,
+        brand=brand,
+        brand_id_fk=brand_id_fk,
+        client=client,
+        limit=limit,
+        min_score=min_score,
+    )
+    stats["fetched"] = fetched_count
+    stats["scored"] = len(topics)
     if not topics:
-        return [], stats
+        return [], stats, set()
+
+    # ``limit`` caps the per-source pre-publish pool (matches old
+    # behaviour — used to be applied after dedup, but in the new structure
+    # we apply it after scoring so image-gen budget tracks the cap, not the
+    # post-dedup count).
+    topics = topics[:limit]
 
     results: list[dict[str, Any]] = []
-    for topic in topics[:limit]:
+    # Track which languages got at least one publish attempt so we can
+    # tell ``runs.languages_completed`` what the fanout reached for THIS
+    # source. The orchestrator unions these across sources.
+    languages_attempted: set[str] = set()
+
+    for topic in topics:
+        # ---- IMAGE: once per topic (the whole point of this refactor)
         try:
-            draft, asset_id = await generate_with_image(
-                topic, brand, language, sanity_publisher
+            asset_id = await generate_image_for_topic(
+                topic, brand, sanity_publisher
             )
+        except Exception:  # noqa: BLE001
+            # generate_image_for_topic already swallows + logs internally,
+            # so this is a paranoia net for unexpected explosions.
+            log.exception("image.unexpected_failure", topic=topic.id)
+            asset_id = None
+
+        # ---- CATEGORY: language-agnostic; once per topic.
+        try:
             category = await assign_category(topic.raw, brand)
-
-            post = SanityPostInput(
-                title=draft.title,
-                body_markdown=draft.body,
-                language=language,
-                category=category,
-                source_url=str(topic.raw.url),
-                topic_id=topic.id,
-                key_takeaway=draft.key_takeaway,
-                cover_image_asset_id=asset_id,
-                cover_image_alt=draft.title[:120],
-            )
-
-            if dry_run:
-                log.info("dry_run.would_create", title=post.title, category=category)
-                results.append({"topic_id": topic.id, "status": "dry_run", "category": category, "title": post.title})
-                client.record_topic_result(
-                    run_id=run_id,
-                    topic_id=topic.id,
-                    source_id=source_record.id,
-                    title=post.title,
-                    url=str(topic.raw.url),
-                    score=int(topic.relevance_score),
-                    status="passed",
-                    draft_id=None,
-                    language=language.value,
-                )
-            else:
-                draft_id = await sanity_publisher.publish_draft(post)
-                results.append({"topic_id": topic.id, "draft_id": draft_id, "category": category, "title": post.title, "language": language.value})
-                stats["drafted"] += 1
-                log.info("topic.published_as_draft", topic=topic.id, draft_id=draft_id, language=language.value)
-                client.record_topic_result(
-                    run_id=run_id,
-                    topic_id=topic.id,
-                    source_id=source_record.id,
-                    title=post.title,
-                    url=str(topic.raw.url),
-                    score=int(topic.relevance_score),
-                    status="passed",
-                    draft_id=draft_id,
-                    language=language.value,
-                )
         except Exception as exc:  # noqa: BLE001
-            log.error("topic.failed", topic=topic.id, err=str(exc))
-            stats["errors"] += 1
-            results.append({"topic_id": topic.id, "status": "failed", "error": str(exc), "language": language.value})
-            client.record_topic_result(
-                run_id=run_id,
-                topic_id=topic.id,
-                source_id=source_record.id,
-                title=topic.raw.title,
-                url=str(topic.raw.url),
-                score=int(topic.relevance_score),
-                status="failed",
-                filter_reason=str(exc),
-                language=language.value,
-            )
-    return results, stats
+            log.error("category.failed", topic=topic.id, err=str(exc))
+            category = "special"
+
+        # ---- DRAFTS: once per (topic, language).
+        for language in languages:
+            languages_attempted.add(language.value)
+            try:
+                # Per-language dedup, two-tier (was inside dedup_filter):
+                # tier 1 in-memory + entity overlap, tier 2 GROQ to Sanity.
+                if deduper.is_duplicate(
+                    topic.raw,
+                    brand.slug,
+                    language,
+                    np.array(topic.embedding, dtype=np.float32),
+                ):
+                    log.info(
+                        "dedup.local_hit",
+                        url=str(topic.raw.url),
+                        lang=language.value,
+                    )
+                    continue
+                if await sanity_publisher.is_topic_already_posted(
+                    topic.id, language
+                ):
+                    log.info(
+                        "dedup.sanity_hit",
+                        topic_id=topic.id,
+                        lang=language.value,
+                    )
+                    continue
+                deduper.remember(
+                    hashlib.sha1(str(topic.raw.url).encode("utf-8")).hexdigest(),
+                    brand.slug,
+                    language,
+                    np.array(topic.embedding, dtype=np.float32),
+                    set(topic.entities),
+                )
+
+                draft = await generate_draft_for_language(topic, brand, language)
+
+                post = SanityPostInput(
+                    title=draft.title,
+                    body_markdown=draft.body,
+                    language=language,
+                    category=category,
+                    source_url=str(topic.raw.url),
+                    topic_id=topic.id,
+                    key_takeaway=draft.key_takeaway,
+                    cover_image_asset_id=asset_id,
+                    cover_image_alt=draft.title[:120],
+                )
+
+                if dry_run:
+                    log.info(
+                        "dry_run.would_create",
+                        title=post.title,
+                        category=category,
+                        language=language.value,
+                    )
+                    results.append(
+                        {
+                            "topic_id": topic.id,
+                            "status": "dry_run",
+                            "category": category,
+                            "title": post.title,
+                            "language": language.value,
+                        }
+                    )
+                    client.record_topic_result(
+                        run_id=run_id,
+                        topic_id=topic.id,
+                        source_id=source_record.id,
+                        title=post.title,
+                        url=str(topic.raw.url),
+                        score=int(topic.relevance_score),
+                        status="passed",
+                        draft_id=None,
+                        language=language.value,
+                    )
+                else:
+                    draft_id = await sanity_publisher.publish_draft(post)
+                    results.append(
+                        {
+                            "topic_id": topic.id,
+                            "draft_id": draft_id,
+                            "category": category,
+                            "title": post.title,
+                            "language": language.value,
+                        }
+                    )
+                    stats["drafted"] += 1
+                    log.info(
+                        "topic.published_as_draft",
+                        topic=topic.id,
+                        draft_id=draft_id,
+                        language=language.value,
+                    )
+                    client.record_topic_result(
+                        run_id=run_id,
+                        topic_id=topic.id,
+                        source_id=source_record.id,
+                        title=post.title,
+                        url=str(topic.raw.url),
+                        score=int(topic.relevance_score),
+                        status="passed",
+                        draft_id=draft_id,
+                        language=language.value,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "topic.failed",
+                    topic=topic.id,
+                    language=language.value,
+                    err=str(exc),
+                )
+                stats["errors"] += 1
+                results.append(
+                    {
+                        "topic_id": topic.id,
+                        "status": "failed",
+                        "error": str(exc),
+                        "language": language.value,
+                    }
+                )
+                client.record_topic_result(
+                    run_id=run_id,
+                    topic_id=topic.id,
+                    source_id=source_record.id,
+                    title=topic.raw.title,
+                    url=str(topic.raw.url),
+                    score=int(topic.relevance_score),
+                    status="failed",
+                    filter_reason=str(exc),
+                    language=language.value,
+                )
+    return results, stats, languages_attempted
 
 
 def _languages_for_brand(
@@ -752,55 +927,56 @@ async def run_pipeline(
     # Cost-recording context spans the whole run; topic_id / draft_id
     # are layered in by ``_process_source`` for finer attribution.
     #
-    # S6.4 fanout: outer loop over languages, inner loop over sources.
-    # Failure in one (language, source) branch is isolated via the
-    # try/except below so the remaining branches still run. Each
-    # finished language is appended to runs.languages_completed so the
-    # admin UI can show fanout progress as it happens.
+    # IT_PROJ_NTS_051 refactor: outer loop is now over sources (was
+    # languages); for each source we process ALL configured languages in
+    # a single pass so image generation can be hoisted above the
+    # language loop. Failure in one (source, topic, language) branch is
+    # isolated below so the remaining branches still run.
+    #
+    # ``mark_language_completed`` used to fire as each language branch
+    # finished sequentially; now it fires for every language the run
+    # touched at the end (one batch). The UI loses incremental progress
+    # for the duration of the fanout but the schema stays compatible.
+    deduper = Deduper(DedupConfig())
+    languages_seen: set[str] = set()
     with cost_context(CostContext(brand_id_fk=brand_id_fk, run_id=run_id)):
-        for lang in languages:
-            lang_errors = 0
-            for src in sources:
-                try:
-                    results, stats = await _process_source(
-                        source_record=src,
-                        brand=brand,
-                        brand_id_fk=brand_id_fk,
-                        language=lang,
-                        limit=limit,
-                        dry_run=dry_run,
-                        sanity_publisher=sanity_publisher,
-                        client=client,
-                        run_id=run_id,
-                        min_score=config.scoring_threshold,
-                    )
-                    aggregate_results.extend(results)
-                    for k, v in stats.items():
-                        aggregate_stats[k] = aggregate_stats.get(k, 0) + v
-                    log_lines.append(
-                        f"[{lang.value}] source {src.name}: fetched={stats['fetched']} "
-                        f"scored={stats['scored']} drafted={stats['drafted']} "
-                        f"errors={stats['errors']}"
-                    )
-                    lang_errors += stats.get("errors", 0)
-                except Exception as exc:  # noqa: BLE001
-                    log.exception(
-                        "source.failed", source=src.name, language=lang.value
-                    )
-                    aggregate_stats["errors"] += 1
-                    lang_errors += 1
-                    log_lines.append(
-                        f"[{lang.value}] source {src.name}: FAILED {exc!r}"
-                    )
-            # Mark the language as completed regardless of per-source
-            # outcomes — the UI cares about "did fanout reach this lang"
-            # rather than "was every source successful for it".
+        for src in sources:
+            try:
+                results, stats, langs_attempted = await _process_source(
+                    source_record=src,
+                    brand=brand,
+                    brand_id_fk=brand_id_fk,
+                    languages=languages,
+                    limit=limit,
+                    dry_run=dry_run,
+                    sanity_publisher=sanity_publisher,
+                    client=client,
+                    run_id=run_id,
+                    min_score=config.scoring_threshold,
+                    deduper=deduper,
+                )
+                aggregate_results.extend(results)
+                for k, v in stats.items():
+                    aggregate_stats[k] = aggregate_stats.get(k, 0) + v
+                languages_seen.update(langs_attempted)
+                log_lines.append(
+                    f"source {src.name}: fetched={stats['fetched']} "
+                    f"scored={stats['scored']} drafted={stats['drafted']} "
+                    f"errors={stats['errors']} "
+                    f"langs={sorted(langs_attempted)}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("source.failed", source=src.name)
+                aggregate_stats["errors"] += 1
+                log_lines.append(f"source {src.name}: FAILED {exc!r}")
+
+    # Mark every configured language as completed (fanout reached it,
+    # even if per-topic publishes within it failed — same semantics as
+    # before, just batched at the end).
+    for lang in languages:
+        if lang.value in languages_seen or not sources:
             client.mark_language_completed(run_id, lang.value)
-            log.info(
-                "pipeline.language_done",
-                language=lang.value,
-                errors=lang_errors,
-            )
+            log.info("pipeline.language_done", language=lang.value)
 
     if dry_run:
         overall_status = "dry_run"

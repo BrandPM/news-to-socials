@@ -90,9 +90,11 @@ def _set_brand_languages(brand_id: int, codes: list[str]) -> None:
 def _mock_externals(monkeypatch, fail_for_language: str | None = None):
     """Stub OpenAI scoring/categorisation, embeddings, image gen, Sanity.
 
-    If ``fail_for_language`` is set, ``generate_with_image`` raises a
-    RuntimeError whenever that language is requested — used to drive the
-    failure-isolation test."""
+    IT_PROJ_NTS_051 (S6.4-bis): the pipeline now splits text vs image
+    generation into two helpers — ``generate_image_for_topic`` (called
+    ONCE per topic) and ``generate_draft_for_language`` (called per
+    (topic, language)). ``fail_for_language`` failure-injection points
+    at the per-language draft step now."""
     from pipeline import run as pipe
 
     fake_items = [
@@ -134,10 +136,19 @@ def _mock_externals(monkeypatch, fail_for_language: str | None = None):
 
     from pipeline.common.models import Draft
 
-    async def fake_generate(topic, brand, language, sanity_publisher):
+    image_call_log: list[str] = []
+
+    async def fake_generate_image(topic, brand, sanity_publisher):
+        # Track topic ids to assert "once per topic, not per language".
+        image_call_log.append(topic.id)
+        return f"asset-{topic.id}"
+
+    monkeypatch.setattr(pipe, "generate_image_for_topic", fake_generate_image)
+
+    async def fake_generate_draft(topic, brand, language):
         if fail_for_language is not None and language.value == fail_for_language:
             raise RuntimeError(f"forced failure for {language.value}")
-        draft = Draft(
+        return Draft(
             topic_id=topic.id,
             brand_id="icon",
             language=language,
@@ -145,9 +156,8 @@ def _mock_externals(monkeypatch, fail_for_language: str | None = None):
             body="Body for " + topic.raw.title,
             key_takeaway="kt",
         )
-        return draft, None
 
-    monkeypatch.setattr(pipe, "generate_with_image", fake_generate)
+    monkeypatch.setattr(pipe, "generate_draft_for_language", fake_generate_draft)
 
     class FakeSanity:
         def __init__(self) -> None:
@@ -165,6 +175,9 @@ def _mock_externals(monkeypatch, fail_for_language: str | None = None):
 
     fake_sanity = FakeSanity()
     monkeypatch.setattr(pipe, "SanityPublisher", lambda *a, **kw: fake_sanity)
+    # Attach the image call log on the fake_sanity object so tests can
+    # assert "image generated once per topic, not 4× per language".
+    fake_sanity.image_call_log = image_call_log  # type: ignore[attr-defined]
     return fake_sanity
 
 
@@ -353,6 +366,68 @@ def test_run_pipeline_for_run_writes_topics_with_real_source_id(
                 f"topic.source_id={t.source_id} but expected {src_id}"
             )
             assert t.status == "passed"
+
+
+def test_run_pipeline_generates_image_once_per_topic_not_per_language(
+    fresh_admin_db_with_source, monkeypatch
+):
+    """IT_PROJ_NTS_051: with 4 languages × 2 topics, image generation must
+    fire exactly 2 times total (once per topic) — not 8 (per (topic, lang)).
+    All 8 drafts must reference the same asset id within each topic."""
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    _set_brand_languages(icon_id, ["en", "ru", "uk", "pl"])
+    fake_sanity = _mock_externals(monkeypatch)
+
+    from pipeline.run import run_pipeline
+
+    asyncio.run(run_pipeline(brand_slug="icon", limit=2, dry_run=False))
+
+    image_calls = fake_sanity.image_call_log  # type: ignore[attr-defined]
+    # 2 topics, image gen called for each ONCE — not 8 (was 4x bug).
+    assert len(image_calls) == 2, (
+        f"expected 2 image calls (one per topic), got {len(image_calls)}: "
+        f"{image_calls}"
+    )
+    assert len(set(image_calls)) == 2  # distinct topic ids
+
+    # Drafts: 2 topics × 4 langs = 8. Each topic's 4 drafts share asset id.
+    assert len(fake_sanity.created) == 8
+    by_topic: dict[str, set[str]] = {}
+    for post in fake_sanity.created:
+        by_topic.setdefault(post.topic_id, set()).add(
+            str(post.cover_image_asset_id)
+        )
+    for topic_id, asset_ids in by_topic.items():
+        assert len(asset_ids) == 1, (
+            f"topic {topic_id} has multiple asset ids: {asset_ids}"
+        )
+
+
+def test_run_pipeline_image_failure_does_not_block_drafts(
+    fresh_admin_db_with_source, monkeypatch
+):
+    """If image generation fails for a topic, the 4 language drafts must
+    still publish (with cover_image_asset_id=None). The cost win we want
+    to preserve cuts both ways — we can't let an image-API hiccup nuke
+    the entire fanout."""
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    _set_brand_languages(icon_id, ["en", "ru", "uk", "pl"])
+    fake_sanity = _mock_externals(monkeypatch)
+
+    from pipeline import run as pipe
+
+    async def failing_image(topic, brand, sanity_publisher):
+        return None  # mimic generate_image_for_topic's swallow-and-log
+
+    monkeypatch.setattr(pipe, "generate_image_for_topic", failing_image)
+
+    from pipeline.run import run_pipeline
+
+    asyncio.run(run_pipeline(brand_slug="icon", limit=2, dry_run=False))
+
+    assert len(fake_sanity.created) == 8
+    for post in fake_sanity.created:
+        assert post.cover_image_asset_id is None
 
 
 def test_run_pipeline_failure_in_one_language_is_isolated(

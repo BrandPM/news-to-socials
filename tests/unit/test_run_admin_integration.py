@@ -109,8 +109,13 @@ def _mock_externals(monkeypatch):
 
     from pipeline.common.models import Draft
 
-    async def fake_generate(topic, brand, language, sanity_publisher):  # noqa: ANN001
-        draft = Draft(
+    async def fake_generate_image(topic, brand, sanity_publisher):  # noqa: ANN001
+        return f"asset-{topic.id}"
+
+    monkeypatch.setattr(pipe, "generate_image_for_topic", fake_generate_image)
+
+    async def fake_generate_draft(topic, brand, language):  # noqa: ANN001
+        return Draft(
             topic_id=topic.id,
             brand_id="icon",
             language=language,
@@ -118,9 +123,8 @@ def _mock_externals(monkeypatch):
             body="Body for " + topic.raw.title,
             key_takeaway="kt",
         )
-        return draft, None
 
-    monkeypatch.setattr(pipe, "generate_with_image", fake_generate)
+    monkeypatch.setattr(pipe, "generate_draft_for_language", fake_generate_draft)
 
     class FakeSanity:
         def __init__(self) -> None:
