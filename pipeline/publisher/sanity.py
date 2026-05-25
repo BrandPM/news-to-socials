@@ -45,8 +45,18 @@ from ..common.config import get_settings
 from ..common.logging import get_logger
 from ..common.models import Channel, Draft, Language, Post, PostStatus
 from ..common.retry import with_retry
+from ..common.slug import compute_slug
 
 log = get_logger(__name__)
+
+
+class SanityPublishError(RuntimeError):
+    """Raised when Sanity's mutate API rejects a publish or delete.
+
+    Caught by the admin /approve and /reject route handlers so a Sanity
+    outage downgrades to "approved but publish-pending" rather than
+    500ing the whole request — the local approval row is still saved.
+    """
 
 
 # --- Sanity REST helpers ---------------------------------------------------
@@ -315,14 +325,6 @@ def estimate_read_time(body: str) -> int:
     return max(1, min(60, round(words / 250)))
 
 
-def slugify(s: str, max_length: int = 96) -> str:
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9\s-]", "", s)
-    s = s.strip()
-    s = re.sub(r"\s+", "-", s)
-    return s[:max_length] or "untitled"
-
-
 def excerpt_from_body(body: str, max_chars: int = 280) -> str:
     """First paragraph or first ``max_chars`` chars, whichever shorter."""
     first_para = (body.split("\n\n", 1)[0] or "").strip()
@@ -359,10 +361,17 @@ class SanityPublisher:
         """Create a draft document in Sanity. Returns the draft's ``_id``."""
         body_pt = markdown_to_portable_text(post.body_markdown)
         read_time = estimate_read_time(post.body_markdown)
-        slug = slugify(post.title)
+        # Pre-generate the document id so the slug-uniqueness check can
+        # tell "our own draft" apart from a real collision (idempotent
+        # retries should not append -2 to a slug they themselves own).
+        published_id = f"post-{uuid.uuid4().hex[:12]}"
+        draft_id = f"drafts.{published_id}"
+        base_slug = compute_slug(post.title, post.language.value)
+        slug = await self._dedupe_slug(base_slug, draft_id, published_id)
 
         doc: dict[str, Any] = {
             "_type": "post",
+            "_id": draft_id,
             "title": post.title[:200],
             "slug": {"_type": "slug", "current": slug},
             "language": post.language.value,
@@ -392,6 +401,119 @@ class SanityPublisher:
 
         draft_id = await self.client.create_draft(doc)
         return draft_id
+
+    async def promote_draft_to_published(self, draft_id: str) -> str:
+        """Publish ``drafts.post-XXX`` → ``post-XXX`` in one Sanity transaction.
+
+        Sanity has no first-class publish API exposed over HTTP; the
+        Studio publish button is implemented client-side by:
+          1. read the draft document,
+          2. ``createOrReplace`` it under the non-prefixed id,
+          3. delete the original ``drafts.`` document.
+        We do the same here, batched into a single ``mutate`` transaction
+        so an interrupted request can't leave the doc both published AND
+        as a stale draft.
+
+        Returns the published ``_id`` (no ``drafts.`` prefix).
+        Raises :class:`SanityPublishError` on missing draft or HTTP errors.
+        """
+        if not draft_id.startswith("drafts."):
+            raise SanityPublishError(
+                f"expected a 'drafts.*' id, got {draft_id!r}"
+            )
+        published_id = draft_id[len("drafts.") :]
+
+        doc = await self.client.query("*[_id == $id][0]", {"id": draft_id})
+        if not doc or not isinstance(doc, dict):
+            raise SanityPublishError(
+                f"draft {draft_id!r} not found in Sanity"
+            )
+
+        # Strip Sanity-managed system fields that the API will reject
+        # (or refuse to replace) — keep _type and our domain content.
+        # _rev is per-revision and changes on every write; _createdAt /
+        # _updatedAt are server-managed.
+        published_doc = {
+            k: v
+            for k, v in doc.items()
+            if k not in {"_id", "_rev", "_createdAt", "_updatedAt"}
+        }
+        published_doc["_id"] = published_id
+
+        try:
+            await self.client.mutate(
+                [
+                    {"createOrReplace": published_doc},
+                    {"delete": {"id": draft_id}},
+                ]
+            )
+        except httpx.HTTPStatusError as exc:
+            raise SanityPublishError(
+                f"Sanity mutate failed for {draft_id!r}: "
+                f"{exc.response.status_code} {exc.response.text[:200]}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise SanityPublishError(
+                f"Sanity mutate failed for {draft_id!r}: "
+                f"{type(exc).__name__}: {exc!s}"
+            ) from exc
+
+        log.info("sanity.draft_published", draft_id=draft_id, published_id=published_id)
+        return published_id
+
+    async def delete_draft(self, draft_id: str) -> None:
+        """Hard-delete a draft document. Used by the reject flow when
+        ``DELETE_REJECTED_FROM_SANITY=true`` so Studio's tray stays clean.
+
+        Idempotent — Sanity's delete is "ok if absent"; we just log it."""
+        if not draft_id.startswith("drafts."):
+            log.warning("sanity.delete_skipped_non_draft", id=draft_id)
+            return
+        try:
+            await self.client.mutate([{"delete": {"id": draft_id}}])
+            log.info("sanity.draft_deleted", id=draft_id)
+        except Exception as exc:  # noqa: BLE001
+            # Reject is best-effort. We do NOT raise — the rejection
+            # decision in admin.db is the source of truth; a Sanity
+            # delete miss is annoying but not load-bearing.
+            log.warning(
+                "sanity.delete_failed",
+                id=draft_id,
+                err=f"{type(exc).__name__}: {exc!s}",
+            )
+
+    async def _dedupe_slug(
+        self, base_slug: str, draft_id: str, published_id: str
+    ) -> str:
+        """Find a non-colliding slug, walking ``base``, ``base-2``, ``base-3``…
+
+        Slug uniqueness in Sanity is per-document-type rather than per
+        language. ``base_slug`` already carries the language suffix (from
+        :func:`compute_slug`), so a collision here means two articles
+        truly want the same URL slot — append ``-2``/``-3``/… until we
+        find a free one. ``draft_id`` and ``published_id`` are excluded
+        from the "is taken?" check so idempotent retries on the same
+        document don't trip over themselves.
+        """
+        groq = (
+            '*[_type == "post" && slug.current == $slug '
+            '&& _id != $draft && _id != $published][0]._id'
+        )
+        candidate = base_slug
+        # Cap at -10. If somehow we still collide, fall back to embedding
+        # the draft id directly; better than an infinite loop.
+        for n in range(1, 11):
+            collision = await self.client.query(
+                groq,
+                {"slug": candidate, "draft": draft_id, "published": published_id},
+            )
+            if not collision:
+                return candidate
+            candidate = f"{base_slug}-{n + 1}"
+        # Pathological fallback — uses the draft id (always unique).
+        fallback = f"{base_slug}-{draft_id.split('post-')[-1][:8]}"
+        log.warning("sanity.slug_dedupe_exhausted", base=base_slug, fallback=fallback)
+        return fallback
 
     # --- Helpers used by run_pipeline.py ---------------------------------
 

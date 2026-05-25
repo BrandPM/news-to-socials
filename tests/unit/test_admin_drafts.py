@@ -426,6 +426,17 @@ def test_list_drafts_merges_approval_status(
     monkeypatch.setattr(
         sanity_mod.SanityClient, "query", _make_list_query_mock(counts, items)
     )
+    # IT_PROJ_NTS_051 Task 3: /approve now publishes to Sanity, so stub
+    # promote_draft_to_published so this list-side test doesn't try to
+    # reach the live API.
+    async def fake_promote(self, draft_id):  # noqa: ANN001
+        return draft_id.replace("drafts.", "")
+
+    monkeypatch.setattr(
+        sanity_mod.SanityPublisher,
+        "promote_draft_to_published",
+        fake_promote,
+    )
     # Approve the draft first.
     client.post(
         f"/api/v1/drafts/post-pl-approved/approve?brand_id={bid}",

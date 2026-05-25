@@ -480,12 +480,51 @@ class CostByTopicItem(BaseModel):
 
 
 class DraftApprovalOut(BaseModel):
-    """Approval row exposed on GET /drafts/{id} (S5 Step 7)."""
+    """Approval row exposed on GET /drafts/{id} (S5 Step 7).
+
+    IT_PROJ_NTS_051 Task 3: ``published_at`` + ``sanity_published_id``
+    surface whether an "approved" row actually made it to Sanity. The
+    publish step can fail independently (network blip, 4xx) without
+    rolling back the local approval — so the admin UI needs to render
+    "approved, publish pending" distinctly from "approved + live".
+    """
 
     status: Literal["draft", "approved", "rejected"]
     decided_at: datetime
     decided_by: str
     note: str | None = None
+    published_at: datetime | None = None
+    sanity_published_id: str | None = None
+
+
+class BatchApprovalResult(BaseModel):
+    """Per-language result of /drafts/{topic_id}/approve-all-siblings (S6.9-bis).
+
+    ``status`` is one of:
+      - ``published``                — local approval + Sanity publish succeeded
+      - ``approved_publish_pending`` — approval recorded, Sanity publish failed
+      - ``skipped``                  — already published, no-op
+      - ``error``                    — unexpected failure (see ``detail``)
+    """
+
+    sanity_draft_id: str
+    language: str
+    status: Literal[
+        "published", "approved_publish_pending", "skipped", "error"
+    ]
+    sanity_published_id: str | None = None
+    detail: str | None = None
+
+
+class BatchApprovalOut(BaseModel):
+    """Response for batch-approve. ``results`` is per-sibling per the
+    above; ``ok_count`` / ``fail_count`` are convenience aggregates the
+    toast helper uses."""
+
+    topic_id: str
+    ok_count: int
+    fail_count: int
+    results: list[BatchApprovalResult]
 
 
 class DraftApprovalIn(BaseModel):
@@ -524,6 +563,10 @@ class DraftListItem(BaseModel):
     created_at: str | None
     cover_image_url: str | None = None
     approval_status: Literal["draft", "approved", "rejected"] = "draft"
+    # S6 slug-fix: surface slug.current so the admin can assert it's
+    # populated. Null is acceptable for legacy drafts before the
+    # backfill runs.
+    slug: str | None = None
 
 
 class DraftListOut(BaseModel):

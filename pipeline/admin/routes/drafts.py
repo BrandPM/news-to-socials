@@ -11,6 +11,8 @@ from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
 from pipeline.admin.models import Brand, CostRecord, DraftApproval
 from pipeline.admin.schemas import (
+    BatchApprovalOut,
+    BatchApprovalResult,
     CostBreakdownItem,
     DraftApprovalIn,
     DraftApprovalOut,
@@ -21,6 +23,10 @@ from pipeline.admin.schemas import (
     JobAcceptedOut,
     JobStatusOut,
 )
+from pipeline.common.config import get_settings
+from pipeline.common.logging import get_logger
+
+log = get_logger(__name__)
 
 SUPPORTED_LANGUAGES = ("en", "ru", "uk", "pl")
 
@@ -41,6 +47,8 @@ def _approval_to_out(row: DraftApproval | None) -> DraftApprovalOut | None:
         decided_at=row.decided_at,
         decided_by=row.decided_by,
         note=row.note,
+        published_at=row.published_at,
+        sanity_published_id=row.sanity_published_id,
     )
 
 
@@ -49,8 +57,17 @@ def _upsert_approval(
     brand_id_fk: int,
     new_status: str,
     note: str | None,
+    *,
+    published_at: datetime | None = None,
+    sanity_published_id: str | None = None,
 ) -> DraftApproval:
-    """Insert or update the approval row for (draft, brand). Returns row."""
+    """Insert or update the approval row for (draft, brand). Returns row.
+
+    ``published_at`` + ``sanity_published_id`` are set when the
+    approve path also publishes to Sanity (IT_PROJ_NTS_051 Task 3).
+    Leaving them ``None`` preserves prior behaviour for the reject path
+    and back-compat callers.
+    """
     now = datetime.now(tz=timezone.utc)
     with session_scope() as session:
         row = session.execute(
@@ -67,12 +84,18 @@ def _upsert_approval(
                 decided_at=now,
                 decided_by="admin",
                 note=note,
+                published_at=published_at,
+                sanity_published_id=sanity_published_id,
             )
             session.add(row)
         else:
             row.status = new_status
             row.decided_at = now
             row.note = note
+            if published_at is not None:
+                row.published_at = published_at
+            if sanity_published_id is not None:
+                row.sanity_published_id = sanity_published_id
         session.commit()
         session.refresh(row)
         # Detach to outlive the session
@@ -174,7 +197,8 @@ async def list_drafts(
 
     selection = (
         "{_id, title, language, topicId, _createdAt, "
-        '"coverImageUrl": coverImage.asset->url}'
+        '"coverImageUrl": coverImage.asset->url, '
+        '"slug": slug.current}'
     )
 
     counts_groq = (
@@ -251,6 +275,7 @@ async def list_drafts(
                 created_at=raw.get("_createdAt"),
                 cover_image_url=raw.get("coverImageUrl"),
                 approval_status=approvals.get(sid, "draft"),  # type: ignore[arg-type]
+                slug=raw.get("slug"),
             )
         )
 
@@ -414,27 +439,239 @@ async def get_draft(
 # ---------------------------------------------------------------------------
 
 
+async def _publish_one_draft(
+    sanity_draft_id: str, brand_id: int, note: str | None
+) -> tuple[DraftApproval, str | None, str | None]:
+    """Approve + publish a single draft. Used by both /approve and the
+    /approve-all-siblings batch handler.
+
+    Returns ``(row, published_id, failure_detail)``. ``published_id`` is
+    set on Sanity-publish success; ``failure_detail`` is set on
+    Sanity-publish failure (the local approval row is still written —
+    operator can retry by re-clicking Approve, the upsert lets it).
+    """
+    from pipeline.publisher.sanity import SanityPublishError  # noqa: PLC0415
+
+    sanity_client, _slug = _build_sanity_client_for_brand(brand_id)
+    from pipeline.publisher.sanity import SanityPublisher  # noqa: PLC0415
+
+    publisher = SanityPublisher(client=sanity_client)
+
+    # 1. Record approval. Done first so an interrupted publish still
+    #    leaves an audit trail.
+    _upsert_approval(sanity_draft_id, brand_id, "approved", note)
+
+    # 2. Publish to Sanity.
+    try:
+        published_id = await publisher.promote_draft_to_published(
+            sanity_draft_id
+        )
+    except SanityPublishError as exc:
+        log.error(
+            "approve.publish_failed",
+            draft_id=sanity_draft_id,
+            err=str(exc),
+        )
+        # Re-read the row for the response — it's still in "approved" but
+        # without published_at/sanity_published_id.
+        with session_scope() as session:
+            row = session.execute(
+                select(DraftApproval).where(
+                    DraftApproval.sanity_draft_id == sanity_draft_id,
+                    DraftApproval.brand_id_fk == brand_id,
+                )
+            ).scalar_one()
+            session.expunge(row)
+        return row, None, str(exc)
+
+    # 3. Record publish completion alongside the existing approval row.
+    row = _upsert_approval(
+        sanity_draft_id,
+        brand_id,
+        "approved",
+        note,
+        published_at=datetime.now(tz=timezone.utc),
+        sanity_published_id=published_id,
+    )
+    return row, published_id, None
+
+
 @router.post("/{sanity_draft_id}/approve", response_model=DraftApprovalOut)
-def approve_draft(
+async def approve_draft(
     sanity_draft_id: str,
     payload: DraftApprovalIn,
     brand_id: int = Query(..., description="Active brand id"),
 ) -> DraftApprovalOut:
+    """Record approval AND publish to Sanity.
+
+    Previously this only inserted a row into ``draft_approvals`` —
+    Andriy then had to open Sanity Studio to actually publish. With
+    IT_PROJ_NTS_051 Task 3 the approve action does both: write the
+    approval, then mutate the draft into a published doc via Sanity's
+    REST API. If Sanity rejects the mutate the approval row is still
+    saved (operator retries by re-clicking Approve).
+    """
     _ensure_brand_owns_draft(brand_id)
     normalised = _normalise_draft_id(sanity_draft_id)
-    row = _upsert_approval(normalised, brand_id, "approved", payload.note)
+    row, _published_id, failure = await _publish_one_draft(
+        normalised, brand_id, payload.note
+    )
+    if failure is not None:
+        # Approval is recorded; surface the publish failure as 502 so
+        # the UI can show "approved, publish pending" with detail.
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "sanity_publish_failed",
+                "reason": failure,
+                "approval_status": "approved",
+            },
+        )
     return _approval_to_out(row)  # type: ignore[return-value]
 
 
+@router.post(
+    "/topic/{topic_id}/approve-all-siblings", response_model=BatchApprovalOut
+)
+async def approve_all_siblings(
+    topic_id: str,
+    brand_id: int = Query(..., description="Active brand id"),
+) -> BatchApprovalOut:
+    """Approve every pending sibling draft for ``topic_id`` and publish each.
+
+    S6.9 added the batch-approve UI but only fired N parallel /approve
+    requests. With IT_PROJ_NTS_051 Task 3 the per-draft approve also
+    publishes, so we want this one endpoint to drive the whole fanout
+    — clearer audit log (one request id) and predictable partial-
+    failure reporting.
+
+    Partial failure semantics: an HTTP 502 from a single sibling does
+    NOT roll back the siblings that already published. The response
+    enumerates per-language ``status`` so the UI toast can show
+    "approved 3, 1 pending" rather than "all-or-nothing".
+    """
+    _ensure_brand_owns_draft(brand_id)
+    sanity_client, brand_slug = _build_sanity_client_for_brand(brand_id)
+
+    # Find every pending draft sharing topic_id (skip already-published
+    # — those need no work, marked as 'skipped' in the response so the
+    # UI can count "X already published, Y now published").
+    drafts_groq = (
+        '*[_type == "post" && _id in path("drafts.**") && topicId == $tid && '
+        '(generatedBy.brandSlug == $slug || !defined(generatedBy.brandSlug))]'
+        "{_id, language}"
+    )
+    try:
+        rows = await sanity_client.query(  # type: ignore[attr-defined]
+            drafts_groq, {"tid": topic_id, "slug": brand_slug}
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sanity query failed: {type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+
+    if not isinstance(rows, list):
+        rows = []
+
+    results: list[BatchApprovalResult] = []
+    ok = 0
+    fail = 0
+
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("_id"):
+            continue
+        draft_id = str(r["_id"])
+        language = str(r.get("language") or "")
+
+        # Skip drafts whose mirror already exists as a published doc.
+        # Re-publishing would either no-op (createOrReplace) or
+        # potentially overwrite operator edits in Studio — better to
+        # leave alone and report it explicitly.
+        published_mirror = draft_id[len("drafts.") :]
+        try:
+            mirror_exists = await sanity_client.query(  # type: ignore[attr-defined]
+                "*[_id == $id][0]._id", {"id": published_mirror}
+            )
+        except Exception:  # noqa: BLE001
+            mirror_exists = None
+        if mirror_exists:
+            results.append(
+                BatchApprovalResult(
+                    sanity_draft_id=draft_id,
+                    language=language,
+                    status="skipped",
+                    sanity_published_id=published_mirror,
+                    detail="already_published",
+                )
+            )
+            continue
+
+        _row, published_id, failure = await _publish_one_draft(
+            draft_id, brand_id, None
+        )
+        if failure is not None:
+            fail += 1
+            results.append(
+                BatchApprovalResult(
+                    sanity_draft_id=draft_id,
+                    language=language,
+                    status="approved_publish_pending",
+                    detail=failure,
+                )
+            )
+        else:
+            ok += 1
+            results.append(
+                BatchApprovalResult(
+                    sanity_draft_id=draft_id,
+                    language=language,
+                    status="published",
+                    sanity_published_id=published_id,
+                )
+            )
+
+    return BatchApprovalOut(
+        topic_id=topic_id,
+        ok_count=ok,
+        fail_count=fail,
+        results=results,
+    )
+
+
 @router.post("/{sanity_draft_id}/reject", response_model=DraftApprovalOut)
-def reject_draft(
+async def reject_draft(
     sanity_draft_id: str,
     payload: DraftApprovalIn,
     brand_id: int = Query(..., description="Active brand id"),
 ) -> DraftApprovalOut:
+    """Record rejection and (optionally) delete the draft from Sanity.
+
+    Deletion is gated on ``DELETE_REJECTED_FROM_SANITY=true`` (default).
+    Failure to delete in Sanity does NOT fail the request — the local
+    rejection row is the source of truth; the Sanity-side delete is a
+    cleanup convenience.
+    """
     _ensure_brand_owns_draft(brand_id)
     normalised = _normalise_draft_id(sanity_draft_id)
     row = _upsert_approval(normalised, brand_id, "rejected", payload.note)
+
+    if get_settings().delete_rejected_from_sanity:
+        try:
+            from pipeline.publisher.sanity import SanityPublisher  # noqa: PLC0415
+
+            sanity_client, _ = _build_sanity_client_for_brand(brand_id)
+            publisher = SanityPublisher(client=sanity_client)
+            await publisher.delete_draft(normalised)
+        except Exception as exc:  # noqa: BLE001
+            # delete_draft already swallows internally but if the
+            # client build itself fails we still want a successful reject.
+            log.warning(
+                "reject.delete_failed",
+                draft_id=normalised,
+                err=f"{type(exc).__name__}: {exc!s}",
+            )
+
     return _approval_to_out(row)  # type: ignore[return-value]
 
 

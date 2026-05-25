@@ -75,6 +75,11 @@ class Settings(BaseSettings):
 
     # Feature flags
     dry_run: bool = Field(default=False, description="Skip external publish APIs")
+    # IT_PROJ_NTS_051 Task 3: when an operator rejects a draft in /drafts,
+    # also delete the document from Sanity so the Studio tray stays clean.
+    # Off-by-flag for environments that prefer keeping rejected drafts as
+    # an audit trail in Studio.
+    delete_rejected_from_sanity: bool = Field(default=True)
 
 
 _settings: Settings | None = None

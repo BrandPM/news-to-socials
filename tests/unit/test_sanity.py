@@ -7,31 +7,7 @@ from pipeline.publisher.sanity import (
     excerpt_from_body,
     extract_toc_from_body,
     markdown_to_portable_text,
-    slugify,
 )
-
-
-# --- slug --------------------------------------------------------------
-
-
-def test_slug_basic() -> None:
-    assert slugify("Visa launches instant SEPA pilot in 2026") == "visa-launches-instant-sepa-pilot-in-2026"
-
-
-def test_slug_strips_punctuation() -> None:
-    assert slugify("M&A deals: a 2026 outlook!") == "ma-deals-a-2026-outlook"
-
-
-def test_slug_truncates_long_titles() -> None:
-    long = "very " * 50 + "long title"
-    s = slugify(long, max_length=20)
-    assert len(s) <= 20
-    assert s.startswith("very")
-
-
-def test_slug_handles_empty() -> None:
-    assert slugify("") == "untitled"
-    assert slugify("???") == "untitled"
 
 
 # --- read time -------------------------------------------------------
@@ -237,6 +213,9 @@ async def test_publish_draft_populates_table_of_contents():
 
     fake_client = AsyncMock()
     fake_client.create_draft = AsyncMock(return_value="drafts.post-xyz")
+    # publish_draft() now runs a slug-uniqueness GROQ query before
+    # creating the draft (S6 fix). Returning None = "no collision".
+    fake_client.query = AsyncMock(return_value=None)
 
     publisher = SanityPublisher(client=fake_client)
     body_md = (
@@ -273,6 +252,9 @@ async def test_publish_draft_omits_toc_when_body_has_no_headings():
 
     fake_client = AsyncMock()
     fake_client.create_draft = AsyncMock(return_value="drafts.post-xyz")
+    # publish_draft() now runs a slug-uniqueness GROQ query before
+    # creating the draft (S6 fix). Returning None = "no collision".
+    fake_client.query = AsyncMock(return_value=None)
 
     publisher = SanityPublisher(client=fake_client)
     await publisher.publish_draft(
@@ -288,6 +270,193 @@ async def test_publish_draft_omits_toc_when_body_has_no_headings():
     doc = fake_client.create_draft.await_args.args[0]
     # Absent rather than empty list — clearer in Studio.
     assert "tableOfContents" not in doc
+
+
+async def test_publish_draft_sets_language_suffixed_slug():
+    """RU draft must land at .../insights/<slug>-ru, not /insights/untitled."""
+    from unittest.mock import AsyncMock
+
+    from pipeline.common.models import Language
+    from pipeline.publisher.sanity import SanityPostInput, SanityPublisher
+
+    fake_client = AsyncMock()
+    fake_client.create_draft = AsyncMock(return_value="drafts.post-ru-abc")
+    fake_client.query = AsyncMock(return_value=None)
+
+    publisher = SanityPublisher(client=fake_client)
+    await publisher.publish_draft(
+        SanityPostInput(
+            title="Индия: новый кредитный фонд 500 млн",
+            body_markdown="body",
+            language=Language.ru,
+            category="wealth",
+            source_url="https://example.com/x",
+            topic_id="t-ru-1",
+        )
+    )
+
+    doc = fake_client.create_draft.await_args.args[0]
+    slug_obj = doc["slug"]
+    # Sanity expects the slug as an object {_type, current}, not a raw
+    # string. (Previously the inline slugify produced a string-only field
+    # that Sanity Studio refused to auto-populate.)
+    assert slug_obj["_type"] == "slug"
+    assert slug_obj["current"].endswith("-ru")
+    assert slug_obj["current"].replace("-", "").isascii()
+
+
+async def test_publish_draft_appends_dedupe_counter_on_slug_collision():
+    """If the base slug is taken by a different doc, walk -2, -3, ..."""
+    from unittest.mock import AsyncMock
+
+    from pipeline.common.models import Language
+    from pipeline.publisher.sanity import SanityPostInput, SanityPublisher
+
+    fake_client = AsyncMock()
+    fake_client.create_draft = AsyncMock(return_value="drafts.post-en-new")
+    # First lookup returns a colliding id; second returns None → free.
+    fake_client.query = AsyncMock(side_effect=["post-en-existing", None])
+
+    publisher = SanityPublisher(client=fake_client)
+    await publisher.publish_draft(
+        SanityPostInput(
+            title="India fund credit",
+            body_markdown="body",
+            language=Language.en,
+            category="wealth",
+            source_url="https://example.com/x",
+            topic_id="t-en-1",
+        )
+    )
+
+    doc = fake_client.create_draft.await_args.args[0]
+    # Base "india-fund-credit" was taken → next candidate is "...-2".
+    assert doc["slug"]["current"] == "india-fund-credit-2"
+    # Two GROQ lookups: base + -2. Don't probe further than needed.
+    assert fake_client.query.await_count == 2
+
+
+async def test_publish_draft_skips_dedupe_when_collision_is_self():
+    """Idempotent re-runs: a draft that finds its own _id should NOT bump to -2."""
+    from unittest.mock import AsyncMock
+
+    from pipeline.common.models import Language
+    from pipeline.publisher.sanity import SanityPostInput, SanityPublisher
+
+    fake_client = AsyncMock()
+    fake_client.create_draft = AsyncMock(return_value="drafts.post-self")
+    # query() is told to exclude $draft and $published — so a "real"
+    # collision check returns None when the only existing match was us.
+    fake_client.query = AsyncMock(return_value=None)
+
+    publisher = SanityPublisher(client=fake_client)
+    await publisher.publish_draft(
+        SanityPostInput(
+            title="An article",
+            body_markdown="body",
+            language=Language.en,
+            category="wealth",
+            source_url="https://example.com/x",
+            topic_id="t-self-1",
+        )
+    )
+
+    doc = fake_client.create_draft.await_args.args[0]
+    # No "-2" appended.
+    assert doc["slug"]["current"] == "an-article"
+    # The GROQ payload must reference $draft and $published so the
+    # uniqueness check can exclude our own document on retries.
+    params = fake_client.query.await_args.args[1]
+    assert "draft" in params and "published" in params
+
+
+async def test_promote_draft_to_published_emits_create_or_replace_and_delete():
+    """The new publish path issues a single mutate transaction with two
+    operations: createOrReplace at the non-drafts. id, then delete the
+    drafts. doc. Tests the happy path."""
+    from unittest.mock import AsyncMock
+
+    from pipeline.publisher.sanity import SanityPublisher
+
+    draft_doc = {
+        "_id": "drafts.post-abc",
+        "_type": "post",
+        "_rev": "rev-xyz",
+        "_createdAt": "2026-05-25T10:00:00Z",
+        "_updatedAt": "2026-05-25T11:00:00Z",
+        "title": "T",
+        "slug": {"_type": "slug", "current": "t-en"},
+    }
+    fake_client = AsyncMock()
+    fake_client.query = AsyncMock(return_value=draft_doc)
+    fake_client.mutate = AsyncMock(return_value={})
+
+    publisher = SanityPublisher(client=fake_client)
+    published_id = await publisher.promote_draft_to_published("drafts.post-abc")
+
+    assert published_id == "post-abc"
+    mutations = fake_client.mutate.await_args.args[0]
+    # Transaction order matters: create-or-replace BEFORE delete, so an
+    # interrupted call leaves the doc published even if the delete drops.
+    assert mutations[0].keys() == {"createOrReplace"}
+    assert mutations[1].keys() == {"delete"}
+    new_doc = mutations[0]["createOrReplace"]
+    # The non-draft id is set, system fields are stripped.
+    assert new_doc["_id"] == "post-abc"
+    assert "_rev" not in new_doc
+    assert "_createdAt" not in new_doc
+    assert new_doc["title"] == "T"
+    assert new_doc["slug"]["current"] == "t-en"
+    # Delete targets the original draft id.
+    assert mutations[1]["delete"]["id"] == "drafts.post-abc"
+
+
+async def test_promote_draft_to_published_raises_on_missing_draft():
+    from unittest.mock import AsyncMock
+
+    from pipeline.publisher.sanity import (
+        SanityPublishError,
+        SanityPublisher,
+    )
+
+    fake_client = AsyncMock()
+    fake_client.query = AsyncMock(return_value=None)
+
+    publisher = SanityPublisher(client=fake_client)
+    import pytest
+
+    with pytest.raises(SanityPublishError, match="not found"):
+        await publisher.promote_draft_to_published("drafts.post-gone")
+
+
+async def test_promote_draft_rejects_non_draft_id():
+    from unittest.mock import AsyncMock
+
+    from pipeline.publisher.sanity import (
+        SanityPublishError,
+        SanityPublisher,
+    )
+
+    publisher = SanityPublisher(client=AsyncMock())
+    import pytest
+
+    with pytest.raises(SanityPublishError, match="drafts"):
+        await publisher.promote_draft_to_published("post-not-a-draft")
+
+
+async def test_delete_draft_swallows_errors():
+    """Reject is best-effort: a Sanity 5xx during delete must NOT raise —
+    the local rejection row is the source of truth."""
+    from unittest.mock import AsyncMock
+
+    from pipeline.publisher.sanity import SanityPublisher
+
+    fake_client = AsyncMock()
+    fake_client.mutate = AsyncMock(side_effect=RuntimeError("network"))
+
+    publisher = SanityPublisher(client=fake_client)
+    # Must NOT raise.
+    await publisher.delete_draft("drafts.post-ok")
 
 
 async def test_query_without_params_still_works():

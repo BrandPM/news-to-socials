@@ -373,6 +373,16 @@ class DraftApproval(Base):
         String, nullable=False, default="admin"
     )
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # IT_PROJ_NTS_051 Task 3 — approve now publishes to Sanity, so we
+    # record the publish completion alongside the approval decision.
+    # Both nullable: row may be ``rejected`` (never published) OR an
+    # older row from before this column existed.
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    sanity_published_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
 
     __table_args__ = (
         CheckConstraint(
