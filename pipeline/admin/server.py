@@ -34,6 +34,7 @@ from . import jobs
 from .auth import require_admin_token
 
 logger = logging.getLogger(__name__)
+from .routes import admin_users as admin_users_routes
 from .routes import brands as brands_routes
 from .routes import config as config_routes
 from .routes import cost as cost_routes
@@ -152,6 +153,10 @@ def create_app() -> FastAPI:
         return {"status": "ok", "version": _pkg_version()}
 
     auth = [Depends(require_admin_token)]
+    app.include_router(
+        admin_users_routes.router, prefix="/api/v1/admin",
+        tags=["admin-users"], dependencies=auth,
+    )
     app.include_router(
         brands_routes.router, prefix="/api/v1/brands",
         tags=["brands"], dependencies=auth,

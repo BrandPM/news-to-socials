@@ -26,6 +26,9 @@ dependencies = [
     "alembic>=1.13.0",
     "aiosqlite>=0.20.0",
 
+    # Auth — admin_users password hashing (NTS_058)
+    "bcrypt>=4.1.0",
+
     # LLM / embeddings
     "openai>=1.40.0",
 

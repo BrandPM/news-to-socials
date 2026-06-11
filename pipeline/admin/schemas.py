@@ -924,3 +924,44 @@ class SourceHealthOut(BaseModel):
     last_fetch_at: datetime | None
     last_error: str | None
     series: list[SourceHealthDayOut]
+
+
+# --- Admin users (NTS_058) ----------------------------------------------
+
+
+class AdminUserOut(BaseModel):
+    """Wire format for an admin user — NEVER includes password_hash."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    created_at: datetime
+    created_by_user_id: int | None
+    last_login_at: datetime | None
+    is_active: bool
+
+
+class AdminUserCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    password: str
+
+
+class AdminUserResetPasswordIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    password: str
+
+
+class AuthVerifyIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    password: str
+
+
+class AuthVerifyOut(BaseModel):
+    user_id: int
+    username: str
