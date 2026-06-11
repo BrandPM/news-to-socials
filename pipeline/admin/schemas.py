@@ -312,6 +312,55 @@ class JobStatusOut(BaseModel):
 
 BrandStatus = Literal["draft", "active", "paused", "archived"]
 
+# Languages the Icon pipeline can fan out into. ``en`` is canonical and
+# every brand must include it (NTS_044 S6 / NTS_056 Task 2).
+SUPPORTED_LANGUAGES = ("en", "ru", "uk", "pl")
+SUPPORTED_LANGUAGE_SET = frozenset(SUPPORTED_LANGUAGES)
+
+
+def _coerce_languages_out(v: Any) -> list[str]:
+    """Normalise ``Brand.languages`` (JSON-as-TEXT or list) for the wire.
+
+    ``Brand.languages`` is stored as a JSON string in SQLite; when loaded
+    via ``from_attributes`` the raw value is a string. Surface as a list so
+    the frontend can iterate without knowing about the storage shape.
+    Falls back to ``["en"]`` for null/empty/garbage so the UI never breaks.
+    """
+    if v is None or v == "":
+        return ["en"]
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except (ValueError, TypeError):
+            return ["en"]
+        return parsed if isinstance(parsed, list) and parsed else ["en"]
+    if isinstance(v, list):
+        return v or ["en"]
+    return ["en"]
+
+
+def validate_languages_payload(v: list[str]) -> list[str]:
+    """Validate a ``languages`` payload: non-empty, supported, includes en.
+
+    Normalises case and de-duplicates while preserving order. Raises
+    ``ValueError`` (→ 422/400 at the route boundary) on any violation.
+    """
+    if not isinstance(v, list) or not v:
+        raise ValueError("languages must be a non-empty list")
+    seen: list[str] = []
+    for raw in v:
+        lang = str(raw).strip().lower()
+        if lang not in SUPPORTED_LANGUAGE_SET:
+            raise ValueError(
+                f"unsupported language {raw!r} — must be one of "
+                f"{list(SUPPORTED_LANGUAGES)}"
+            )
+        if lang not in seen:
+            seen.append(lang)
+    if "en" not in seen:
+        raise ValueError("languages must include 'en' (canonical language)")
+    return seen
+
 
 class BrandSummary(BaseModel):
     """Wire format for brand list — NO sensitive credential fields."""
@@ -330,20 +379,7 @@ class BrandSummary(BaseModel):
     @field_validator("languages", mode="before")
     @classmethod
     def _parse_languages(cls, v: Any) -> Any:
-        # Brand.languages is JSON-as-TEXT; loaded via from_attributes the
-        # raw value is a string. Surface as a list so the frontend can
-        # iterate without knowing about the storage shape.
-        if v is None or v == "":
-            return ["en"]
-        if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-            except (ValueError, TypeError):
-                return ["en"]
-            return parsed if isinstance(parsed, list) and parsed else ["en"]
-        if isinstance(v, list):
-            return v or ["en"]
-        return ["en"]
+        return _coerce_languages_out(v)
 
 
 class BrandIn(BaseModel):
@@ -382,6 +418,7 @@ class BrandUpdate(BaseModel):
 
     name: str | None = None
     language: str | None = None
+    languages: list[str] | None = None
     timezone: str | None = None
     status: BrandStatus | None = None
     sanity_project_id: str | None = None
@@ -397,6 +434,9 @@ class BrandUpdate(BaseModel):
     meta_page_id: str | None = None
     meta_ig_business_id: str | None = None
     voice_profile_yaml: str | None = None
+    # NOTE: ``languages`` content rules (non-empty / supported / includes en)
+    # are enforced in the route handler so the failure is a 400 with a clear
+    # message (NTS_056 Task 2 contract) rather than Pydantic's generic 422.
 
 
 class BrandDetail(BaseModel):
@@ -408,6 +448,7 @@ class BrandDetail(BaseModel):
     slug: str
     name: str
     language: str
+    languages: list[str] = ["en"]
     timezone: str
     status: BrandStatus
     active: bool
@@ -427,6 +468,11 @@ class BrandDetail(BaseModel):
     has_meta_access_token: bool
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("languages", mode="before")
+    @classmethod
+    def _parse_languages(cls, v: Any) -> Any:
+        return _coerce_languages_out(v)
 
 
 class BrandTestSanityOut(BaseModel):

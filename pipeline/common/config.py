@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # request except /health. Empty string means admin API is disabled.
     admin_trigger_secret: str = ""
     admin_cors_origin: str = "http://localhost:3000"
+    # Hourly background job that force-fails runs stuck in 'running' >24h
+    # (NTS_056 Task 3). On in production; tests disable it so no scheduler
+    # thread leaks across the suite.
+    admin_run_scheduler: bool = True
+    stale_run_max_age_hours: int = 24
     # Where /runs/{id}/log + /runs/{id}/events read structured pipeline
     # events from. After NTS_025 the pipeline runs inside the admin-api
     # systemd unit, which redirects stdout to admin-api.log; the legacy

@@ -17,6 +17,9 @@ from pipeline.common import config as config_module
 def _isolated_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force a clean Settings instance for every test."""
     monkeypatch.setattr(config_module, "_settings", None)
+    # Never start the APScheduler stale-run cleaner during tests — it would
+    # leak a background thread across the suite (NTS_056 Task 3).
+    monkeypatch.setenv("ADMIN_RUN_SCHEDULER", "0")
     monkeypatch.setenv("OPENAI_API_KEY", "")
     monkeypatch.setenv("REPLICATE_API_TOKEN", "")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")

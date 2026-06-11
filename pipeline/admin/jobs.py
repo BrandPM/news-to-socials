@@ -23,7 +23,7 @@ import json
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -79,6 +79,56 @@ async def execute_pipeline_run(run_id: int) -> None:
                 row.log_excerpt = (row.log_excerpt or "") + f"\nERROR: {exc!r}"
                 session.commit()
         raise
+
+
+# --- Stale-run cleanup (NTS_056 Task 3) -----------------------------------
+
+# A run stuck in 'running' past this many hours is presumed dead — the
+# worker crashed or the box rebooted mid-fanout (e.g. NTS_055 runs #13/#21).
+STALE_RUN_MAX_AGE_HOURS = 24
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Treat naive timestamps (SQLite DateTime) as UTC for comparison."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def close_stale_runs(
+    *,
+    max_age_hours: int = STALE_RUN_MAX_AGE_HOURS,
+    now: datetime | None = None,
+) -> int:
+    """Mark runs stuck in 'running' beyond ``max_age_hours`` as failed.
+
+    Idempotent and safe to call on a schedule: only touches rows whose
+    ``status='running'`` AND ``started_at`` is older than the cutoff. Each
+    closure is appended to ``run.log_excerpt`` so the audit trail records
+    why the run was force-failed. Returns the number of runs closed.
+    """
+    now = now or datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(hours=max_age_hours)
+    factory = get_session_factory()
+    closed = 0
+    with factory() as session:
+        running = session.scalars(
+            select(Run).where(Run.status == "running")
+        ).all()
+        for run in running:
+            if _as_utc(run.started_at) >= cutoff:
+                continue  # still within the grace window — leave it alone
+            run.status = "failed"
+            run.finished_at = now
+            note = (
+                f"[NTS_056 cleanup] marked failed — stuck running "
+                f">{max_age_hours}h (since {run.started_at})"
+            )
+            run.log_excerpt = (
+                f"{run.log_excerpt}\n{note}" if run.log_excerpt else note
+            )
+            closed += 1
+        if closed:
+            session.commit()
+    return closed
 
 
 # --- Image-regenerate jobs ------------------------------------------------

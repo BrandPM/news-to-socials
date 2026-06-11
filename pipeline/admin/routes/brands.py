@@ -40,6 +40,7 @@ from pipeline.admin.schemas import (
     BrandSummary,
     BrandTestSanityOut,
     BrandUpdate,
+    validate_languages_payload,
 )
 
 router = APIRouter()
@@ -56,6 +57,7 @@ def _to_detail(row: Brand) -> BrandDetail:
         slug=row.slug,
         name=row.name,
         language=row.language,
+        languages=row.languages,
         timezone=row.timezone,
         status=row.status,
         active=row.active,
@@ -190,6 +192,20 @@ def update_brand(brand_id: int, payload: BrandUpdate) -> BrandDetail:
                 setattr(row, db_key, None)  # clear (explicit null)
             else:
                 setattr(row, db_key, _encrypt_or_none(value))  # replace
+
+        # ``languages`` is a list on the wire but JSON-as-TEXT in the DB.
+        # Content rules (non-empty / supported / includes en) raise a 400.
+        # Omitted key (None) preserves the existing roster.
+        if "languages" in data:
+            langs = data.pop("languages")
+            if langs is not None:
+                try:
+                    validated = validate_languages_payload(langs)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                import json as _json  # noqa: PLC0415
+
+                row.languages = _json.dumps(validated)
 
         # Plaintext + metadata fields — also preserve/clear/replace.
         for k, v in data.items():

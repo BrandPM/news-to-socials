@@ -1,0 +1,39 @@
+name: CI
+
+# IT_PROJ_NTS_056 Task 5 — backend regression gate.
+# Runs the full pytest suite, which now includes the multilingual-fanout
+# and X-Triggered-By integration tests under tests/integration/ (testpaths
+# in pyproject.toml already covers them) plus the stale-run cleanup unit
+# tests. This is the guard that keeps the NTS_055 regression from recurring.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (dev + api extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,api]"
+
+      - name: Run test suite (unit + integration)
+        run: pytest tests/ -q
+
+      - name: Multilingual-fanout regression tests (explicit)
+        run: |
+          pytest tests/integration/test_multilang_fanout.py \
+                 tests/integration/test_run_all_trigger.py \
+                 tests/unit/test_stale_run_cleanup.py -q

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -23,6 +23,29 @@ from pipeline.admin.schemas import (
 )
 
 router = APIRouter()
+
+# Audit-trail provenance for a pipeline run. The cron systemd unit passes
+# ``X-Triggered-By: cron``; the admin UI omits the header (→ "manual"); CLI
+# tooling may pass "cli". Anything else is rejected so a typo never silently
+# pollutes the audit trail (NTS_056 Task 1).
+_ALLOWED_TRIGGERS = frozenset({"cron", "manual", "cli"})
+
+
+def _resolve_triggered_by(value: str | None) -> str:
+    """Validate the X-Triggered-By header, defaulting to 'manual'.
+
+    Raises 400 for any value outside the allow-list.
+    """
+    resolved = (value or "manual").strip().lower()
+    if resolved not in _ALLOWED_TRIGGERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid X-Triggered-By {value!r} — must be one of "
+                f"{sorted(_ALLOWED_TRIGGERS)}"
+            ),
+        )
+    return resolved
 
 
 @router.get("", response_model=list[SourceOut])
@@ -156,14 +179,19 @@ async def test_source(source_id: int, limit: int = 5) -> SourceTestOut:
     response_model=RunTriggerOut,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def run_source(source_id: int, background: BackgroundTasks) -> RunTriggerOut:
+def run_source(
+    source_id: int,
+    background: BackgroundTasks,
+    x_triggered_by: str | None = Header(default=None, alias="X-Triggered-By"),
+) -> RunTriggerOut:
+    triggered_by = _resolve_triggered_by(x_triggered_by)
     with session_scope() as session:
         src = session.get(Source, source_id)
         if src is None:
             raise HTTPException(status_code=404, detail="source not found")
         brand_id_fk = src.brand_id_fk
     run_id = jobs.kick_off_pipeline_run(
-        brand_id_fk=brand_id_fk, source_ids=[source_id], triggered_by="manual"
+        brand_id_fk=brand_id_fk, source_ids=[source_id], triggered_by=triggered_by
     )
     background.add_task(jobs.execute_pipeline_run, run_id)
     return RunTriggerOut(run_id=run_id)
@@ -174,13 +202,22 @@ def run_source(source_id: int, background: BackgroundTasks) -> RunTriggerOut:
     response_model=RunTriggerOut,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def run_all_sources(payload: RunAllIn, background: BackgroundTasks) -> RunTriggerOut:
+def run_all_sources(
+    payload: RunAllIn,
+    background: BackgroundTasks,
+    x_triggered_by: str | None = Header(default=None, alias="X-Triggered-By"),
+) -> RunTriggerOut:
     """Schedule the pipeline for every active source of one brand.
 
     Refuses brands with status != 'active' (M4) — returns 409 so the UI
     can show 'Setup required' instead of silently producing nothing.
+
+    ``X-Triggered-By`` records run provenance (cron|manual|cli) for the
+    audit trail — the cron systemd unit sets ``cron`` (NTS_056 Task 1).
     """
     from pipeline.admin.models import Brand  # noqa: PLC0415
+
+    triggered_by = _resolve_triggered_by(x_triggered_by)
 
     with session_scope() as session:
         brand = session.get(Brand, payload.brand_id)
@@ -208,7 +245,7 @@ def run_all_sources(payload: RunAllIn, background: BackgroundTasks) -> RunTrigge
     run_id = jobs.kick_off_pipeline_run(
         brand_id_fk=payload.brand_id,
         source_ids=source_ids,
-        triggered_by="manual",
+        triggered_by=triggered_by,
     )
     background.add_task(jobs.execute_pipeline_run, run_id)
     return RunTriggerOut(run_id=run_id)

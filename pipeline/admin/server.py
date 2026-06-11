@@ -19,6 +19,9 @@ shared dependency so we cannot forget to authenticate a new route.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+from collections.abc import AsyncIterator
 from importlib.metadata import PackageNotFoundError, version
 
 from fastapi import Depends, FastAPI
@@ -26,7 +29,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.common.config import get_settings
 
+from . import jobs
 from .auth import require_admin_token
+
+logger = logging.getLogger(__name__)
 from .routes import brands as brands_routes
 from .routes import config as config_routes
 from .routes import cost as cost_routes
@@ -46,6 +52,52 @@ def _pkg_version() -> str:
         return "0.0.0+local"
 
 
+def _build_lifespan(settings):
+    """Lifespan that runs the hourly stale-run cleanup (NTS_056 Task 3).
+
+    Disabled when ``admin_run_scheduler`` is False (the test suite) so no
+    APScheduler thread leaks across tests.
+    """
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        scheduler = None
+        if settings.admin_run_scheduler:
+            from apscheduler.schedulers.background import (  # noqa: PLC0415
+                BackgroundScheduler,
+            )
+
+            max_age = settings.stale_run_max_age_hours
+
+            def _cleanup() -> None:
+                try:
+                    closed = jobs.close_stale_runs(max_age_hours=max_age)
+                    if closed:
+                        logger.info("stale-run cleanup closed %d run(s)", closed)
+                except Exception:  # noqa: BLE001 — never let the job kill the loop
+                    logger.exception("stale-run cleanup failed")
+
+            scheduler = BackgroundScheduler(timezone="UTC")
+            scheduler.add_job(
+                _cleanup,
+                trigger="interval",
+                hours=1,
+                id="close_stale_runs",
+                next_run_time=None,  # first fire one interval out, not at boot
+            )
+            scheduler.start()
+            # Sweep once at startup so a freshly-booted box doesn't wait an
+            # hour to clear runs orphaned by the reboot.
+            _cleanup()
+        try:
+            yield
+        finally:
+            if scheduler is not None:
+                scheduler.shutdown(wait=False)
+
+    return lifespan
+
+
 def create_app() -> FastAPI:
     """Factory so tests can spin up a fresh app instance."""
     settings = get_settings()
@@ -57,6 +109,7 @@ def create_app() -> FastAPI:
         # with Cloudflare Access.
         docs_url="/docs",
         redoc_url=None,
+        lifespan=_build_lifespan(settings),
     )
 
     app.add_middleware(
