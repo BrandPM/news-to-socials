@@ -432,39 +432,3 @@ class SourceHealthRecord(Base):
         Index("ix_health_source_fetched", "source_id", "fetched_at"),
         Index("ix_health_brand_fetched", "brand_id_fk", "fetched_at"),
     )
-
-
-class AdminUser(Base):
-    """A person who can log into the admin UI (NTS_058).
-
-    Flat model — every active user has identical, full admin rights. No
-    roles, no scopes. ``password_hash`` is bcrypt (cost 12); plaintext is
-    never stored or logged. ``created_by_user_id`` is a self-FK (NULL for
-    the seed user copied from ``ADMIN_UI_*`` env at migration time).
-
-    Delete is soft (``is_active=False``) so audit/history references stay
-    intact; the seed user (id=1) can never be deactivated — that's the
-    lock-out backstop.
-    """
-
-    __tablename__ = "admin_users"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String, nullable=False, unique=True)
-    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=_utcnow
-    )
-    created_by_user_id: Mapped[int | None] = mapped_column(
-        Integer,
-        ForeignKey("admin_users.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    is_active: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default=text("1")
-    )
-
-    __table_args__ = (
-        Index("idx_admin_users_username", "username", unique=True),
-    )
