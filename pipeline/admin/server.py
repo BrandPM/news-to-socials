@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version
 
 from fastapi import Depends, FastAPI
@@ -55,45 +56,71 @@ def _pkg_version() -> str:
 def _build_lifespan(settings):
     """Lifespan that runs the hourly stale-run cleanup (NTS_056 Task 3).
 
+    CRITICAL (NTS_058 hotfix): the cleanup does **synchronous SQLite I/O**,
+    which must never run on the asyncio event loop — a blocked sync DB call
+    (lock contention, busy-wait) would freeze the whole API and time out
+    ``/health``. So:
+
+      * The sweep runs **only** inside APScheduler's ``BackgroundScheduler``,
+        which executes jobs in its own thread pool — off the event loop.
+      * There is **no** synchronous sweep call in the async startup path.
+        The first sweep is scheduled a few seconds out (still on the
+        scheduler thread) so a freshly-booted box clears orphaned runs
+        without blocking startup.
+      * The entire scheduler setup is wrapped so a scheduler failure can
+        never take the API down.
+
     Disabled when ``admin_run_scheduler`` is False (the test suite) so no
-    APScheduler thread leaks across tests.
+    scheduler thread leaks across tests.
     """
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scheduler = None
         if settings.admin_run_scheduler:
-            from apscheduler.schedulers.background import (  # noqa: PLC0415
-                BackgroundScheduler,
-            )
+            try:
+                from apscheduler.schedulers.background import (  # noqa: PLC0415
+                    BackgroundScheduler,
+                )
 
-            max_age = settings.stale_run_max_age_hours
+                max_age = settings.stale_run_max_age_hours
 
-            def _cleanup() -> None:
-                try:
-                    closed = jobs.close_stale_runs(max_age_hours=max_age)
-                    if closed:
-                        logger.info("stale-run cleanup closed %d run(s)", closed)
-                except Exception:  # noqa: BLE001 — never let the job kill the loop
-                    logger.exception("stale-run cleanup failed")
+                def _cleanup() -> None:
+                    # Runs on a BackgroundScheduler worker thread — NEVER the
+                    # event loop. Swallows everything so a bad sweep can't
+                    # crash the scheduler.
+                    try:
+                        closed = jobs.close_stale_runs(max_age_hours=max_age)
+                        if closed:
+                            logger.info("stale-run cleanup closed %d run(s)", closed)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("stale-run cleanup failed")
 
-            scheduler = BackgroundScheduler(timezone="UTC")
-            scheduler.add_job(
-                _cleanup,
-                trigger="interval",
-                hours=1,
-                id="close_stale_runs",
-                next_run_time=None,  # first fire one interval out, not at boot
-            )
-            scheduler.start()
-            # Sweep once at startup so a freshly-booted box doesn't wait an
-            # hour to clear runs orphaned by the reboot.
-            _cleanup()
+                scheduler = BackgroundScheduler(timezone="UTC")
+                scheduler.add_job(
+                    _cleanup,
+                    trigger="interval",
+                    hours=1,
+                    id="close_stale_runs",
+                    # First sweep ~15s after boot, on the scheduler thread —
+                    # clears reboot-orphaned runs without blocking startup.
+                    next_run_time=datetime.now(timezone.utc) + timedelta(seconds=15),
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=300,
+                )
+                scheduler.start()
+            except Exception:  # noqa: BLE001 — scheduler must never block boot
+                logger.exception("stale-run scheduler failed to start; continuing")
+                scheduler = None
         try:
             yield
         finally:
             if scheduler is not None:
-                scheduler.shutdown(wait=False)
+                try:
+                    scheduler.shutdown(wait=False)
+                except Exception:  # noqa: BLE001
+                    logger.exception("scheduler shutdown failed")
 
     return lifespan
 
