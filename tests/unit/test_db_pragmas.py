@@ -16,6 +16,7 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
 
 from pipeline.admin import db as admin_db
 from pipeline.common import config as config_module
@@ -82,3 +83,62 @@ def test_startup_does_not_block_event_loop(tmp_path, monkeypatch):
     assert resp.json()["status"] == "ok"
     assert elapsed_ms < 500, f"startup+health took {elapsed_ms:.0f}ms"
     admin_db.reset_for_tests()
+
+
+# --- NTS_061: PRAGMA listener is scoped to the admin engine only ----------
+
+
+def test_other_sqlite_engine_unaffected_by_admin_listener(tmp_path):
+    """A foreign SQLite engine created in the SAME process must NOT inherit the
+    admin engine's PRAGMAs.
+
+    Before NTS_061 the listener was attached to the ``Engine`` *class*
+    (``@event.listens_for(Engine, "connect")``), so every SQLite engine in the
+    process — e.g. the pipeline's own DB — got flipped to WAL + busy_timeout
+    uninvited. With the listener bound to the admin-engine instance, an
+    unrelated engine keeps SQLite's defaults (rollback-journal "delete" mode,
+    busy_timeout 0).
+    """
+    # Build the admin engine first so its instance-scoped listener is live.
+    admin_db.reset_for_tests()
+    admin_engine = admin_db.get_engine(path=tmp_path / "admin.db")
+    try:
+        with admin_engine.connect() as conn:
+            assert str(conn.exec_driver_sql("PRAGMA journal_mode").scalar()).lower() == "wal"
+
+        # A separate, unrelated on-disk SQLite engine in the same process.
+        other = create_engine(f"sqlite:///{tmp_path / 'pipeline.db'}", future=True)
+        try:
+            with other.connect() as conn:
+                mode = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+                fk = conn.exec_driver_sql("PRAGMA foreign_keys").scalar()
+                synchronous = conn.exec_driver_sql("PRAGMA synchronous").scalar()
+            # Our handler would force these to wal / 1 / 1. A foreign engine the
+            # admin listener never touched keeps SQLite's defaults: rollback
+            # "delete" journal, FK enforcement OFF, synchronous FULL (2).
+            # (busy_timeout is NOT asserted here — it's environment-dependent
+            #  and some libsqlite builds default it non-zero, so it can't tell
+            #  "we set it" from "the platform did".)
+            assert str(mode).lower() != "wal"
+            assert fk == 0
+            assert synchronous == 2  # FULL — our handler would have set NORMAL (1)
+        finally:
+            other.dispose()
+    finally:
+        admin_db.reset_for_tests()
+
+
+def test_admin_engine_recreated_keeps_pragmas(tmp_path):
+    """Recreating the admin engine (e.g. reset_for_tests + new path) re-attaches
+    the listener — boot/idempotency guard. The fresh engine must still come up
+    WAL + busy_timeout, and a foreign engine made afterwards stays clean."""
+    admin_db.reset_for_tests()
+    admin_db.get_engine(path=tmp_path / "a.db")
+    admin_db.reset_for_tests()
+    engine2 = admin_db.get_engine(path=tmp_path / "b.db")
+    try:
+        with engine2.connect() as conn:
+            assert str(conn.exec_driver_sql("PRAGMA journal_mode").scalar()).lower() == "wal"
+            assert conn.exec_driver_sql("PRAGMA busy_timeout").scalar() >= 5000
+    finally:
+        admin_db.reset_for_tests()

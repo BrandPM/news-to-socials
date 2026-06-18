@@ -40,29 +40,6 @@ def _make_url(path: Path) -> str:
     return f"sqlite:///{p}"
 
 
-def get_engine(path: Path | None = None, *, echo: bool = False) -> Engine:
-    """Return the process-wide engine, creating it on first call.
-
-    Pass ``path`` to force a fresh engine bound to a specific DB file
-    (useful for tests). Note that this also resets the session factory.
-    """
-    global _engine, _SessionLocal
-    if path is not None or _engine is None:
-        db_path = path if path is not None else get_settings().admin_db_path
-        _engine = create_engine(
-            _make_url(db_path),
-            echo=echo,
-            future=True,
-            # check_same_thread=False allows FastAPI's threadpool to share
-            # the engine across worker threads. SQLite is otherwise serial.
-            connect_args={"check_same_thread": False},
-        )
-        _SessionLocal = sessionmaker(
-            bind=_engine, autoflush=False, autocommit=False, future=True
-        )
-    return _engine
-
-
 # Minimum busy-wait before SQLite gives up on a locked DB and raises
 # "database is locked". 0 (the default) is what caused the NTS_059 hangs:
 # the stale-run sweep thread and request threads collided on the rollback
@@ -71,14 +48,20 @@ def get_engine(path: Path | None = None, *, echo: bool = False) -> Engine:
 SQLITE_BUSY_TIMEOUT_MS = 5000
 
 
-@event.listens_for(Engine, "connect")
 def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:  # noqa: ANN001
     """Apply per-connection SQLite PRAGMAs to every pooled connection.
 
-    Fires on *every* DBAPI connect, so it covers all sessions regardless of
-    which thread (request threadpool or the BackgroundScheduler sweep thread)
-    opened them — the engine pools and reuses connections across threads via
-    ``check_same_thread=False``.
+    Attached **only to the admin engine** (``event.listen`` on the instance in
+    :func:`get_engine`), never to the ``Engine`` class. NTS_061: the previous
+    class-wide ``@event.listens_for(Engine, "connect")`` would have applied
+    these PRAGMAs to *any* other SQLite engine created in the same process
+    (e.g. the pipeline's own DB) — turning it to WAL uninvited. Scoping to the
+    admin-engine instance keeps the blast radius to ``admin.db``.
+
+    Fires on *every* DBAPI connect for this engine, so it covers all sessions
+    regardless of which thread (request threadpool or the BackgroundScheduler
+    sweep thread) opened them — the engine pools and reuses connections across
+    threads via ``check_same_thread=False``.
 
       * ``busy_timeout`` — wait instead of failing/hanging on the writer lock
         (root cause of NTS_059). See ``SQLITE_BUSY_TIMEOUT_MS``.
@@ -99,6 +82,32 @@ def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None: 
         cursor.execute("PRAGMA foreign_keys = ON")
     finally:
         cursor.close()
+
+
+def get_engine(path: Path | None = None, *, echo: bool = False) -> Engine:
+    """Return the process-wide engine, creating it on first call.
+
+    Pass ``path`` to force a fresh engine bound to a specific DB file
+    (useful for tests). Note that this also resets the session factory.
+    """
+    global _engine, _SessionLocal
+    if path is not None or _engine is None:
+        db_path = path if path is not None else get_settings().admin_db_path
+        _engine = create_engine(
+            _make_url(db_path),
+            echo=echo,
+            future=True,
+            # check_same_thread=False allows FastAPI's threadpool to share
+            # the engine across worker threads. SQLite is otherwise serial.
+            connect_args={"check_same_thread": False},
+        )
+        # NTS_061: bind the PRAGMA listener to THIS engine instance only, so
+        # other SQLite engines in the same process are left untouched.
+        event.listen(_engine, "connect", _configure_sqlite_connection)
+        _SessionLocal = sessionmaker(
+            bind=_engine, autoflush=False, autocommit=False, future=True
+        )
+    return _engine
 
 
 def get_session_factory() -> sessionmaker[Session]:
