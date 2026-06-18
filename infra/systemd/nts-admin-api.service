@@ -1,0 +1,31 @@
+[Unit]
+Description=News-to-Socials admin API (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=news-deploy
+WorkingDirectory=/opt/news-to-socials/repo
+EnvironmentFile=/opt/news-to-socials/repo/.env
+# --timeout-graceful-shutdown: uvicorn stops accepting, drains in-flight
+# requests, then force-exits inside the window so we never wait on a wedged
+# worker. Kept below TimeoutStopSec so systemd's own timer is a backstop.
+ExecStart=/opt/news-to-socials/repo/.venv/bin/uvicorn pipeline.admin.server:app \
+    --host 127.0.0.1 --port 8080 --timeout-graceful-shutdown 15
+Restart=always
+RestartSec=5
+MemoryMax=512M
+# Graceful shutdown (NTS_059): uvicorn treats SIGINT as a clean-shutdown
+# signal (the default SIGTERM also works, but SIGINT mirrors Ctrl-C and is
+# what uvicorn documents). Bound the stop so a stuck process is SIGKILLed
+# after 20s instead of systemd's 90s default — previously the loop wedged on
+# a SQLite lock and only died on SIGKILL.
+KillSignal=SIGINT
+TimeoutStopSec=20
+TimeoutStartSec=30
+StandardOutput=append:/var/log/news-to-socials/admin-api.log
+StandardError=append:/var/log/news-to-socials/admin-api.log
+
+[Install]
+WantedBy=multi-user.target

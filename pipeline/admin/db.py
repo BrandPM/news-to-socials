@@ -63,11 +63,39 @@ def get_engine(path: Path | None = None, *, echo: bool = False) -> Engine:
     return _engine
 
 
+# Minimum busy-wait before SQLite gives up on a locked DB and raises
+# "database is locked". 0 (the default) is what caused the NTS_059 hangs:
+# the stale-run sweep thread and request threads collided on the rollback
+# journal's writer lock and failed instantly instead of waiting. 5s is
+# comfortably longer than any admin write.
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
 @event.listens_for(Engine, "connect")
-def _enable_sqlite_fk(dbapi_connection, _connection_record) -> None:  # noqa: ANN001
-    """Foreign keys are OFF by default in SQLite; turn them on per-connection."""
+def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:  # noqa: ANN001
+    """Apply per-connection SQLite PRAGMAs to every pooled connection.
+
+    Fires on *every* DBAPI connect, so it covers all sessions regardless of
+    which thread (request threadpool or the BackgroundScheduler sweep thread)
+    opened them — the engine pools and reuses connections across threads via
+    ``check_same_thread=False``.
+
+      * ``busy_timeout`` — wait instead of failing/hanging on the writer lock
+        (root cause of NTS_059). See ``SQLITE_BUSY_TIMEOUT_MS``.
+      * ``journal_mode = WAL`` — readers no longer block the writer (and vice
+        versa). WAL is a persistent, DB-file-level setting, so this is a
+        no-op once the file is already in WAL; we re-assert it so a freshly
+        created or restored DB self-heals. Returns "memory" for in-memory
+        test DBs, which is fine.
+      * ``synchronous = NORMAL`` — the safe pairing with WAL: durable across
+        app crashes, only loses the last commits on an OS/power crash.
+      * ``foreign_keys = ON`` — OFF by default in SQLite (NTS_002 FK work).
+    """
     cursor = dbapi_connection.cursor()
     try:
+        cursor.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA journal_mode = WAL")
+        cursor.execute("PRAGMA synchronous = NORMAL")
         cursor.execute("PRAGMA foreign_keys = ON")
     finally:
         cursor.close()
