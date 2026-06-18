@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -9,6 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from pipeline.admin.db import session_scope
 from pipeline.admin.models import Prompt
 from pipeline.admin.schemas import (
+    PromptAnalysisOut,
+    PromptContradiction,
     PromptDiffOut,
     PromptIn,
     PromptOut,
@@ -18,6 +22,33 @@ from pipeline.admin.schemas import (
 )
 
 router = APIRouter()
+
+
+# --- Analyze rate limit -------------------------------------------------
+#
+# Analyze hits a paid LLM, so we cap it per prompt version: at most
+# ``_ANALYZE_LIMIT`` calls per ``_ANALYZE_WINDOW_S`` seconds. In-memory
+# sliding window keyed by prompt id — fine for the single-process admin
+# API; if it ever runs multi-worker this becomes per-worker, which is an
+# acceptable looser bound for a cost guard (not a security control).
+_ANALYZE_LIMIT = 5
+_ANALYZE_WINDOW_S = 60.0
+_analyze_calls: dict[int, list[float]] = {}
+
+
+def _enforce_analyze_rate_limit(prompt_id: int) -> None:
+    now = time.monotonic()
+    recent = [t for t in _analyze_calls.get(prompt_id, []) if now - t < _ANALYZE_WINDOW_S]
+    if len(recent) >= _ANALYZE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"too many analyze requests for this version — "
+                f"max {_ANALYZE_LIMIT} per minute, try again shortly"
+            ),
+        )
+    recent.append(now)
+    _analyze_calls[prompt_id] = recent
 
 
 # --- Fixture used by the /test endpoint ---------------------------------
@@ -203,4 +234,44 @@ async def test_prompt(prompt_id: int, payload: PromptTestIn) -> PromptTestOut:
         generated_text=result.text,
         cost_usd=result.cost_usd,
         ai_tells_count=result.ai_tells_count,
+    )
+
+
+@router.post("/{prompt_id}/analyze", response_model=PromptAnalysisOut)
+async def analyze_prompt(prompt_id: int) -> PromptAnalysisOut:
+    """Send the prompt to a reviewer LLM and return a structured critique.
+
+    Read-only: never mutates the prompt. Records a ``prompt_analysis``
+    cost row (visible in Costs). Rate-limited per version. A malformed
+    LLM reply surfaces as 422, not 500.
+    """
+    from pipeline.admin import llm  # noqa: PLC0415
+
+    _enforce_analyze_rate_limit(prompt_id)
+
+    with session_scope() as session:
+        p = session.get(Prompt, prompt_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="prompt not found")
+        prompt_content = p.content
+        prompt_type = p.prompt_type
+        brand_id_fk = p.brand_id_fk
+
+    try:
+        result = await llm.run_prompt_analysis(
+            prompt_type=prompt_type,
+            prompt_content=prompt_content,
+            brand_id_fk=brand_id_fk,
+        )
+    except llm.PromptAnalysisError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"prompt analysis returned an unusable response: {exc}",
+        ) from exc
+
+    return PromptAnalysisOut(
+        strengths=result.strengths,
+        contradictions=[PromptContradiction(**c) for c in result.contradictions],
+        risks=result.risks,
+        summary=result.summary,
     )

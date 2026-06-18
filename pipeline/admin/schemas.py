@@ -162,6 +162,35 @@ class PromptTestOut(BaseModel):
     ai_tells_count: int
 
 
+class PromptContradiction(BaseModel):
+    """One internal contradiction the reviewer found in a prompt.
+
+    ``issue`` names the conflict, ``why`` explains the failure mode it
+    causes downstream, and ``suggestion`` is a concrete edit. NTS_060
+    is the canonical example: a prompt that asks for ``## H2`` headings
+    in the body while another clause forbids markdown in the title can
+    leak ``##`` into titles — the reviewer should surface that pairing.
+    """
+
+    issue: str
+    why: str
+    suggestion: str
+
+
+class PromptAnalysisOut(BaseModel):
+    """Strict result of POST /prompts/{id}/analyze (NTS task 3).
+
+    The LLM is forced to emit exactly this shape; a response we can't
+    coerce into it becomes a 422 at the route boundary rather than a
+    500. Analyze is read-only — it never mutates the prompt.
+    """
+
+    strengths: list[str]
+    contradictions: list[PromptContradiction]
+    risks: list[str]
+    summary: str
+
+
 # --- Pipeline config ----------------------------------------------------
 
 

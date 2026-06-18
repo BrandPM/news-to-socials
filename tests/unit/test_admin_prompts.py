@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -105,7 +107,7 @@ def test_activate_does_not_touch_other_prompt_types(client, icon_brand_id) -> No
     client.post(f"/api/v1/prompts/{draft}/activate", headers=AUTH)
     listed = client.get("/api/v1/prompts", headers=AUTH).json()
     actives = sorted(
-        (p["prompt_type"] for p in listed if p["is_active"])
+        p["prompt_type"] for p in listed if p["is_active"]
     )
     assert actives == ["writer_draft", "writer_polish"]
 
@@ -128,7 +130,7 @@ def test_test_endpoint_uses_mocked_llm(monkeypatch, client, icon_brand_id) -> No
 
     from pipeline.admin import llm as llm_mod
 
-    async def fake_test(*, prompt_type, prompt_content, sample_topic, brand_id_fk=None):  # noqa: ANN001
+    async def fake_test(*, prompt_type, prompt_content, sample_topic, brand_id_fk=None):
         assert prompt_type == "writer_polish"
         assert "Polish" in prompt_content
         assert "India" in sample_topic["title"]
@@ -145,3 +147,192 @@ def test_test_endpoint_uses_mocked_llm(monkeypatch, client, icon_brand_id) -> No
     assert body["generated_text"].startswith("A clean rewrite")
     assert body["cost_usd"] == 0.012
     assert body["ai_tells_count"] == 0
+
+
+# --- Save = clone + activate (NTS task 2) -------------------------------
+#
+# The redesigned editor "saves" an edit as a brand-new version and
+# activates it, leaving the prior version intact for rollback. The UI
+# composes the two existing endpoints (POST /prompts then
+# POST /{id}/activate); this asserts the invariants that flow relies on.
+
+
+def test_save_creates_new_active_version_and_old_survives(client, icon_brand_id) -> None:
+    v1 = client.post(
+        "/api/v1/prompts",
+        headers=AUTH,
+        json=_payload(icon_brand_id, version_name="v1", content="Original."),
+    ).json()["id"]
+    client.post(f"/api/v1/prompts/{v1}/activate", headers=AUTH)
+
+    # "Save" an edit → a new version from the edited content, then activate.
+    v2 = client.post(
+        "/api/v1/prompts",
+        headers=AUTH,
+        json=_payload(icon_brand_id, version_name="v2 (edited)", content="Edited body."),
+    ).json()["id"]
+    resp = client.post(f"/api/v1/prompts/{v2}/activate", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is True
+
+    # New version is active, old version still exists but is inactive.
+    old = client.get(f"/api/v1/prompts/{v1}", headers=AUTH).json()
+    assert old["is_active"] is False
+    assert old["content"] == "Original."
+    new = client.get(f"/api/v1/prompts/{v2}", headers=AUTH).json()
+    assert new["is_active"] is True
+    assert new["content"] == "Edited body."
+
+
+# --- Analyze (NTS task 3) -----------------------------------------------
+
+_GOOD_ANALYSIS = {
+    "strengths": ["Clear voice instructions"],
+    "contradictions": [
+        {
+            "issue": "Asks for ## H2 in body but forbids markdown in title",
+            "why": "The model can leak '##' into the title field",
+            "suggestion": "Scope the markdown rule to the body only",
+        }
+    ],
+    "risks": ["No explicit length cap"],
+    "summary": "Solid prompt with one contradiction to resolve.",
+}
+
+
+class _FakeUsage:
+    # Responses API usage shape. output_tokens includes reasoning_tokens.
+    input_tokens = 800
+    output_tokens = 200
+    output_tokens_details = type("D", (), {"reasoning_tokens": 150})()
+
+
+class _FakeResp:
+    """Mimics the Responses API result (resp.output_text + resp.usage)."""
+
+    def __init__(self, content: str) -> None:
+        self.output_text = content
+        self.usage = _FakeUsage()
+
+
+def _fake_openai_returning(content: str):
+    """Build a fake openai.AsyncOpenAI whose responses.create returns ``content``."""
+
+    class _Responses:
+        async def create(self, **_kwargs):
+            return _FakeResp(content)
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    return _Client
+
+
+@pytest.fixture
+def _openai_key(monkeypatch):
+    """Give the analyzer a (fake) API key so run_prompt_analysis proceeds."""
+    monkeypatch.setattr(config_module, "_settings", None)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    yield
+    monkeypatch.setattr(config_module, "_settings", None)
+
+
+def test_analyze_returns_valid_json_and_writes_cost(
+    monkeypatch, client, icon_brand_id, _openai_key
+) -> None:
+    import openai
+
+    monkeypatch.setattr(
+        openai, "AsyncOpenAI", _fake_openai_returning(json.dumps(_GOOD_ANALYSIS))
+    )
+    pid = client.post("/api/v1/prompts", headers=AUTH, json=_payload(icon_brand_id)).json()["id"]
+
+    resp = client.post(f"/api/v1/prompts/{pid}/analyze", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["strengths"] == ["Clear voice instructions"]
+    assert body["contradictions"][0]["suggestion"].startswith("Scope the markdown")
+    assert body["risks"] == ["No explicit length cap"]
+    assert body["summary"].startswith("Solid prompt")
+
+    # A cost_records row with operation "prompt_analysis" was written.
+    from pipeline.admin.models import CostRecord
+
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        rows = session.query(CostRecord).filter_by(operation="prompt_analysis").all()
+    assert len(rows) == 1
+    assert rows[0].brand_id_fk == icon_brand_id
+    assert rows[0].model == "gpt-5.5-2026-04-23"
+    assert rows[0].cost_usd > 0
+
+
+def test_analyze_calls_gpt55_responses_api_with_high_effort(
+    monkeypatch, client, icon_brand_id, _openai_key
+) -> None:
+    """The analyze call targets gpt-5.5 via the Responses API at effort=high."""
+    import openai
+
+    captured: dict = {}
+
+    class _Responses:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return _FakeResp(json.dumps(_GOOD_ANALYSIS))
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _Client)
+    pid = client.post("/api/v1/prompts", headers=AUTH, json=_payload(icon_brand_id)).json()["id"]
+
+    resp = client.post(f"/api/v1/prompts/{pid}/analyze", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    assert captured["model"] == "gpt-5.5-2026-04-23"
+    assert captured["reasoning"] == {"effort": "high"}
+    # Strict structured-output contract is enforced at the API layer.
+    assert captured["text"]["format"]["type"] == "json_schema"
+    assert captured["text"]["format"]["strict"] is True
+
+
+def test_analyze_malformed_llm_response_returns_422(
+    monkeypatch, client, icon_brand_id, _openai_key
+) -> None:
+    import openai
+
+    # Valid JSON, wrong shape (missing summary, contradictions not a list).
+    bad = json.dumps({"strengths": [], "contradictions": "nope", "risks": []})
+    monkeypatch.setattr(openai, "AsyncOpenAI", _fake_openai_returning(bad))
+    pid = client.post("/api/v1/prompts", headers=AUTH, json=_payload(icon_brand_id)).json()["id"]
+
+    resp = client.post(f"/api/v1/prompts/{pid}/analyze", headers=AUTH)
+    assert resp.status_code == 422, resp.text
+    assert "unusable response" in resp.json()["detail"]
+
+
+def test_analyze_not_found_returns_404(client, icon_brand_id, _openai_key) -> None:
+    resp = client.post("/api/v1/prompts/999999/analyze", headers=AUTH)
+    assert resp.status_code == 404
+
+
+def test_analyze_rate_limited_per_version(
+    monkeypatch, client, icon_brand_id, _openai_key
+) -> None:
+    import openai
+
+    from pipeline.admin.routes import prompts as prompts_routes
+
+    monkeypatch.setattr(
+        openai, "AsyncOpenAI", _fake_openai_returning(json.dumps(_GOOD_ANALYSIS))
+    )
+    # Reset the in-memory window so prior tests don't bleed in.
+    monkeypatch.setattr(prompts_routes, "_analyze_calls", {})
+    monkeypatch.setattr(prompts_routes, "_ANALYZE_LIMIT", 2)
+    pid = client.post("/api/v1/prompts", headers=AUTH, json=_payload(icon_brand_id)).json()["id"]
+
+    assert client.post(f"/api/v1/prompts/{pid}/analyze", headers=AUTH).status_code == 200
+    assert client.post(f"/api/v1/prompts/{pid}/analyze", headers=AUTH).status_code == 200
+    resp = client.post(f"/api/v1/prompts/{pid}/analyze", headers=AUTH)
+    assert resp.status_code == 429
