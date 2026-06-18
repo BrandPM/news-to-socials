@@ -19,6 +19,172 @@ class PromptTestResult:
     ai_tells_count: int
 
 
+@dataclass
+class PromptAnalysisResult:
+    strengths: list[str]
+    contradictions: list[dict[str, str]]
+    risks: list[str]
+    summary: str
+    cost_usd: float
+
+
+class PromptAnalysisError(ValueError):
+    """The LLM returned something we can't coerce into the strict
+    analysis schema. The /analyze route maps this to HTTP 422 so a flaky
+    model response never surfaces as a 500."""
+
+
+# System prompt for the reviewer. Kept terse and explicit about the JSON
+# contract — gpt-4o honours response_format=json_object, but we still
+# coerce + validate the shape because "valid JSON" != "our schema".
+_ANALYZER_SYSTEM = (
+    "You are a senior prompt engineer reviewing a production LLM prompt "
+    "used in a news-to-social content pipeline. Critique the prompt the "
+    "user sends. Be concrete and specific to its wording — do not give "
+    "generic prompt-writing advice.\n\n"
+    "Pay special attention to INTERNAL CONTRADICTIONS: instructions that "
+    "fight each other and cause real downstream failures. A canonical "
+    "example: a prompt that asks for '## H2' markdown headings in the "
+    "article body while elsewhere forbidding markdown in the title can "
+    "leak '##' into the title field. Flag pairings like that.\n\n"
+    "Respond with a SINGLE JSON object and nothing else, with exactly "
+    "these keys:\n"
+    '  "strengths": array of short strings (what the prompt does well)\n'
+    '  "contradictions": array of objects, each with string keys '
+    '"issue", "why", "suggestion"\n'
+    '  "risks": array of short strings (failure modes / footguns)\n'
+    '  "summary": one short paragraph string\n\n'
+    "Every array may be empty but must be present. Do not wrap the JSON "
+    "in markdown fences."
+)
+
+
+def _coerce_analysis(raw: Any) -> tuple[list[str], list[dict[str, str]], list[str], str]:
+    """Validate the parsed LLM JSON against the strict analysis shape.
+
+    Raises ``PromptAnalysisError`` on any structural deviation so the
+    route can return 422. We coerce scalars to ``str`` defensively but
+    reject missing/incorrectly-typed top-level keys.
+    """
+    if not isinstance(raw, dict):
+        raise PromptAnalysisError("expected a JSON object")
+
+    def _str_list(value: Any, field: str) -> list[str]:
+        if not isinstance(value, list):
+            raise PromptAnalysisError(f"{field!r} must be an array")
+        return [str(item) for item in value]
+
+    strengths = _str_list(raw.get("strengths"), "strengths")
+    risks = _str_list(raw.get("risks"), "risks")
+
+    raw_contras = raw.get("contradictions")
+    if not isinstance(raw_contras, list):
+        raise PromptAnalysisError("'contradictions' must be an array")
+    contradictions: list[dict[str, str]] = []
+    for item in raw_contras:
+        if not isinstance(item, dict):
+            raise PromptAnalysisError(
+                "each contradiction must be an object with issue/why/suggestion"
+            )
+        contradictions.append(
+            {
+                "issue": str(item.get("issue", "")),
+                "why": str(item.get("why", "")),
+                "suggestion": str(item.get("suggestion", "")),
+            }
+        )
+
+    summary = raw.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise PromptAnalysisError("'summary' must be a non-empty string")
+
+    return strengths, contradictions, risks, summary.strip()
+
+
+async def run_prompt_analysis(
+    *,
+    prompt_type: str,
+    prompt_content: str,
+    brand_id_fk: int | None = None,
+) -> PromptAnalysisResult:
+    """Send a prompt to the reviewer LLM and return a structured critique.
+
+    Reuses the same OpenAI client + settings + pricing table + cost
+    recorder as ``run_prompt_test`` (NTS task 3: do not spin up a new
+    client). Records a ``prompt_analysis`` cost row. Read-only: the
+    prompt itself is never modified. Raises ``PromptAnalysisError`` when
+    the model's reply can't be coerced into the strict schema.
+    """
+    import json as _json  # noqa: PLC0415
+
+    import openai  # noqa: PLC0415
+
+    from pipeline.common.config import get_settings  # noqa: PLC0415
+
+    settings = get_settings()
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set; cannot run /prompts/analyze")
+
+    client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
+    model = "gpt-4o"
+    user_msg = (
+        f"Prompt type: {prompt_type}\n\n"
+        "--- PROMPT UNDER REVIEW ---\n"
+        f"{prompt_content}\n"
+        "--- END PROMPT ---"
+    )
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _ANALYZER_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=1200,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+
+    try:
+        parsed = _json.loads(text)
+    except (ValueError, TypeError) as exc:
+        raise PromptAnalysisError("model did not return valid JSON") from exc
+    strengths, contradictions, risks, summary = _coerce_analysis(parsed)
+
+    # Cost recording mirrors run_prompt_test exactly (NTS_025 — shared
+    # pricing table so the Costs dashboard agrees with this figure).
+    from pipeline.common.pricing import openai_cost  # noqa: PLC0415
+
+    usage = getattr(resp, "usage", None)
+    tokens_in = getattr(usage, "prompt_tokens", None)
+    tokens_out = getattr(usage, "completion_tokens", None)
+    cost = openai_cost(model, tokens_in, tokens_out)
+
+    if brand_id_fk is not None:
+        from pipeline.admin.config_client import AdminConfigClient  # noqa: PLC0415
+
+        try:
+            AdminConfigClient.record_cost(
+                brand_id_fk=brand_id_fk,
+                provider="openai",
+                operation="prompt_analysis",
+                model=model,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost,
+            )
+        except Exception:  # noqa: BLE001
+            # Cost recording must never break the endpoint.
+            pass
+
+    return PromptAnalysisResult(
+        strengths=strengths,
+        contradictions=contradictions,
+        risks=risks,
+        summary=summary,
+        cost_usd=round(cost, 4),
+    )
+
+
 async def run_prompt_test(
     *,
     prompt_type: str,
