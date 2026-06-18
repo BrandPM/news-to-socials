@@ -23,6 +23,7 @@ only place that knows which model is in use.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import yaml
@@ -44,6 +45,45 @@ class _DraftJSON(BaseModel):
     title: str
     body: str
     key_takeaway: str = ""
+
+
+# Leading markdown block markers (heading #, blockquote >, list -/*/+) that the
+# polish/translate pass sometimes leaks into the *title*. The body carries the
+# markdown; the title must be plain text. We require trailing whitespace so we
+# never eat a legitimate "#1 ranking" or a hyphenated first word.
+_TITLE_LEADING_MARKER = re.compile(r"^\s*(?:#{1,6}|>|[-*+])\s+")
+# Inline emphasis wrappers: **bold**, __bold__, *italic*, _italic_.
+_TITLE_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_TITLE_ITALIC = re.compile(r"\*(.+?)\*|_(.+?)_")
+
+
+def sanitize_title(title: str) -> str:
+    """Strip stray markdown from an LLM-produced title — the last line of defence.
+
+    Translation/polish passes (non-English especially) sometimes return the
+    title with leading heading markers ("## ", "# "), bold (``**...**``),
+    backticks, or list bullets even though the title field should be plain
+    text. This runs on every parsed draft, for every language, before the
+    title is ever persisted to Sanity or the admin DB (NTS_060).
+
+    Idempotent: a clean title passes through unchanged.
+    """
+    if not title:
+        return title
+    text = title.strip()
+    # Peel leading block markers, possibly stacked ("## > foo"). Loop until stable.
+    prev = None
+    while prev != text:
+        prev = text
+        text = _TITLE_LEADING_MARKER.sub("", text).strip()
+    # Drop backticks entirely (inline code has no place in a title).
+    text = text.replace("`", "")
+    # Unwrap emphasis: keep the inner text, drop the markers.
+    text = _TITLE_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
+    text = _TITLE_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
+    # Collapse any whitespace the stripping opened up.
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 _LANGUAGE_NAMES = {
@@ -104,6 +144,11 @@ Rules:
 * No filler phrases ("moreover", "furthermore", "it's important to note").
 * Em-dashes used sparingly.
 
+TITLE FORMAT (mandatory): the title is PLAIN TEXT only — no markdown.
+Never start it with ``#`` or ``##``, never wrap it in ``**bold**`` or
+backticks, never make it a list item. Markdown belongs in ``body``, not
+in ``title``.
+
 Return ONLY a JSON object: {{"title": "...", "body": "...", "key_takeaway": "..."}}
 where ``body`` is markdown including the H2 headings.
 """
@@ -133,6 +178,10 @@ VOICE GUARDRAILS:
 * Examples of the voice we want (mirror this register and cadence):
 {good_examples}
 
+TITLE FORMAT (mandatory): the title is PLAIN TEXT only — no markdown.
+Never start it with ``#`` or ``##``, never wrap it in ``**bold**`` or
+backticks. Markdown (the H2 headings) belongs in ``body``, not ``title``.
+
 Draft:
 {draft_json}
 
@@ -156,6 +205,9 @@ VOICE GUARDRAILS (still apply):
 {banned_phrases}
 * Examples of the voice we want:
 {good_examples}
+
+TITLE FORMAT (mandatory): the title is PLAIN TEXT only — no markdown,
+no leading ``#``/``##``, no ``**bold**`` or backticks.
 
 Draft:
 {draft_json}
@@ -407,7 +459,11 @@ class CommentWriter:
                 text = text[4:]
         try:
             data = json.loads(text)
-            return _DraftJSON.model_validate(data)
+            obj = _DraftJSON.model_validate(data)
+            # Last line of defence: strip any markdown the model leaked into the
+            # title (leading ##, **bold**, backticks). Body keeps its markdown.
+            obj.title = sanitize_title(obj.title)
+            return obj
         except Exception as exc:  # noqa: BLE001
             log.error("comment_writer.parse_failed", raw=text[:200], err=str(exc))
             return _DraftJSON(title="(parse failed)", body=text[:800], key_takeaway="")

@@ -19,6 +19,7 @@ from pipeline.generator.anti_ai_check import find_banned_phrase_hits
 from pipeline.generator.comment_writer import (
     CommentWriter,
     parse_voice_guardrails,
+    sanitize_title,
 )
 
 
@@ -237,3 +238,104 @@ async def test_write_does_not_retry_more_than_once() -> None:
 
     # 3 calls: draft + polish + 1 retry. No 4th call even though body is still dirty.
     assert client.chat.completions.create.await_count == 3
+
+
+# --- sanitize_title (IT_PROJ_NTS_060) --------------------------------
+#
+# Translation/polish passes leak markdown into the title field ("## Foo").
+# sanitize_title is the last line of defence before persistence.
+
+
+def test_sanitize_title_strips_h2() -> None:
+    assert sanitize_title("## The Shifting Landscape") == "The Shifting Landscape"
+
+
+def test_sanitize_title_strips_h1() -> None:
+    assert sanitize_title("# A Clean Headline") == "A Clean Headline"
+
+
+def test_sanitize_title_strips_bold() -> None:
+    assert sanitize_title("**Bold Title**") == "Bold Title"
+
+
+def test_sanitize_title_strips_leading_space_and_hashes() -> None:
+    assert sanitize_title("  ##  Spaced Heading") == "Spaced Heading"
+
+
+def test_sanitize_title_clean_unchanged() -> None:
+    clean = "The Shifting Landscape of Tax Advisory Services"
+    assert sanitize_title(clean) == clean
+
+
+def test_sanitize_title_real_prod_examples() -> None:
+    # The PL/RU/UK titles that shipped with markdown on topic 0f7c49edcb.
+    assert (
+        sanitize_title("## Klienci stawiają na strategię w doradztwie podatkowym")
+        == "Klienci stawiają na strategię w doradztwie podatkowym"
+    )
+    assert (
+        sanitize_title("## Совершенствование стратегической экспертизы через ИИ")
+        == "Совершенствование стратегической экспертизы через ИИ"
+    )
+
+
+def test_sanitize_title_multiple_hashes() -> None:
+    assert sanitize_title("#### Deep Heading") == "Deep Heading"
+
+
+def test_sanitize_title_strips_backticks() -> None:
+    assert sanitize_title("`code title`") == "code title"
+
+
+def test_sanitize_title_strips_list_marker() -> None:
+    assert sanitize_title("- A bullet title") == "A bullet title"
+
+
+def test_sanitize_title_inner_bold_preserved() -> None:
+    # Emphasis in the middle is unwrapped, surrounding text kept.
+    assert sanitize_title("Why **mezzanine** repriced") == "Why mezzanine repriced"
+
+
+def test_sanitize_title_does_not_eat_hash_number() -> None:
+    # "#1" is not a heading (no space) — must survive.
+    assert sanitize_title("#1 ranking shift") == "#1 ranking shift"
+
+
+def test_sanitize_title_empty() -> None:
+    assert sanitize_title("") == ""
+    assert sanitize_title("   ") == ""
+
+
+def test_sanitize_title_is_idempotent() -> None:
+    once = sanitize_title("## ** Stacked ** markup")
+    assert sanitize_title(once) == once
+
+
+# --- pipeline path runs the title through the sanitizer --------------
+
+
+async def test_write_sanitizes_markdown_title_from_polish() -> None:
+    """End-to-end: a polish stage that returns a "## " title yields a clean
+    Draft.title. Proves the pipeline path runs every title through
+    sanitize_title before it can reach Sanity / the admin DB."""
+    draft_payload = {
+        "title": "## Draft markdown title",
+        "body": "## Section A\n\nClean draft body.",
+        "key_takeaway": "T",
+    }
+    polish_payload = {
+        "title": "## Polished markdown title",
+        "body": "## Section A\n\nThe proposal moves the discussion.",
+        "key_takeaway": "T",
+    }
+
+    client = AsyncMock()
+    client.chat.completions.create = AsyncMock(
+        side_effect=[_chat_resp(draft_payload), _chat_resp(polish_payload)]
+    )
+
+    writer = CommentWriter(client=client)
+    out = await writer.write(_make_topic(), _voice_yaml(), Language.uk)
+
+    assert out.title == "Polished markdown title"
+    assert not out.title.startswith("#")
