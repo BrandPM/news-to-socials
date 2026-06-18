@@ -11,7 +11,13 @@ from fastapi.testclient import TestClient
 from pipeline.admin import db as admin_db
 from pipeline.admin import encryption as enc_mod
 from pipeline.admin import jobs as admin_jobs
-from pipeline.admin.models import DraftApproval
+from pipeline.admin.models import (
+    CostRecord,
+    DraftApproval,
+    Run,
+    Source,
+    Topic,
+)
 from pipeline.common import config as config_module
 from tests.unit.conftest import seed_brand, seed_icon_brand
 
@@ -659,23 +665,170 @@ def test_permanent_delete_succeeds_for_rejected_doc(
     assert deleted == ["drafts.post-bye"]
 
 
-def test_permanent_delete_returns_404_when_doc_missing(
+def _seed_local_refs(brand_id: int, draft_id: str) -> None:
+    """Insert a topic + cost_record + draft_approval all pointing at
+    ``draft_id`` (normalised) so deletion/backfill purge logic has
+    something to clean (IT_PROJ_NTS_062)."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(tz=timezone.utc)
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        src = Source(
+            brand_id_fk=brand_id,
+            name="seed-source",
+            source_type="rss",
+            url="https://example.com/feed",
+            primary_category="markets",
+        )
+        session.add(src)
+        session.flush()
+        run = Run(
+            brand_id_fk=brand_id,
+            triggered_by="test",
+            source_ids="[]",
+            started_at=now,
+            status="success",
+        )
+        session.add(run)
+        session.flush()
+        session.add(
+            Topic(
+                run_id=run.id,
+                topic_id="topic-seed",
+                source_id=src.id,
+                title="Seed topic",
+                status="passed",
+                draft_id=draft_id,
+                language="en",
+            )
+        )
+        session.add(
+            CostRecord(
+                brand_id_fk=brand_id,
+                draft_id=draft_id,
+                provider="anthropic",
+                operation="completion",
+                cost_usd=0.0123,
+            )
+        )
+        session.add(
+            DraftApproval(
+                sanity_draft_id=draft_id,
+                brand_id_fk=brand_id,
+                status="rejected",
+                decided_by="admin",
+            )
+        )
+        session.commit()
+
+
+def _count_local_refs(draft_id: str) -> tuple[int, int, int]:
+    """(topics, cost_records, draft_approvals) still pointing at draft_id."""
+    factory = admin_db.get_session_factory()
+    with factory() as session:
+        topics = (
+            session.query(Topic).filter(Topic.draft_id == draft_id).count()
+        )
+        costs = (
+            session.query(CostRecord)
+            .filter(CostRecord.draft_id == draft_id)
+            .count()
+        )
+        approvals = (
+            session.query(DraftApproval)
+            .filter(DraftApproval.sanity_draft_id == draft_id)
+            .count()
+        )
+    return topics, costs, approvals
+
+
+def test_permanent_delete_purges_local_refs_for_rejected_doc(
     monkeypatch, client, icon_with_creds
 ) -> None:
-    """Hitting DELETE on an id Sanity has no record of → 404."""
+    """Delete of an existing rejected draft removes it from Sanity AND
+    snips every admin.db reference (IT_PROJ_NTS_062)."""
     bid = icon_with_creds
+    draft_id = "drafts.post-bye"
+    _seed_local_refs(bid, draft_id)
+    assert _count_local_refs(draft_id) == (1, 1, 1)
 
+    deleted: list[str] = []
+    from pipeline.publisher import sanity as sanity_mod
+
+    async def query_rejected(self, groq, params=None):  # noqa: ANN001
+        return {"_id": draft_id, "status": "rejected", "isDraft": True}
+
+    async def capture_delete(self, did):  # noqa: ANN001
+        deleted.append(did)
+
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", query_rejected)
+    monkeypatch.setattr(
+        sanity_mod.SanityPublisher, "delete_draft", capture_delete
+    )
+
+    resp = client.delete(
+        f"/api/v1/drafts/post-bye?brand_id={bid}", headers=AUTH
+    )
+    assert resp.status_code == 204
+    assert deleted == [draft_id]
+    # topics/cost_records keep the row but lose the dead pointer;
+    # the approval row is dropped entirely.
+    assert _count_local_refs(draft_id) == (0, 0, 0)
+
+
+def test_permanent_delete_is_idempotent_when_doc_missing(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """If Sanity already has no such doc, Delete is NOT an error: it skips
+    the Sanity mutation, still purges local refs, and returns 204
+    (idempotency — IT_PROJ_NTS_062)."""
+    bid = icon_with_creds
+    draft_id = "drafts.post-4670c339e90e"
+    _seed_local_refs(bid, draft_id)
+    assert _count_local_refs(draft_id) == (1, 1, 1)
+
+    deleted: list[str] = []
     from pipeline.publisher import sanity as sanity_mod
 
     async def query_empty(self, groq, params=None):  # noqa: ANN001
         return None
 
+    async def capture_delete(self, did):  # noqa: ANN001
+        deleted.append(did)
+
     monkeypatch.setattr(sanity_mod.SanityClient, "query", query_empty)
+    monkeypatch.setattr(
+        sanity_mod.SanityPublisher, "delete_draft", capture_delete
+    )
 
     resp = client.delete(
-        f"/api/v1/drafts/post-ghost?brand_id={bid}", headers=AUTH
+        f"/api/v1/drafts/post-4670c339e90e?brand_id={bid}", headers=AUTH
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 204
+    # No Sanity mutation attempted — the doc was already gone.
+    assert deleted == []
+    # Local refs cleaned up all the same.
+    assert _count_local_refs(draft_id) == (0, 0, 0)
+
+
+def test_get_deleted_draft_returns_404_not_500(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """GET on a draft Sanity no longer has → semantic 404, never a 500."""
+    bid = icon_with_creds
+    from pipeline.publisher import sanity as sanity_mod
+
+    async def query_gone(self, groq, params=None):  # noqa: ANN001
+        # Detail endpoint's combined GROQ — neither draft nor published.
+        return {"draft": None, "published": None}
+
+    monkeypatch.setattr(sanity_mod.SanityClient, "query", query_gone)
+
+    resp = client.get(
+        f"/api/v1/drafts/post-4670c339e90e?brand_id={bid}", headers=AUTH
+    )
+    assert resp.status_code == 404, resp.text
 
 
 def test_approve_all_siblings_publishes_each_and_reports_per_language(

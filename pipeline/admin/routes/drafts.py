@@ -5,11 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.orm import Session
 
 from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
-from pipeline.admin.models import Brand, CostRecord, DraftApproval
+from pipeline.admin.models import Brand, CostRecord, DraftApproval, Topic
 from pipeline.admin.schemas import (
     BatchApprovalOut,
     BatchApprovalResult,
@@ -42,6 +45,61 @@ def _normalise_draft_id(sanity_draft_id: str) -> str:
     if not sanity_draft_id.startswith("drafts."):
         return f"drafts.{sanity_draft_id}"
     return sanity_draft_id
+
+
+def purge_draft_local_refs(
+    session: Session, sanity_draft_id: str, brand_id: int
+) -> dict[str, int]:
+    """Remove every admin.db reference to ``sanity_draft_id`` for one brand.
+
+    IT_PROJ_NTS_062. The permanent-delete endpoint deleted the Sanity doc
+    but left the local pointers dangling, so a deleted draft lingered as
+    desync in three places. This unlinks all of them in a single session
+    (the caller's transaction), brand-scoped so we never touch another
+    brand's rows:
+
+      * ``topics.draft_id``        → NULL  (keep the run/topic history)
+      * ``cost_records.draft_id``  → NULL  (keep the historical spend)
+      * ``draft_approvals`` row    → DELETE (the audit decision now points
+        at a doc that no longer exists; ``sanity_draft_id`` is NOT NULL so
+        we drop the row rather than orphan it)
+
+    Idempotent: matches both the normalised ``drafts.<id>`` form and the
+    bare ``<id>`` form, and returns row counts so callers/backfill can
+    report exactly what was cleaned. ``cost_records`` and
+    ``draft_approvals`` are scoped by their brand FK; ``topics`` has no
+    direct brand column but a Sanity draft id is globally unique and owned
+    by exactly one brand, so matching on ``draft_id`` alone stays within
+    the brand by construction.
+    """
+    normalised = _normalise_draft_id(sanity_draft_id)
+    bare = normalised[len("drafts.") :]
+    id_forms = [normalised, bare]
+
+    topics_res = session.execute(
+        sa_update(Topic)
+        .where(Topic.draft_id.in_(id_forms))
+        .values(draft_id=None)
+    )
+    costs_res = session.execute(
+        sa_update(CostRecord)
+        .where(
+            CostRecord.draft_id.in_(id_forms),
+            CostRecord.brand_id_fk == brand_id,
+        )
+        .values(draft_id=None)
+    )
+    approvals_res = session.execute(
+        sa_delete(DraftApproval).where(
+            DraftApproval.sanity_draft_id.in_(id_forms),
+            DraftApproval.brand_id_fk == brand_id,
+        )
+    )
+    return {
+        "topics": topics_res.rowcount or 0,
+        "cost_records": costs_res.rowcount or 0,
+        "draft_approvals": approvals_res.rowcount or 0,
+    }
 
 
 def _approval_to_out(row: DraftApproval | None) -> DraftApprovalOut | None:
@@ -1103,7 +1161,14 @@ async def permanently_delete_draft(
     400 so an operator can't accidentally lose a pending or published
     document by hitting Delete in the wrong UI.
 
-    The local DraftApproval row is left in place as an audit trail.
+    Atomic + idempotent (IT_PROJ_NTS_062). A single Delete snips the doc
+    out of Sanity AND every local pointer to it (``topics.draft_id``,
+    ``cost_records.draft_id``, the ``draft_approvals`` audit row) so no
+    desync survives. If Sanity already has no such doc (already deleted,
+    or a stale UI hitting Delete twice) that is NOT an error: we skip the
+    Sanity mutation, still purge the local refs, and return 204. The local
+    cleanup is committed only after the Sanity side has settled, so we
+    never orphan the doc by failing the DB write first.
     """
     _ensure_brand_owns_draft(brand_id)
     normalised = _normalise_draft_id(sanity_draft_id)
@@ -1123,30 +1188,39 @@ async def permanently_delete_draft(
             detail=f"Sanity query failed: {type(exc).__name__}: {str(exc)[:200]}",
         ) from exc
 
-    if not isinstance(doc, dict) or not doc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"no document found for {normalised!r}",
-        )
-    if not doc.get("isDraft") or doc.get("status") != "rejected":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "refusing to delete: document is not in the rejected "
-                "state. Reject it first, then retry."
-            ),
-        )
+    doc_exists = isinstance(doc, dict) and bool(doc)
+    if doc_exists:
+        # Safety gate only applies to a doc that still exists: an operator
+        # must not lose a pending/published doc by mis-clicking Delete.
+        if not doc.get("isDraft") or doc.get("status") != "rejected":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "refusing to delete: document is not in the rejected "
+                    "state. Reject it first, then retry."
+                ),
+            )
 
-    from pipeline.publisher.sanity import SanityPublisher  # noqa: PLC0415
+        from pipeline.publisher.sanity import SanityPublisher  # noqa: PLC0415
 
-    publisher = SanityPublisher(client=sanity_client)
-    try:
-        await publisher.delete_draft(normalised)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=502,
-            detail=f"Sanity delete failed: {type(exc).__name__}: {str(exc)[:200]}",
-        ) from exc
+        publisher = SanityPublisher(client=sanity_client)
+        try:
+            await publisher.delete_draft(normalised)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502,
+                detail=f"Sanity delete failed: {type(exc).__name__}: {str(exc)[:200]}",
+            ) from exc
+    else:
+        # Idempotent path: Sanity has no such doc. Don't 404 — the caller
+        # wants this draft gone, and it already is on the Sanity side. Fall
+        # through to clean any local refs that outlived it.
+        log.info("draft.delete_already_absent_in_sanity", draft_id=normalised)
+
+    with session_scope() as session:
+        purged = purge_draft_local_refs(session, normalised, brand_id)
+    if any(purged.values()):
+        log.info("draft.local_refs_purged", draft_id=normalised, **purged)
     return None
 
 
