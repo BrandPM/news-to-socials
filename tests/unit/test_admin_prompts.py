@@ -201,30 +201,30 @@ _GOOD_ANALYSIS = {
 
 
 class _FakeUsage:
-    prompt_tokens = 800
-    completion_tokens = 200
+    # Responses API usage shape. output_tokens includes reasoning_tokens.
+    input_tokens = 800
+    output_tokens = 200
+    output_tokens_details = type("D", (), {"reasoning_tokens": 150})()
 
 
 class _FakeResp:
+    """Mimics the Responses API result (resp.output_text + resp.usage)."""
+
     def __init__(self, content: str) -> None:
-        message = type("M", (), {"content": content})()
-        self.choices = [type("C", (), {"message": message})()]
+        self.output_text = content
         self.usage = _FakeUsage()
 
 
 def _fake_openai_returning(content: str):
-    """Build a fake openai.AsyncOpenAI whose chat completion returns ``content``."""
+    """Build a fake openai.AsyncOpenAI whose responses.create returns ``content``."""
 
-    class _Completions:
+    class _Responses:
         async def create(self, **_kwargs):
             return _FakeResp(content)
 
-    class _Chat:
-        completions = _Completions()
-
     class _Client:
         def __init__(self, **_kwargs):
-            self.chat = _Chat()
+            self.responses = _Responses()
 
     return _Client
 
@@ -264,8 +264,37 @@ def test_analyze_returns_valid_json_and_writes_cost(
         rows = session.query(CostRecord).filter_by(operation="prompt_analysis").all()
     assert len(rows) == 1
     assert rows[0].brand_id_fk == icon_brand_id
-    assert rows[0].model == "gpt-4o"
+    assert rows[0].model == "gpt-5.5-2026-04-23"
     assert rows[0].cost_usd > 0
+
+
+def test_analyze_calls_gpt55_responses_api_with_high_effort(
+    monkeypatch, client, icon_brand_id, _openai_key
+) -> None:
+    """The analyze call targets gpt-5.5 via the Responses API at effort=high."""
+    import openai
+
+    captured: dict = {}
+
+    class _Responses:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return _FakeResp(json.dumps(_GOOD_ANALYSIS))
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            self.responses = _Responses()
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _Client)
+    pid = client.post("/api/v1/prompts", headers=AUTH, json=_payload(icon_brand_id)).json()["id"]
+
+    resp = client.post(f"/api/v1/prompts/{pid}/analyze", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    assert captured["model"] == "gpt-5.5-2026-04-23"
+    assert captured["reasoning"] == {"effort": "high"}
+    # Strict structured-output contract is enforced at the API layer.
+    assert captured["text"]["format"]["type"] == "json_schema"
+    assert captured["text"]["format"]["strict"] is True
 
 
 def test_analyze_malformed_llm_response_returns_422(

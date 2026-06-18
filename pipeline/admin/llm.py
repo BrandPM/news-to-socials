@@ -9,7 +9,7 @@ types and a thin gpt-4o-mini call for the rest.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass
@@ -34,29 +34,60 @@ class PromptAnalysisError(ValueError):
     model response never surfaces as a 500."""
 
 
-# System prompt for the reviewer. Kept terse and explicit about the JSON
-# contract — gpt-4o honours response_format=json_object, but we still
-# coerce + validate the shape because "valid JSON" != "our schema".
+# NTS_064 — Analyze runs on a top reasoning model (prompt review is
+# LLM-as-judge, quality over latency). Pinned snapshot so behaviour stays
+# stable; the structured-output schema enforces the wire contract at the
+# API layer, so the system prompt can stay high-level. Reasoning models do
+# their own thinking — no chain-of-thought / "think step by step" framing.
+_ANALYSIS_MODEL = "gpt-5.5-2026-04-23"
+_ANALYSIS_EFFORT: Literal["high"] = "high"
+# Generous output cap: at effort=high the reasoning tokens count against
+# this budget, so leave plenty of room above the (small) JSON answer.
+_ANALYSIS_MAX_OUTPUT_TOKENS = 8000
+# Backend-side request timeout (seconds). Below the proxy's maxDuration so
+# a slow call fails cleanly here instead of being killed mid-flight.
+_ANALYSIS_TIMEOUT_S = 180.0
+
 _ANALYZER_SYSTEM = (
-    "You are a senior prompt engineer reviewing a production LLM prompt "
-    "used in a news-to-social content pipeline. Critique the prompt the "
-    "user sends. Be concrete and specific to its wording — do not give "
-    "generic prompt-writing advice.\n\n"
-    "Pay special attention to INTERNAL CONTRADICTIONS: instructions that "
-    "fight each other and cause real downstream failures. A canonical "
-    "example: a prompt that asks for '## H2' markdown headings in the "
-    "article body while elsewhere forbidding markdown in the title can "
-    "leak '##' into the title field. Flag pairings like that.\n\n"
-    "Respond with a SINGLE JSON object and nothing else, with exactly "
-    "these keys:\n"
-    '  "strengths": array of short strings (what the prompt does well)\n'
-    '  "contradictions": array of objects, each with string keys '
-    '"issue", "why", "suggestion"\n'
-    '  "risks": array of short strings (failure modes / footguns)\n'
-    '  "summary": one short paragraph string\n\n'
-    "Every array may be empty but must be present. Do not wrap the JSON "
-    "in markdown fences."
+    "You are a senior prompt engineer doing a rigorous review of a "
+    "production LLM prompt used in a news-to-social content pipeline. "
+    "Judge the prompt the user provides: name its genuine strengths, find "
+    "internal contradictions, and list concrete risks. Internal "
+    "contradictions are instructions that fight each other and cause real "
+    "downstream failures — for example, requiring '## H2' markdown "
+    "headings in the article body while forbidding markdown in the title, "
+    "which leaks '##' into the title field. Be specific to this prompt's "
+    "actual wording; avoid generic prompt-writing advice. For each "
+    "contradiction give the issue, why it bites downstream, and a concrete "
+    "fix."
 )
+
+# Strict structured-output schema (Responses API text.format). Forces the
+# exact wire shape so a well-formed model reply always matches the
+# contract; _coerce_analysis stays as defence-in-depth for the 422 path.
+_ANALYSIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "contradictions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "issue": {"type": "string"},
+                    "why": {"type": "string"},
+                    "suggestion": {"type": "string"},
+                },
+                "required": ["issue", "why", "suggestion"],
+            },
+        },
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+    },
+    "required": ["strengths", "contradictions", "risks", "summary"],
+}
 
 
 def _coerce_analysis(raw: Any) -> tuple[list[str], list[dict[str, str]], list[str], str]:
@@ -118,6 +149,10 @@ async def run_prompt_analysis(
     import json as _json  # noqa: PLC0415
 
     import openai  # noqa: PLC0415
+    from openai.types.responses.response_text_config_param import (  # noqa: PLC0415
+        ResponseTextConfigParam,
+    )
+    from openai.types.shared_params import Reasoning  # noqa: PLC0415
 
     from pipeline.common.config import get_settings  # noqa: PLC0415
 
@@ -126,23 +161,40 @@ async def run_prompt_analysis(
         raise RuntimeError("OPENAI_API_KEY is not set; cannot run /prompts/analyze")
 
     client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
-    model = "gpt-4o"
+    model = _ANALYSIS_MODEL
     user_msg = (
         f"Prompt type: {prompt_type}\n\n"
         "--- PROMPT UNDER REVIEW ---\n"
         f"{prompt_content}\n"
         "--- END PROMPT ---"
     )
-    resp = await client.chat.completions.create(
+    # Responses API (gpt-5.5 is Responses-first): system goes in
+    # ``instructions``, the prompt under review in ``input``, reasoning
+    # effort high, strict JSON via ``text.format``. Params are annotated
+    # with the SDK TypedDicts so the literals type-check.
+    reasoning_param: Reasoning = {"effort": _ANALYSIS_EFFORT}
+    text_param: ResponseTextConfigParam = {
+        "format": {
+            "type": "json_schema",
+            "name": "prompt_analysis",
+            "schema": _ANALYSIS_SCHEMA,
+            "strict": True,
+        }
+    }
+    resp = await client.responses.create(
         model=model,
-        messages=[
-            {"role": "system", "content": _ANALYZER_SYSTEM},
-            {"role": "user", "content": user_msg},
-        ],
-        response_format={"type": "json_object"},
-        max_tokens=1200,
+        instructions=_ANALYZER_SYSTEM,
+        input=user_msg,
+        reasoning=reasoning_param,
+        text=text_param,
+        max_output_tokens=_ANALYSIS_MAX_OUTPUT_TOKENS,
+        timeout=_ANALYSIS_TIMEOUT_S,
     )
-    text = (resp.choices[0].message.content or "").strip()
+    text = (resp.output_text or "").strip()
+    if not text:
+        # Empty output usually means the reasoning budget was exhausted
+        # before any answer tokens — surface it as a 422, not a 500.
+        raise PromptAnalysisError("model returned an empty response")
 
     try:
         parsed = _json.loads(text)
@@ -151,12 +203,14 @@ async def run_prompt_analysis(
     strengths, contradictions, risks, summary = _coerce_analysis(parsed)
 
     # Cost recording mirrors run_prompt_test exactly (NTS_025 — shared
-    # pricing table so the Costs dashboard agrees with this figure).
+    # pricing table so the Costs dashboard agrees with this figure). On the
+    # Responses API reasoning tokens are part of ``output_tokens``, so the
+    # output rate already accounts for them.
     from pipeline.common.pricing import openai_cost  # noqa: PLC0415
 
     usage = getattr(resp, "usage", None)
-    tokens_in = getattr(usage, "prompt_tokens", None)
-    tokens_out = getattr(usage, "completion_tokens", None)
+    tokens_in = getattr(usage, "input_tokens", None)
+    tokens_out = getattr(usage, "output_tokens", None)
     cost = openai_cost(model, tokens_in, tokens_out)
 
     if brand_id_fk is not None:
