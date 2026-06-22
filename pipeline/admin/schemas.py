@@ -522,6 +522,22 @@ class BrandDetail(BaseModel):
         return _coerce_languages_out(v)
 
 
+class BannedByLanguageOut(BaseModel):
+    """Per-language banned phrases as stored in voice.<lang>.banned_phrases
+    (NTS_072). ``languages`` is the brand's roster (tab order for the editor);
+    ``banned`` maps each to its raw list (empty when none set yet)."""
+
+    languages: list[str]
+    banned: dict[str, list[str]]
+
+
+class BannedPhraseUpdateIn(BaseModel):
+    """Set one language's banned list. Only that language is touched."""
+
+    language: str
+    phrases: list[str]
+
+
 class BrandTestSanityOut(BaseModel):
     ok: bool
     error: str | None = None

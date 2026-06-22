@@ -33,6 +33,8 @@ from pipeline.admin.models import (
     Topic,
 )
 from pipeline.admin.schemas import (
+    BannedByLanguageOut,
+    BannedPhraseUpdateIn,
     BrandCloneForTestIn,
     BrandCloneForTestOut,
     BrandDetail,
@@ -221,6 +223,79 @@ def update_brand(brand_id: int, payload: BrandUpdate) -> BrandDetail:
         row.updated_at = datetime.now(tz=timezone.utc)
         session.flush()
         return _to_detail(row)
+
+
+def _brand_language_roster(row: Brand) -> list[str]:
+    """Decode ``brand.languages`` (JSON-as-TEXT) → ordered code list."""
+    import json as _json  # noqa: PLC0415
+
+    try:
+        decoded = _json.loads(row.languages or '["en"]')
+    except (ValueError, TypeError):
+        decoded = ["en"]
+    if not isinstance(decoded, list) or not decoded:
+        decoded = ["en"]
+    return [str(c) for c in decoded if isinstance(c, str)]
+
+
+@router.get("/{brand_id}/banned-phrases", response_model=BannedByLanguageOut)
+def get_banned_phrases(brand_id: int) -> BannedByLanguageOut:
+    """Per-language banned phrases from ``voice.<lang>.banned_phrases`` — the
+    lists generation actually uses (NTS_072), NOT the flat PipelineConfig
+    column the old Settings page edited."""
+    from pipeline.admin.voice_banned import read_banned_by_language  # noqa: PLC0415
+
+    with session_scope() as session:
+        row = session.get(Brand, brand_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="brand not found")
+        languages = _brand_language_roster(row)
+        banned = read_banned_by_language(row.voice_profile_yaml or "", languages)
+        return BannedByLanguageOut(languages=languages, banned=banned)
+
+
+@router.put("/{brand_id}/banned-phrases", response_model=BannedByLanguageOut)
+def update_banned_phrases(
+    brand_id: int, payload: BannedPhraseUpdateIn
+) -> BannedByLanguageOut:
+    """Set ONE language's banned list inside the voice profile, preserving the
+    other languages, voice_principles, topics_relevant, style_examples and
+    glossary. The prompt-source-of-truth (NTS_067, prompts table) is untouched;
+    parse_voice_guardrails picks the new list up on the next run."""
+    import yaml  # noqa: PLC0415
+
+    from pipeline.admin.voice_banned import (  # noqa: PLC0415
+        read_banned_by_language,
+        write_banned_for_language,
+    )
+
+    with session_scope() as session:
+        row = session.get(Brand, brand_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="brand not found")
+        languages = _brand_language_roster(row)
+        if payload.language not in languages:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"language {payload.language!r} not in brand roster "
+                    f"{languages}"
+                ),
+            )
+        try:
+            new_yaml = write_banned_for_language(
+                row.voice_profile_yaml or "", payload.language, payload.phrases
+            )
+        except yaml.YAMLError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"voice_profile_yaml is not valid YAML: {exc}",
+            ) from exc
+        row.voice_profile_yaml = new_yaml
+        row.updated_at = datetime.now(tz=timezone.utc)
+        session.flush()
+        banned = read_banned_by_language(new_yaml, languages)
+        return BannedByLanguageOut(languages=languages, banned=banned)
 
 
 @router.delete("/{brand_id}", status_code=status.HTTP_204_NO_CONTENT)
