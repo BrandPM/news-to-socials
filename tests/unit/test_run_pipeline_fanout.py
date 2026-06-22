@@ -159,6 +159,24 @@ def _mock_externals(monkeypatch, fail_for_language: str | None = None):
 
     monkeypatch.setattr(pipe, "generate_draft_for_language", fake_generate_draft)
 
+    # NTS_065: non-EN drafts now flow through translate_draft_for_language,
+    # which takes the canonical EN draft and returns its translation. The
+    # fake echoes the EN draft under the target language so the fanout
+    # count/shape assertions still hold; failure injection points here too.
+    async def fake_translate_draft(topic, brand, language, en_draft):
+        if fail_for_language is not None and language.value == fail_for_language:
+            raise RuntimeError(f"forced failure for {language.value}")
+        return Draft(
+            topic_id=en_draft.topic_id,
+            brand_id=en_draft.brand_id,
+            language=language,
+            title=en_draft.title,
+            body=en_draft.body,
+            key_takeaway=en_draft.key_takeaway,
+        )
+
+    monkeypatch.setattr(pipe, "translate_draft_for_language", fake_translate_draft)
+
     class FakeSanity:
         def __init__(self) -> None:
             self.created: list[dict] = []
@@ -279,6 +297,41 @@ def test_run_pipeline_fans_out_to_every_brand_language(
             by_topic_id.setdefault(t.topic_id, set()).add(t.language)
         for tid, langs in by_topic_id.items():
             assert langs == {"en", "ru", "uk", "pl"}, (tid, langs)
+
+
+def test_non_en_drafts_are_translations_of_the_canonical_en_draft(
+    fresh_admin_db_with_source, monkeypatch
+):
+    """NTS_065 core guarantee: every non-EN draft is produced by
+    translate_draft_for_language fed the EN draft for the same topic — NOT a
+    native generation from the topic. We capture the en_draft handed to the
+    translate seam and assert it is the EN-branch output."""
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    _set_brand_languages(icon_id, ["en", "ru", "uk", "pl"])
+    _mock_externals(monkeypatch)
+
+    from pipeline import run as pipe
+
+    translate_calls: list[tuple[str, str]] = []
+    real_translate = pipe.translate_draft_for_language
+
+    async def spy_translate(topic, brand, language, en_draft):
+        # The source must be the canonical EN draft for THIS topic.
+        translate_calls.append((language.value, en_draft.language.value))
+        assert en_draft.language == Language.en
+        assert en_draft.topic_id == topic.id
+        return await real_translate(topic, brand, language, en_draft)
+
+    monkeypatch.setattr(pipe, "translate_draft_for_language", spy_translate)
+
+    from pipeline.run import run_pipeline
+
+    asyncio.run(run_pipeline(brand_slug="icon", limit=1, dry_run=False))
+
+    # 1 topic × 3 non-EN languages = 3 translate calls, each from EN.
+    assert len(translate_calls) == 3
+    assert {c[0] for c in translate_calls} == {"ru", "uk", "pl"}
+    assert all(src == "en" for _, src in translate_calls)
 
 
 def test_run_pipeline_single_language_override_pins_to_one_branch(

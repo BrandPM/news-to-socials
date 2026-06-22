@@ -176,7 +176,7 @@ class Prompt(Base):
     __table_args__ = (
         CheckConstraint(
             "prompt_type IN ('writer_polish', 'writer_draft', "
-            "'topic_picker', 'image_prompt')",
+            "'topic_picker', 'image_prompt', 'writer_translate')",
             name="ck_prompts_prompt_type",
         ),
         # Spec § "prompts" partial UNIQUE: at most one active prompt per

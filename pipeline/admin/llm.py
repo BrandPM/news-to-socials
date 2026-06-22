@@ -291,7 +291,13 @@ async def run_prompt_test(
             + f"URL: {sample_topic['url']}\n"
         )
 
-    model = "gpt-4o" if prompt_type == "writer_polish" else "gpt-4o-mini"
+    # writer_polish + writer_translate exercise the gpt-4o-class prompt the
+    # pipeline really uses; the cheaper types stay on gpt-4o-mini.
+    model = (
+        "gpt-4o"
+        if prompt_type in ("writer_polish", "writer_translate")
+        else "gpt-4o-mini"
+    )
     resp = await client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": rendered}],
