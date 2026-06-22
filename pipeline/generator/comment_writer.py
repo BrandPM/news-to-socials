@@ -34,7 +34,7 @@ from ..common.config import get_settings
 from ..common.logging import get_logger
 from ..common.models import Draft, Language, Topic
 from ..common.retry import with_retry
-from .anti_ai_check import find_banned_phrase_hits, score_ai_tells
+from .anti_ai_check import close_lacks_anchor, find_banned_phrase_hits, score_ai_tells
 
 log = get_logger(__name__)
 
@@ -127,6 +127,17 @@ Language: {language}
 Audience: people in the brand's target segment, NOT general public.
 Length: 250-400 words.
 
+SPECIFICITY (mandatory — highest priority):
+* Every claim must be specific to THIS story — tied to a concrete fact,
+  number, named entity, or mechanism from the news peg above.
+* BAN any sentence that could be pasted into an article on a completely
+  different topic: vague intensifiers and generic risk/urgency statements.
+  Examples of the BANNED generic shape: "rising uncertainty creates
+  challenges", "could cause serious damage", "requires immediate decisions".
+  Replace each with the specific who / what / how-much from this story.
+* One concrete number or named entity per paragraph — not vague
+  intensifiers. Lead with a specific consequence, not a general framing.
+
 STRUCTURE REQUIREMENTS (mandatory — markdown headings, not bold):
 * Open with a 1-2 sentence lede paragraph that names the specific
   consequence, NOT a general framing. No heading on the lede.
@@ -134,8 +145,11 @@ STRUCTURE REQUIREMENTS (mandatory — markdown headings, not bold):
   substantive and describe the actual content
   (e.g. "## The repricing of mezzanine credit", NOT
   "## What this means" or "## Key takeaways").
-* End with a forward-looking close that names what changes for the
-  reader's next decision. No "in conclusion"-style restatement.
+* End with a forward-looking close that is ANCHORED to the article: it must
+  reference a specific named entity, number, or mechanism already mentioned
+  in the body, and state the concrete shift it creates for the reader's next
+  decision ON THIS topic. Do NOT end on a generic call-to-action or a tidy
+  restatement that would fit any article. No "in conclusion"-style wrap-up.
 * Source quotes ≤ 15 words. The piece is commentary, not a rewrite.
 
 Rules:
@@ -143,6 +157,10 @@ Rules:
 * Original perspective, not a summary of the article.
 * No filler phrases ("moreover", "furthermore", "it's important to note").
 * Em-dashes used sparingly.
+
+VOICE GUARDRAILS:
+* Banned phrases — do NOT use any of these (case-insensitive):
+{banned_phrases}
 
 TITLE FORMAT (mandatory): the title is PLAIN TEXT only — no markdown.
 Never start it with ``#`` or ``##``, never wrap it in ``**bold**`` or
@@ -161,14 +179,28 @@ Rewrite this draft to sound more natural and less AI-generated, preserving
 its meaning. Pay special attention to these tells found in the draft:
 {ai_tells}
 
+SPECIFICITY (mandatory — highest priority):
+* Every claim must stay specific to THIS story — tied to a concrete fact,
+  number, named entity, or mechanism from the draft. Cut or rewrite any
+  sentence that could be pasted into an article on a different topic (vague
+  intensifiers, generic risk/urgency statements). Examples of the BANNED
+  generic shape: "rising uncertainty creates challenges", "could cause
+  serious damage", "requires immediate decisions" — replace each with the
+  specific who / what / how-much already present in the draft.
+* Voice principles to enforce (from the brand profile):
+{voice_principles}
+
 STRUCTURE REQUIREMENTS (preserve / enforce — markdown, not bold):
 * The piece must open with a 1-2 sentence lede paragraph (no heading).
 * Then 2-3 H2 sections (`## Heading`). Substantive heading names that
   describe the section content, e.g. "## The repricing of mezzanine
   credit" — NEVER "## What this means", "## Conclusion", "## Key
   takeaways", "## Overview", or other content-free labels.
-* End with a forward-looking close: what changes for the reader's
-  next decision. No "in conclusion" restatement.
+* End with a forward-looking close ANCHORED to the article: it must
+  reference a specific named entity, number, or mechanism already in the
+  body and state the concrete shift for the reader's next decision ON THIS
+  topic. NOT a generic call-to-action or a restatement that fits any
+  article. No "in conclusion" restatement.
 * If the draft is one flat block, restructure it into lede + H2
   sections + close while keeping the meaning.
 
@@ -267,7 +299,56 @@ where ``body`` is markdown with the same H2 headings, translated into {language_
 """
 
 
+_GENERIC_CLOSE_RETRY_PROMPT = """\
+OUTPUT LANGUAGE: {language_name}. The rewrite must remain in {language_name}. Do NOT translate.
+
+The final paragraph of this piece reads as a GENERIC close — it does not
+reference any specific named entity, number, or mechanism from the body, so
+it would fit any article. Rewrite the piece so the CLOSING paragraph is
+anchored to THIS story: it must name a specific entity / number / mechanism
+already present in the body and state the concrete shift it creates for the
+reader's next decision. Do NOT introduce new facts, and do NOT change the
+meaning or structure of the rest of the piece (lede + 2-3 H2 sections + close).
+
+Draft:
+{draft_json}
+
+Return ONLY a JSON object in the same shape: {{"title": "...", "body": "...", "key_takeaway": "..."}}
+"""
+
+
 _BANNED_PHRASE_RETRY_THRESHOLD = 2
+
+# Placeholders a DB-stored prompt MUST contain (``required``) for the
+# generation path to trust it, and the full set it MAY reference
+# (``allowed`` = the kwargs we render with). A DB prompt that drops a
+# required placeholder or introduces an unknown one is rejected in favour of
+# the in-code fallback constant (see ``CommentWriter._resolve_template``) —
+# so a bad admin-UI edit degrades to the canonical prompt instead of breaking
+# generation with a KeyError.
+_REQUIRED_PLACEHOLDERS: dict[str, set[str]] = {
+    "writer_draft": {
+        "voice_profile_yaml",
+        "title",
+        "summary",
+        "language_name",
+        "banned_phrases",
+    },
+    "writer_polish": {
+        "ai_tells",
+        "banned_phrases",
+        "good_examples",
+        "voice_principles",
+        "draft_json",
+        "language_name",
+    },
+    "writer_translate": {
+        "draft_json",
+        "language_name",
+        "banned_phrases",
+        "good_examples",
+    },
+}
 
 
 def _bullet_list(items: list[str]) -> str:
@@ -368,16 +449,115 @@ def parse_voice_guardrails(
     return banned, good
 
 
+def parse_voice_principles(
+    voice_profile_yaml: str,
+    language: str | Language = Language.en,
+) -> list[str]:
+    """Extract ``voice_principles`` from the brand voice profile (NTS_067).
+
+    These ("one concrete number or named entity per paragraph, not vague
+    intensifiers", "lead with a specific consequence") were only ever
+    reaching the draft stage via the wholesale ``{voice_profile_yaml}`` dump;
+    the polish stage never saw them. We now parse them explicitly so polish
+    can enforce the same anti-generic discipline.
+
+    Precedence: per-language ``voice.<lang>.voice_principles`` if present,
+    else top-level ``voice_principles``. Missing / malformed → ``[]``.
+    """
+    try:
+        data = yaml.safe_load(voice_profile_yaml) or {}
+    except yaml.YAMLError as exc:
+        log.warning("comment_writer.voice_principles_parse_failed", err=str(exc))
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    lang_key = language.value if isinstance(language, Language) else str(language)
+    voice = data.get("voice")
+    if isinstance(voice, dict) and isinstance(voice.get(lang_key), dict):
+        per_lang = voice[lang_key].get("voice_principles")
+        if isinstance(per_lang, list) and per_lang:
+            return [str(p) for p in per_lang if p]
+
+    principles = data.get("voice_principles")
+    if isinstance(principles, list):
+        return [str(p) for p in principles if p]
+    return []
+
+
 class CommentWriter:
     def __init__(
         self,
         client: AsyncOpenAI | None = None,
         draft_model: str = "gpt-4o-mini",
         polish_model: str = "gpt-4o",
+        brand_id_fk: int | None = None,
     ) -> None:
         self.client = client or AsyncOpenAI(api_key=get_settings().openai_api_key)
         self.draft_model = draft_model
         self.polish_model = polish_model
+        # NTS_067: when set, draft/polish/translate prompts are sourced from
+        # the brand's ACTIVE row in the ``prompts`` table (so admin-UI edits
+        # drive generation), with the in-code constant as a safe fallback.
+        # When None (tests, ad-hoc), the constant is always used.
+        self.brand_id_fk = brand_id_fk
+
+    def _resolve_template(
+        self, prompt_type: str, fallback: str, render_kwargs: dict[str, Any]
+    ) -> str:
+        """Return the prompt template to render: the brand's ACTIVE DB row
+        when present and safe, else the in-code ``fallback`` constant.
+
+        Safety (NTS_067): the DB template is used only if every placeholder it
+        references is one we supply (``render_kwargs``) AND it still contains
+        the required placeholders for its type. A drifted/broken admin-UI edit
+        therefore degrades to the canonical constant instead of raising a
+        ``KeyError`` mid-generation. Any DB/lookup error also falls back.
+        """
+        if self.brand_id_fk is None:
+            return fallback
+        try:
+            import string  # noqa: PLC0415
+
+            from sqlalchemy import select  # noqa: PLC0415
+
+            from pipeline.admin import db as admin_db  # noqa: PLC0415
+            from pipeline.admin.models import Prompt  # noqa: PLC0415
+
+            factory = admin_db.get_session_factory()
+            with factory() as session:
+                row = session.scalars(
+                    select(Prompt).where(
+                        Prompt.brand_id_fk == self.brand_id_fk,
+                        Prompt.prompt_type == prompt_type,
+                        Prompt.is_active.is_(True),
+                    )
+                ).first()
+            if row is None or not row.content:
+                return fallback
+            fields = {
+                fname
+                for _, fname, _, _ in string.Formatter().parse(row.content)
+                if fname
+            }
+            allowed = set(render_kwargs)
+            required = _REQUIRED_PLACEHOLDERS.get(prompt_type, set())
+            if not (required <= fields <= allowed):
+                log.warning(
+                    "comment_writer.db_prompt_rejected",
+                    prompt_type=prompt_type,
+                    missing_required=sorted(required - fields),
+                    unknown_placeholders=sorted(fields - allowed),
+                )
+                return fallback
+            return row.content
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "comment_writer.db_prompt_resolve_failed",
+                prompt_type=prompt_type,
+                err=str(exc),
+            )
+            return fallback
 
     async def write(
         self,
@@ -388,17 +568,18 @@ class CommentWriter:
         banned_phrases, good_examples = parse_voice_guardrails(
             voice_profile_yaml, language
         )
+        voice_principles = parse_voice_principles(voice_profile_yaml, language)
 
-        # --- Stage 1: draft ---
-        draft = await self._draft(topic, voice_profile_yaml, language)
+        # --- Stage 1: draft (banned phrases injected here too — NTS_067) ---
+        draft = await self._draft(topic, voice_profile_yaml, language, banned_phrases)
 
         # --- Anti-AI check ---
         score, tells = score_ai_tells(draft.body)
         log.info("comment_writer.draft_ai_score", topic=topic.id, score=score, tells=tells)
 
-        # --- Stage 2: polish (always; injects voice guardrails) ---
+        # --- Stage 2: polish (always; injects voice guardrails + principles) ---
         polished = await self._polish(
-            draft, tells, banned_phrases, good_examples, language
+            draft, tells, banned_phrases, good_examples, language, voice_principles
         )
 
         # --- Banned-phrase retry (one extra pass, cap to avoid runaways) ---
@@ -417,6 +598,19 @@ class CommentWriter:
                 "comment_writer.banned_phrase_retry_done",
                 topic=topic.id,
                 remaining=remaining,
+            )
+
+        # --- Generic-close retry (NTS_067; EN canon only, one extra pass) ---
+        # If the closing paragraph cites no number/named-entity from the body,
+        # it's a topic-agnostic CTA — re-anchor it once. Gated to English: the
+        # heuristic is EN-oriented, and non-EN goes through translate() anyway.
+        if language == Language.en and close_lacks_anchor(polished.body):
+            log.info("comment_writer.generic_close_retry", topic=topic.id)
+            polished = await self._retry_for_generic_close(polished, language)
+            log.info(
+                "comment_writer.generic_close_retry_done",
+                topic=topic.id,
+                still_generic=close_lacks_anchor(polished.body),
             )
 
         return Draft(
@@ -493,12 +687,14 @@ class CommentWriter:
         banned_phrases: list[str],
         good_examples: list[str],
     ) -> _DraftJSON:
-        prompt = _TRANSLATE_PROMPT.format(
-            language_name=_language_name(language),
-            banned_phrases=_bullet_list(banned_phrases) or "  (none specified)",
-            good_examples=_bullet_list(good_examples) or "  (none specified)",
-            draft_json=draft.model_dump_json(),
-        )
+        kwargs = {
+            "language_name": _language_name(language),
+            "banned_phrases": _bullet_list(banned_phrases) or "  (none specified)",
+            "good_examples": _bullet_list(good_examples) or "  (none specified)",
+            "draft_json": draft.model_dump_json(),
+        }
+        template = self._resolve_template("writer_translate", _TRANSLATE_PROMPT, kwargs)
+        prompt = template.format(**kwargs)
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
             max_tokens=2000,
@@ -510,16 +706,23 @@ class CommentWriter:
 
     @with_retry()
     async def _draft(
-        self, topic: Topic, voice_profile_yaml: str, language: Language
+        self,
+        topic: Topic,
+        voice_profile_yaml: str,
+        language: Language,
+        banned_phrases: list[str] | None = None,
     ) -> _DraftJSON:
-        prompt = _DRAFT_PROMPT.format(
-            voice_profile_yaml=voice_profile_yaml,
-            title=topic.raw.title,
-            url=topic.raw.url,
-            summary=topic.raw.summary[:1000],
-            language=language.value,
-            language_name=_language_name(language),
-        )
+        kwargs = {
+            "voice_profile_yaml": voice_profile_yaml,
+            "title": topic.raw.title,
+            "url": topic.raw.url,
+            "summary": topic.raw.summary[:1000],
+            "language": language.value,
+            "language_name": _language_name(language),
+            "banned_phrases": _bullet_list(banned_phrases or []) or "  (none specified)",
+        }
+        template = self._resolve_template("writer_draft", _DRAFT_PROMPT, kwargs)
+        prompt = template.format(**kwargs)
         resp = await self.client.chat.completions.create(
             model=self.draft_model,
             max_tokens=1500,
@@ -537,14 +740,19 @@ class CommentWriter:
         banned_phrases: list[str],
         good_examples: list[str],
         language: Language = Language.en,
+        voice_principles: list[str] | None = None,
     ) -> _DraftJSON:
-        prompt = _POLISH_PROMPT.format(
-            ai_tells=", ".join(ai_tells) if ai_tells else "no specific tells noted",
-            banned_phrases=_bullet_list(banned_phrases) or "  (none specified)",
-            good_examples=_bullet_list(good_examples) or "  (none specified)",
-            draft_json=draft.model_dump_json(),
-            language_name=_language_name(language),
-        )
+        kwargs = {
+            "ai_tells": ", ".join(ai_tells) if ai_tells else "no specific tells noted",
+            "banned_phrases": _bullet_list(banned_phrases) or "  (none specified)",
+            "good_examples": _bullet_list(good_examples) or "  (none specified)",
+            "voice_principles": _bullet_list(voice_principles or [])
+            or "  (none specified)",
+            "draft_json": draft.model_dump_json(),
+            "language_name": _language_name(language),
+        }
+        template = self._resolve_template("writer_polish", _POLISH_PROMPT, kwargs)
+        prompt = template.format(**kwargs)
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
             max_tokens=1500,
@@ -552,6 +760,29 @@ class CommentWriter:
             messages=[{"role": "user", "content": prompt}],
         )
         _record_openai_cost(resp, model=self.polish_model, operation="polish")
+        return self._parse(resp.choices[0].message.content or "{}")
+
+    @with_retry()
+    async def _retry_for_generic_close(
+        self, draft: _DraftJSON, language: Language
+    ) -> _DraftJSON:
+        """One extra pass to re-anchor a generic closing paragraph (NTS_067).
+
+        Uses the in-code retry prompt (not a versioned prompt_type) — it's an
+        internal guard, not an operator-tunable template."""
+        prompt = _GENERIC_CLOSE_RETRY_PROMPT.format(
+            language_name=_language_name(language),
+            draft_json=draft.model_dump_json(),
+        )
+        resp = await self.client.chat.completions.create(
+            model=self.polish_model,
+            max_tokens=1500,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        _record_openai_cost(
+            resp, model=self.polish_model, operation="generic_close_retry"
+        )
         return self._parse(resp.choices[0].message.content or "{}")
 
     @with_retry()

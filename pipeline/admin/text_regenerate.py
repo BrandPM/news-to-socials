@@ -56,6 +56,7 @@ async def regenerate_draft_text(
         CommentWriter,
         _DraftJSON,
         parse_voice_guardrails,
+        parse_voice_principles,
     )
     from pipeline.publisher.sanity import SanityClient  # noqa: PLC0415
 
@@ -116,11 +117,17 @@ async def regenerate_draft_text(
         banned_phrases, good_examples = parse_voice_guardrails(
             voice_profile_yaml, Language.en
         )
-        writer = CommentWriter()
+        voice_principles = parse_voice_principles(voice_profile_yaml, Language.en)
+        writer = CommentWriter(brand_id_fk=brand_id_fk)
         pre_draft = _DraftJSON(title=title, body=body_md, key_takeaway=key_takeaway)
         with cost_context(ctx):
             result = await writer._polish(  # noqa: SLF001
-                pre_draft, tells, banned_phrases, good_examples, Language.en
+                pre_draft,
+                tells,
+                banned_phrases,
+                good_examples,
+                Language.en,
+                voice_principles,
             )
         new_title, new_body, new_kt = result.title, result.body, result.key_takeaway
     else:
@@ -132,7 +139,7 @@ async def regenerate_draft_text(
                 "English source can't be located — cannot translate."
             )
         en_draft = await _load_en_source(client, str(topic_id), brand_id_fk)
-        writer = CommentWriter()
+        writer = CommentWriter(brand_id_fk=brand_id_fk)
         with cost_context(ctx):
             translated = await writer.translate(
                 en_draft, language, voice_profile_yaml
