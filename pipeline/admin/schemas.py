@@ -255,6 +255,9 @@ class RunOut(BaseModel):
     stats: dict[str, Any] | None
     log_excerpt: str | None
     languages_completed: list[str] = []
+    # NTS_068 — live run progress {sources_total, sources_done, current_source,
+    # drafts, errors, stage}. Empty dict when the run predates the column.
+    progress: dict[str, Any] = {}
 
     @field_validator("source_ids", mode="before")
     @classmethod
@@ -269,6 +272,19 @@ class RunOut(BaseModel):
         if isinstance(v, str):
             return json.loads(v) if v else None
         return v
+
+    @field_validator("progress", mode="before")
+    @classmethod
+    def _parse_progress(cls, v: Any) -> Any:
+        if v is None or v == "":
+            return {}
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+            except (ValueError, TypeError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return v if isinstance(v, dict) else {}
 
     @field_validator("languages_completed", mode="before")
     @classmethod
