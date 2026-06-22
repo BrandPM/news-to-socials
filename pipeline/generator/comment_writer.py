@@ -216,6 +216,57 @@ Return ONLY a JSON object in the same shape: {{"title": "...", "body": "...", "k
 """
 
 
+_TRANSLATE_PROMPT = """\
+OUTPUT LANGUAGE: {language_name}. Write the title, body, and key takeaway
+in {language_name} only.
+
+You are a faithful translator. Translate the English article below into
+{language_name}. This is a TRANSLATION, not a rewrite and not a new piece
+of writing. The English version is canonical and authoritative.
+
+ABSOLUTE FIDELITY RULES (highest priority — override everything else):
+* Do NOT invent, add, or introduce ANY fact, statistic, percentage,
+  figure, date, name, or claim that is not present in the English source.
+* Do NOT drop or omit any fact, number, or claim that IS present.
+* Every number, percentage, currency amount and proper noun must appear in
+  the translation with the SAME numeric value (e.g. "67%" stays "67%",
+  "$2.4m" stays "$2.4m"). Localise only the surrounding words, never the
+  figures themselves.
+* Preserve the EXACT structure: the same opening lede paragraph (no
+  heading), the SAME number of H2 sections in the SAME order, and the same
+  forward-looking closing paragraph. Each `## Heading` in the source must
+  become exactly one `## Heading` in the translation (translated text,
+  still an H2). Do not add, merge, split, or reorder sections.
+* Keep a comparable length — within roughly ±15% of the source. Do not
+  expand with commentary or compress by summarising.
+* Source quotes stay quotes; do not paraphrase a quote into a new claim.
+
+LOCALISATION (lower priority — apply only without violating the rules above):
+* Make the {language_name} read naturally and idiomatically — this is the
+  ONLY thing the voice guardrails below are for. They license you to choose
+  natural phrasing, NOT to add, drop, or alter facts.
+* Glossary: keep established domain terms per the brand glossary (e.g.
+  "family office" is rendered per glossary, not literally translated). When
+  in doubt, prefer the recognised industry term in {language_name}.
+* Voice guardrails — avoid these banned phrases / their direct calques
+  where a natural alternative exists, but NEVER reword in a way that changes
+  meaning or drops a fact just to dodge a phrase:
+{banned_phrases}
+* Register / cadence to mirror:
+{good_examples}
+
+TITLE FORMAT (mandatory): translate the title into {language_name}. The
+title is PLAIN TEXT only — no markdown, no leading ``#``/``##``, no
+``**bold**`` or backticks. Markdown (the H2 headings) belongs in ``body``.
+
+English source article (JSON):
+{draft_json}
+
+Return ONLY a JSON object in the same shape: {{"title": "...", "body": "...", "key_takeaway": "..."}}
+where ``body`` is markdown with the same H2 headings, translated into {language_name}.
+"""
+
+
 _BANNED_PHRASE_RETRY_THRESHOLD = 2
 
 
@@ -376,6 +427,86 @@ class CommentWriter:
             body=polished.body,
             key_takeaway=polished.key_takeaway,
         )
+
+    async def translate(
+        self,
+        en_draft: Draft,
+        language: Language,
+        voice_profile_yaml: str,
+    ) -> Draft:
+        """Translate a finished EN draft into ``language`` (NTS_065).
+
+        The EN draft is canonical. Non-EN languages are an exact, faithful
+        translation of it — same structure (H2 set), same facts and
+        numbers, comparable length — NOT a fresh native generation from the
+        topic. This is the whole point of the NTS_065 rework: native
+        per-language generation drifted in structure/length and invented
+        facts (e.g. a "67% of clients" stat in RU that EN never had).
+
+        ``voice_profile`` / ``banned_phrases`` for the target language are
+        applied ONLY as phrasing localisation (naturalness + glossary), not
+        as licence to add or drop content — that constraint lives in the
+        prompt and is the reason we do NOT run the banned-phrase rewrite
+        loop here (it could shed facts).
+        """
+        if language == Language.en:
+            raise ValueError(
+                "translate() is for non-EN targets; EN is the canonical "
+                "source and is produced by write()"
+            )
+        banned_phrases, good_examples = parse_voice_guardrails(
+            voice_profile_yaml, language
+        )
+        source = _DraftJSON(
+            title=en_draft.title,
+            body=en_draft.body,
+            key_takeaway=en_draft.key_takeaway,
+        )
+        translated = await self._translate(
+            source, language, banned_phrases, good_examples
+        )
+        # Log (don't rewrite) any banned-phrase hits — a faithful
+        # translation must not shed facts to dodge a cliché, so we surface
+        # them for review instead of triggering the aggressive retry loop.
+        hits = find_banned_phrase_hits(translated.body, banned_phrases)
+        if hits:
+            log.info(
+                "comment_writer.translate_banned_hits",
+                topic=en_draft.topic_id,
+                language=language.value,
+                hits=hits,
+            )
+        return Draft(
+            topic_id=en_draft.topic_id,
+            brand_id=en_draft.brand_id,
+            language=language,
+            title=translated.title,
+            body=translated.body,
+            key_takeaway=translated.key_takeaway,
+        )
+
+    @with_retry()
+    async def _translate(
+        self,
+        draft: _DraftJSON,
+        language: Language,
+        banned_phrases: list[str],
+        good_examples: list[str],
+    ) -> _DraftJSON:
+        prompt = _TRANSLATE_PROMPT.format(
+            language_name=_language_name(language),
+            banned_phrases=_bullet_list(banned_phrases) or "  (none specified)",
+            good_examples=_bullet_list(good_examples) or "  (none specified)",
+            draft_json=draft.model_dump_json(),
+        )
+        resp = await self.client.chat.completions.create(
+            model=self.polish_model,
+            max_tokens=2000,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        _record_openai_cost(resp, model=self.polish_model, operation="translate")
+        return self._parse(resp.choices[0].message.content or "{}")
 
     @with_retry()
     async def _draft(

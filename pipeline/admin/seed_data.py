@@ -125,6 +125,14 @@ def get_active_draft_prompt() -> tuple[str, str]:
     return ("v1.1 — H2 structure (IT_PROJ_NTS_013)", _DRAFT_PROMPT)
 
 
+def get_active_translate_prompt() -> tuple[str, str]:
+    """Return ``(version_name, content)`` for the active writer_translate
+    prompt — the NTS_065 faithful EN→target translation template."""
+    from pipeline.generator.comment_writer import _TRANSLATE_PROMPT  # noqa: PLC0415
+
+    return ("v1.0 — faithful EN→target translation (NTS_065)", _TRANSLATE_PROMPT)
+
+
 # Pipeline config defaults — match icon_brand_config() at seed time.
 ICON_SEED_THRESHOLD = 7
 ICON_SEED_TOPICS_PER_RUN = 3

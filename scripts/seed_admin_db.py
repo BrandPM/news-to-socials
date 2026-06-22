@@ -169,6 +169,7 @@ def _seed_prompts(session: Session, brand_id_fk: int) -> tuple[list[str], list[s
     targets = [
         ("writer_polish", seed_data.get_active_polish_prompt()),
         ("writer_draft", seed_data.get_active_draft_prompt()),
+        ("writer_translate", seed_data.get_active_translate_prompt()),
     ]
     for ptype, (version_name, content) in targets:
         existing = session.execute(

@@ -393,10 +393,43 @@ async def generate_draft_for_language(
     brand: BrandConfig,
     language: Language,
 ) -> Draft:
-    """Generate the per-language post text. No image work — that's hoisted
-    above this call in the orchestrator (see :func:`generate_image_for_topic`)."""
+    """Generate the CANONICAL draft for ``language`` natively from the topic.
+
+    Post-NTS_065 this is used for the canonical (English) draft only — see
+    :func:`translate_draft_for_language` for the non-EN path. Kept on this
+    name + signature because it's the seam the fanout tests monkeypatch.
+    No image work — that's hoisted above this call in the orchestrator
+    (see :func:`generate_image_for_topic`)."""
     writer = CommentWriter()
     return await writer.write(topic, brand.voice_profile_yaml, language)
+
+
+async def translate_draft_for_language(
+    topic: Topic,  # kept for a uniform seam with generate_draft_for_language
+    brand: BrandConfig,
+    language: Language,
+    en_draft: Draft,
+) -> Draft:
+    """Produce the non-EN draft as a faithful TRANSLATION of ``en_draft``.
+
+    NTS_065 rework: non-EN languages are no longer generated natively from
+    the topic (which drifted in structure/length and invented facts). They
+    are an exact translation of the canonical English draft — same H2 set,
+    same facts/numbers, comparable length — with the target language's
+    voice profile applied only as phrasing localisation. Separate seam from
+    :func:`generate_draft_for_language` so tests can stub each independently."""
+    writer = CommentWriter()
+    return await writer.translate(en_draft, language, brand.voice_profile_yaml)
+
+
+def _order_languages_en_first(languages: list[Language]) -> list[Language]:
+    """Return ``languages`` with English first so the canonical EN draft is
+    produced before any translation that depends on it. Order of the
+    remaining languages is preserved."""
+    rest: list[Language] = [lang for lang in languages if lang != Language.en]
+    if Language.en in languages:
+        return [Language.en, *rest]
+    return rest
 
 
 # --------------------------------------------------------------------------
@@ -569,7 +602,12 @@ async def _process_source(
             category = "special"
 
         # ---- DRAFTS: once per (topic, language).
-        for language in languages:
+        # NTS_065: English is canonical and generated FIRST; every non-EN
+        # language is a faithful translation of that EN draft, not a fresh
+        # native generation. ``en_draft`` caches the canonical text for the
+        # topic so the translate branches reuse it.
+        en_draft: Draft | None = None
+        for language in _order_languages_en_first(languages):
             languages_attempted.add(language.value)
             try:
                 # Per-language dedup, two-tier (was inside dedup_filter):
@@ -603,7 +641,24 @@ async def _process_source(
                     set(topic.entities),
                 )
 
-                draft = await generate_draft_for_language(topic, brand, language)
+                if language == Language.en:
+                    draft = await generate_draft_for_language(
+                        topic, brand, Language.en
+                    )
+                    en_draft = draft
+                else:
+                    # Non-EN = translation of the canonical EN draft. If EN
+                    # wasn't produced yet (e.g. EN was a dedup hit, or this
+                    # run only targets a non-EN language), generate the
+                    # canonical EN now as the translation source — it is NOT
+                    # published, it only feeds the translation.
+                    if en_draft is None:
+                        en_draft = await generate_draft_for_language(
+                            topic, brand, Language.en
+                        )
+                    draft = await translate_draft_for_language(
+                        topic, brand, language, en_draft
+                    )
 
                 post = SanityPostInput(
                     title=draft.title,

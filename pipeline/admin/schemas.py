@@ -24,7 +24,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 SourceType = Literal["rss", "web", "telegram"]
-PromptType = Literal["writer_polish", "writer_draft", "topic_picker", "image_prompt"]
+PromptType = Literal[
+    "writer_polish", "writer_draft", "topic_picker", "image_prompt", "writer_translate"
+]
 RunStatus = Literal["running", "success", "failed", "dry_run"]
 TopicStatus = Literal[
     "passed", "filtered_banned", "filtered_dup", "filtered_score", "failed"
