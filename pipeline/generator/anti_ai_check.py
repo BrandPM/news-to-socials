@@ -37,6 +37,70 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _LONG_SENT_WORDS = 30
 
 
+# --- Generic-close detector (NTS_067) -------------------------------------
+# A "watery" close is one that names nothing from the article — it would fit
+# any topic. We flag a close that shares NO number and NO named entity (proper
+# noun) with the rest of the body. EN-oriented heuristic; the caller gates it
+# to English. Capitalised common/sentence-initial words are excluded so a
+# leading "The"/"This" isn't mistaken for a named entity.
+_PROPER_NOUN_RE = re.compile(r"[A-Z][A-Za-z][A-Za-z'’\-]+")  # noqa: RUF001 — ’ intentional (O’Brien)
+_CLOSE_STOPWORDS = frozenset(
+    {
+        "the", "this", "that", "these", "those", "their", "there", "they",
+        "with", "from", "into", "when", "where", "what", "which", "while",
+        "after", "before", "because", "however", "although", "moreover",
+        "furthermore", "and", "but", "for", "not", "its", "our", "his", "her",
+        "your", "you", "she", "now", "yet", "still", "then",
+        "here", "over", "under", "about", "across", "every", "each", "some",
+        "many", "most", "more", "less", "such", "only", "also", "even",
+    }
+)
+
+
+def _content_paragraphs(body: str) -> list[str]:
+    """Non-empty, non-heading paragraphs in markdown reading order."""
+    return [
+        p.strip()
+        for p in (body or "").split("\n\n")
+        if p.strip() and not p.strip().startswith("#")
+    ]
+
+
+def _proper_nouns(text: str) -> set[str]:
+    return {
+        w.lower()
+        for w in _PROPER_NOUN_RE.findall(text or "")
+        if len(w) >= 3 and w.lower() not in _CLOSE_STOPWORDS
+    }
+
+
+def close_lacks_anchor(body: str) -> bool:
+    """True if the closing paragraph is a generic, topic-agnostic close.
+
+    "Generic" == it shares no number and no named entity with the rest of the
+    body, even though the body HAS such anchors. Returns ``False`` (don't
+    flag) when there's nothing to anchor to (no body anchors, or fewer than
+    two content paragraphs) — the problem there is upstream, not the close.
+    """
+    from .translation_check import extract_number_cores  # noqa: PLC0415
+
+    paras = _content_paragraphs(body)
+    if len(paras) < 2:
+        return False
+    close = paras[-1]
+    rest = "\n\n".join(paras[:-1])
+
+    rest_nums = set(extract_number_cores(rest))
+    rest_ents = _proper_nouns(rest)
+    if not rest_nums and not rest_ents:
+        return False  # nothing concrete in the body to anchor the close to
+
+    close_nums = set(extract_number_cores(close))
+    close_ents = _proper_nouns(close)
+    # Anchored iff the close shares a number or named entity with the body.
+    return not ((close_nums & rest_nums) or (close_ents & rest_ents))
+
+
 def find_banned_phrase_hits(text: str, banned_phrases: list[str]) -> list[str]:
     """Return the subset of ``banned_phrases`` that appear in ``text``.
 

@@ -37,7 +37,6 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
 import numpy as np
 import openai
 import typer
@@ -56,13 +55,11 @@ from pipeline.generator.image import BrandVisual, ImageGenerator
 from pipeline.generator.image_resizer import fetch_master, resize_for_channel
 from pipeline.publisher.sanity import (
     SanityCategoryMapping,
-    SanityClient,
     SanityPostInput,
     SanityPublisher,
 )
 from pipeline.selector.dedup import DedupConfig, Deduper, extract_entities
 from pipeline.selector.topic_picker import BrandContext, TopicPicker
-from pipeline.sources import REGISTRY
 from pipeline.sources.base import Source
 
 log = get_logger(__name__)
@@ -90,6 +87,9 @@ class BrandConfig:
     visual: BrandVisual
     context: BrandContext
     categories: SanityCategoryMapping
+    # NTS_067: brand PK, so CommentWriter can source the ACTIVE prompt row
+    # from the prompts table for this brand. None → use in-code constants.
+    id_fk: int | None = None
 
 
 def icon_brand_config() -> BrandConfig:
@@ -216,7 +216,6 @@ def load_source_by_id(source_id: str, source_url: str | None = None) -> Source:
 
     Later we'll load from sources-v0.yaml.
     """
-    from pipeline.common.models import SourceType
     from pipeline.sources.rss import RssSource
 
     # For now, force RSS; the dispatch table is in REGISTRY for real Stage 6 use.
@@ -400,7 +399,7 @@ async def generate_draft_for_language(
     name + signature because it's the seam the fanout tests monkeypatch.
     No image work — that's hoisted above this call in the orchestrator
     (see :func:`generate_image_for_topic`)."""
-    writer = CommentWriter()
+    writer = CommentWriter(brand_id_fk=brand.id_fk)
     return await writer.write(topic, brand.voice_profile_yaml, language)
 
 
@@ -418,7 +417,7 @@ async def translate_draft_for_language(
     same facts/numbers, comparable length — with the target language's
     voice profile applied only as phrasing localisation. Separate seam from
     :func:`generate_draft_for_language` so tests can stub each independently."""
-    writer = CommentWriter()
+    writer = CommentWriter(brand_id_fk=brand.id_fk)
     return await writer.translate(en_draft, language, brand.voice_profile_yaml)
 
 
@@ -884,6 +883,7 @@ async def run_pipeline(
         visual=brand.visual,
         context=brand.context,
         categories=brand.categories,
+        id_fk=brand_row.id,
     )
 
     brand_id_fk = brand_row.id
@@ -1059,13 +1059,13 @@ async def run_pipeline_for_run(run_id: int) -> None:
     the run row, then delegates to :func:`run_pipeline` with
     ``existing_run_id`` set so we don't double-record.
     """
-    from pipeline.admin.config_client import AdminConfigClient  # noqa: PLC0415
-
     # Resolve brand slug from the existing run row so the client uses the
     # right brand context. Step 4 switches AdminConfigClient to take the
     # brand_id_fk directly.
     from pipeline.admin import db as admin_db_mod  # noqa: PLC0415
-    from pipeline.admin.models import Brand as BrandModel, Run as RunModel  # noqa: PLC0415
+    from pipeline.admin.config_client import AdminConfigClient  # noqa: PLC0415
+    from pipeline.admin.models import Brand as BrandModel  # noqa: PLC0415
+    from pipeline.admin.models import Run as RunModel
 
     factory = admin_db_mod.get_session_factory()
     with factory() as session:
