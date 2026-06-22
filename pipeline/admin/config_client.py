@@ -428,6 +428,73 @@ class AdminConfigClient:
                 row.languages_completed = json.dumps(current)
                 session.commit()
 
+    # --- live run progress (NTS_068) ------------------------------------
+
+    def update_run_progress(self, run_id: int | None, **fields: Any) -> None:
+        """Merge ``fields`` into ``runs.progress`` (JSON). Best-effort: any
+        failure is swallowed so progress reporting never breaks a run.
+
+        ``None`` values are skipped so callers can pass only what changed."""
+        if run_id is None:
+            return
+        try:
+            factory = admin_db.get_session_factory()
+            with factory() as session:
+                row = session.get(Run, run_id)
+                if row is None:
+                    return
+                try:
+                    current = json.loads(row.progress or "{}")
+                    if not isinstance(current, dict):
+                        current = {}
+                except (ValueError, TypeError):
+                    current = {}
+                current.update({k: v for k, v in fields.items() if v is not None})
+                row.progress = json.dumps(current)
+                session.commit()
+        except Exception:  # noqa: BLE001 — progress is never load-bearing
+            pass
+
+    def set_run_running(
+        self, run_id: int | None, stats: dict[str, Any] | None = None
+    ) -> None:
+        """Re-assert a run as ``running`` (clearing ``finished_at``).
+
+        ``run_pipeline_for_run`` calls this between sources: each per-source
+        ``run_pipeline`` finalises the shared run row, which would otherwise
+        flip the status to terminal mid-fanout and make the global indicator
+        read "completed" seconds into a multi-source pass."""
+        if run_id is None:
+            return
+        try:
+            factory = admin_db.get_session_factory()
+            with factory() as session:
+                row = session.get(Run, run_id)
+                if row is None:
+                    return
+                row.status = "running"
+                row.finished_at = None
+                if stats is not None:
+                    row.stats = json.dumps(stats)
+                session.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def get_run_stats(self, run_id: int | None) -> dict[str, Any]:
+        """Return the run's current ``stats`` dict (``{}`` if absent)."""
+        if run_id is None:
+            return {}
+        try:
+            factory = admin_db.get_session_factory()
+            with factory() as session:
+                row = session.get(Run, run_id)
+                if row is None or not row.stats:
+                    return {}
+                parsed = json.loads(row.stats)
+                return parsed if isinstance(parsed, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     # --- cost recording -------------------------------------------------
 
     @staticmethod

@@ -34,7 +34,6 @@ from pipeline.common.models import Language, RawItem
 from pipeline.run import _languages_for_brand
 from tests.unit.conftest import seed_icon_brand
 
-
 # --- helpers --------------------------------------------------------------
 
 
@@ -364,6 +363,82 @@ def test_run_pipeline_single_language_override_pins_to_one_branch(
         runs = list(session.scalars(select(Run)))
         completed = json.loads(runs[0].languages_completed)
         assert completed == ["en"]
+
+
+def test_run_pipeline_for_run_writes_live_progress_across_sources(
+    fresh_admin_db_with_source, monkeypatch
+):
+    """NTS_068: run_pipeline_for_run keeps the run RUNNING with live X/N
+    progress across a multi-source run-all, accumulates per-source stats, and
+    writes one authoritative finish. We stub run_pipeline so each 'source'
+    just records its per-source stats (mimicking record_run_finish)."""
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    factory = admin_db.get_session_factory()
+
+    # Add a 2nd source so the loop exercises the between-sources re-assert.
+    with factory() as session:
+        session.add(
+            Source(
+                brand_id_fk=icon_id,
+                name="Second Feed",
+                source_type="rss",
+                url="https://test.example.com/feed2",
+                primary_category="wealth",
+                active=True,
+            )
+        )
+        session.commit()
+        src_ids = [
+            s.id
+            for s in session.scalars(
+                select(Source).where(Source.brand_id_fk == icon_id)
+            )
+        ]
+        run = Run(
+            brand_id_fk=icon_id,
+            triggered_by="manual",
+            source_ids=json.dumps(src_ids),
+            started_at=__import__("datetime").datetime.now(
+                tz=__import__("datetime").timezone.utc
+            ),
+            status="running",
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
+    from pipeline import run as pipe
+    from pipeline.admin.config_client import AdminConfigClient
+
+    async def fake_run_pipeline(*args, **kwargs):
+        rid = kwargs["existing_run_id"]
+        # Mimic a per-source run finishing: write that source's stats + a
+        # terminal status on the shared run row.
+        AdminConfigClient(brand_slug="icon").record_run_finish(
+            rid, status="success",
+            stats={"fetched": 10, "scored": 2, "drafted": 2, "errors": 0},
+        )
+        return []
+
+    monkeypatch.setattr(pipe, "run_pipeline", fake_run_pipeline)
+
+    from pipeline.run import run_pipeline_for_run
+
+    asyncio.run(run_pipeline_for_run(run_id))
+
+    with factory() as session:
+        run = session.get(Run, run_id)
+        progress = json.loads(run.progress)
+        assert progress["sources_total"] == 2
+        assert progress["sources_done"] == 2
+        assert progress["stage"] == "done"
+        # 2 sources × 2 drafted each = 4 accumulated (not last-source-only).
+        assert progress["drafts"] == 4
+        assert progress["errors"] == 0
+        # Authoritative finish: terminal status + finished_at + aggregate stats.
+        assert run.status == "success"
+        assert run.finished_at is not None
+        assert json.loads(run.stats)["drafted"] == 4
 
 
 def test_run_pipeline_for_run_writes_topics_with_real_source_id(

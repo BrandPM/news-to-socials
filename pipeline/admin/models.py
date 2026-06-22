@@ -233,6 +233,12 @@ class Run(Base):
     languages_completed: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default="[]"
     )
+    # NTS_068 — live run progress as JSON-as-TEXT:
+    # {sources_total, sources_done, current_source, drafts, errors, stage}.
+    # Written best-effort by run_pipeline_for_run for the global status badge.
+    progress: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
 
     topics: Mapped[list["Topic"]] = relationship(
         back_populates="run",

@@ -1092,15 +1092,39 @@ async def run_pipeline_for_run(run_id: int) -> None:
             select(Source).where(Source.id.in_(source_ids))
         ).all()
     if not rows:
+        client.update_run_progress(
+            run_id, sources_total=0, sources_done=0, stage="done"
+        )
         client.record_run_finish(
             run_id, status="failed", log_excerpt="no sources resolved for this run"
         )
         return
 
+    # NTS_068: keep the run visibly RUNNING with live X/N progress across the
+    # whole source list. Each per-source run_pipeline finalises the shared run
+    # row (writing that source's stats + a terminal status), so we read +
+    # accumulate those stats, re-assert 'running' between sources, and write
+    # ONE authoritative finish at the end. Generation logic is untouched — this
+    # is pure run-lifecycle orchestration + the additive progress field.
+    total = len(rows)
+    agg = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
+    client.update_run_progress(
+        run_id,
+        sources_total=total,
+        sources_done=0,
+        drafts=0,
+        errors=0,
+        current_source=rows[0].name,
+        stage="starting",
+    )
+
     # Re-enter the orchestrator with the existing run_id so it appends to
     # the same row instead of creating a sibling. All rows share the same
     # brand_slug (M1 invariant — sources are brand-scoped).
-    for source in rows:
+    for i, source in enumerate(rows):
+        client.update_run_progress(
+            run_id, current_source=source.name, stage="processing"
+        )
         await run_pipeline(
             brand_slug=brand_slug,
             source_id=str(source.id),
@@ -1110,6 +1134,30 @@ async def run_pipeline_for_run(run_id: int) -> None:
             dry_run=False,
             existing_run_id=run_id,
         )
+        source_stats = client.get_run_stats(run_id)
+        for key in agg:
+            agg[key] += int(source_stats.get(key, 0) or 0)
+        # Re-assert running for every source but the last, so the indicator
+        # doesn't read "completed" mid-fanout. The final status is written
+        # once, below.
+        if i < total - 1:
+            client.set_run_running(run_id, stats=agg)
+        client.update_run_progress(
+            run_id,
+            sources_done=i + 1,
+            drafts=agg["drafted"],
+            errors=agg["errors"],
+        )
+
+    final_status = "success" if agg["errors"] == 0 else "failed"
+    client.record_run_finish(run_id, status=final_status, stats=agg)
+    client.update_run_progress(
+        run_id,
+        sources_done=total,
+        drafts=agg["drafted"],
+        errors=agg["errors"],
+        stage="done",
+    )
 
 
 class _DryRunSanityPublisher:
