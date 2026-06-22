@@ -152,6 +152,16 @@ def icon_brand_config() -> BrandConfig:
             "  - cutting-edge\n"
             "  - in an increasingly\n"
             "  - paradigm shift\n"
+            # NTS_070 — manager-feedback additions (EN).
+            "  - growing uncertainty\n"
+            "  - rising uncertainty\n"
+            "  - significant impact\n"
+            "  - immediate action required\n"
+            "  - potential conflict\n"
+            "  - each case is different\n"
+            "  - it is important to\n"
+            "  - plays a crucial role\n"
+            "  - when it comes to\n"
             "style_examples:\n"
             "  good:\n"
             "    - \"The proposal moves the discussion, not the timeline.\"\n"
@@ -164,6 +174,7 @@ def icon_brand_config() -> BrandConfig:
             "    - \"Icon believes in harnessing the power of strategic perspectives to navigate the complexities of cross-border structuring.\"\n"
             "    - \"This article will delve into the comprehensive framework that enables families to unlock the potential of their wealth.\"\n"
             "    - \"Moreover, the proposal represents a paradigm shift. Furthermore, it is at the forefront of innovation. In conclusion, allocators should take note.\"\n"
+            "    - \"Growing uncertainty creates significant challenges that require immediate action.\"\n"
         ),
         visual=BrandVisual(
             brand_id="icon",

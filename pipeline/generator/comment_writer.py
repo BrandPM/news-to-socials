@@ -138,6 +138,22 @@ SPECIFICITY (mandatory — highest priority):
 * One concrete number or named entity per paragraph — not vague
   intensifiers. Lead with a specific consequence, not a general framing.
 
+NO REPETITION & DENSITY (mandatory):
+* No sentence may restate a previous one. Every paragraph must add NEW
+  specifics. Delete any sentence that carries no new information — but
+  tighten, do not gut: keep the lede + H2 structure and a comparable length.
+
+AUDIENCE LINK (mandatory):
+* Connect the story to the brand's target segment using `topics_relevant`
+  from the voice profile above. If the link isn't obvious, make it explicit
+  in the body. Do NOT decline the topic or truncate the piece — topic
+  selection happens upstream.
+
+NO INVENTION (mandatory):
+* Numbers, dates, and names may come ONLY from the source. Never invent
+  them. If the source lacks a figure, write the piece without it — do not
+  fabricate a statistic, date, or name to fill a gap.
+
 STRUCTURE REQUIREMENTS (mandatory — markdown headings, not bold):
 * Open with a 1-2 sentence lede paragraph that names the specific
   consequence, NOT a general framing. No heading on the lede.
@@ -148,8 +164,10 @@ STRUCTURE REQUIREMENTS (mandatory — markdown headings, not bold):
 * End with a forward-looking close that is ANCHORED to the article: it must
   reference a specific named entity, number, or mechanism already mentioned
   in the body, and state the concrete shift it creates for the reader's next
-  decision ON THIS topic. Do NOT end on a generic call-to-action or a tidy
-  restatement that would fit any article. No "in conclusion"-style wrap-up.
+  decision ON THIS topic. The final paragraph must answer: "So what does
+  this mean specifically?" — referencing a concrete fact / number / entity /
+  consequence from THIS article. Do NOT end on a generic call-to-action or a
+  tidy restatement that would fit any article. No "in conclusion"-style wrap-up.
 * Source quotes ≤ 15 words. The piece is commentary, not a rewrite.
 
 Rules:
@@ -190,6 +208,23 @@ SPECIFICITY (mandatory — highest priority):
 * Voice principles to enforce (from the brand profile):
 {voice_principles}
 
+NO REPETITION & DENSITY (mandatory):
+* No sentence may restate a previous one. Every paragraph must add NEW
+  specifics. Delete any sentence that carries no new information — but
+  tighten, do not gut: keep the lede + H2 structure and a comparable length.
+
+AUDIENCE LINK (mandatory):
+* Connect the story to the brand's target segment, drawn from these
+  topics_relevant:
+{topics_relevant}
+  If the link isn't obvious in the draft, make it explicit in the body. Do
+  NOT decline or truncate — topic selection happens upstream.
+
+NO INVENTION (mandatory):
+* Numbers, dates, and names may come ONLY from the source draft. Never
+  invent them; if a figure isn't present, write without it — do not
+  fabricate one to fill a gap.
+
 STRUCTURE REQUIREMENTS (preserve / enforce — markdown, not bold):
 * The piece must open with a 1-2 sentence lede paragraph (no heading).
 * Then 2-3 H2 sections (`## Heading`). Substantive heading names that
@@ -199,8 +234,10 @@ STRUCTURE REQUIREMENTS (preserve / enforce — markdown, not bold):
 * End with a forward-looking close ANCHORED to the article: it must
   reference a specific named entity, number, or mechanism already in the
   body and state the concrete shift for the reader's next decision ON THIS
-  topic. NOT a generic call-to-action or a restatement that fits any
-  article. No "in conclusion" restatement.
+  topic. The final paragraph must answer: "So what does this mean
+  specifically?" — referencing a concrete fact / number / entity /
+  consequence from THIS article. NOT a generic call-to-action or a
+  restatement that fits any article. No "in conclusion" restatement.
 * If the draft is one flat block, restructure it into lede + H2
   sections + close while keeping the meaning.
 
@@ -339,6 +376,7 @@ _REQUIRED_PLACEHOLDERS: dict[str, set[str]] = {
         "banned_phrases",
         "good_examples",
         "voice_principles",
+        "topics_relevant",
         "draft_json",
         "language_name",
     },
@@ -485,6 +523,39 @@ def parse_voice_principles(
     return []
 
 
+def parse_topics_relevant(
+    voice_profile_yaml: str,
+    language: str | Language = Language.en,
+) -> list[str]:
+    """Extract ``topics_relevant`` (the brand's audience segments) from the
+    voice profile (NTS_070).
+
+    The draft stage sees these via the wholesale YAML dump, but polish does
+    not — so we parse them explicitly to power the AUDIENCE LINK rule there.
+    Precedence: per-language ``voice.<lang>.topics_relevant`` if present, else
+    top-level ``topics_relevant``. Missing / malformed → ``[]``.
+    """
+    try:
+        data = yaml.safe_load(voice_profile_yaml) or {}
+    except yaml.YAMLError as exc:
+        log.warning("comment_writer.topics_relevant_parse_failed", err=str(exc))
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    lang_key = language.value if isinstance(language, Language) else str(language)
+    voice = data.get("voice")
+    if isinstance(voice, dict) and isinstance(voice.get(lang_key), dict):
+        per_lang = voice[lang_key].get("topics_relevant")
+        if isinstance(per_lang, list) and per_lang:
+            return [str(t) for t in per_lang if t]
+
+    topics = data.get("topics_relevant")
+    if isinstance(topics, list):
+        return [str(t) for t in topics if t]
+    return []
+
+
 class CommentWriter:
     def __init__(
         self,
@@ -569,6 +640,7 @@ class CommentWriter:
             voice_profile_yaml, language
         )
         voice_principles = parse_voice_principles(voice_profile_yaml, language)
+        topics_relevant = parse_topics_relevant(voice_profile_yaml, language)
 
         # --- Stage 1: draft (banned phrases injected here too — NTS_067) ---
         draft = await self._draft(topic, voice_profile_yaml, language, banned_phrases)
@@ -579,7 +651,13 @@ class CommentWriter:
 
         # --- Stage 2: polish (always; injects voice guardrails + principles) ---
         polished = await self._polish(
-            draft, tells, banned_phrases, good_examples, language, voice_principles
+            draft,
+            tells,
+            banned_phrases,
+            good_examples,
+            language,
+            voice_principles,
+            topics_relevant,
         )
 
         # --- Banned-phrase retry (one extra pass, cap to avoid runaways) ---
@@ -741,12 +819,15 @@ class CommentWriter:
         good_examples: list[str],
         language: Language = Language.en,
         voice_principles: list[str] | None = None,
+        topics_relevant: list[str] | None = None,
     ) -> _DraftJSON:
         kwargs = {
             "ai_tells": ", ".join(ai_tells) if ai_tells else "no specific tells noted",
             "banned_phrases": _bullet_list(banned_phrases) or "  (none specified)",
             "good_examples": _bullet_list(good_examples) or "  (none specified)",
             "voice_principles": _bullet_list(voice_principles or [])
+            or "  (none specified)",
+            "topics_relevant": _bullet_list(topics_relevant or [])
             or "  (none specified)",
             "draft_json": draft.model_dump_json(),
             "language_name": _language_name(language),
