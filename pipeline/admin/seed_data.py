@@ -115,13 +115,13 @@ def get_active_polish_prompt() -> tuple[str, str]:
     writer_polish prompt — i.e. the IT_PROJ_NTS_013 v1.1 version."""
     from pipeline.generator.comment_writer import _POLISH_PROMPT  # noqa: PLC0415
 
-    return ("v1.2 — anti-generic + DB source of truth (NTS_067)", _POLISH_PROMPT)
+    return ("v1.3 — manager quality merge (NTS_070)", _POLISH_PROMPT)
 
 
 def get_active_draft_prompt() -> tuple[str, str]:
     from pipeline.generator.comment_writer import _DRAFT_PROMPT  # noqa: PLC0415
 
-    return ("v1.2 — anti-generic + DB source of truth (NTS_067)", _DRAFT_PROMPT)
+    return ("v1.3 — manager quality merge (NTS_070)", _DRAFT_PROMPT)
 
 
 def get_active_translate_prompt() -> tuple[str, str]:

@@ -55,6 +55,7 @@ async def regenerate_draft_text(
     from pipeline.generator.comment_writer import (  # noqa: PLC0415
         CommentWriter,
         _DraftJSON,
+        parse_topics_relevant,
         parse_voice_guardrails,
         parse_voice_principles,
     )
@@ -118,6 +119,7 @@ async def regenerate_draft_text(
             voice_profile_yaml, Language.en
         )
         voice_principles = parse_voice_principles(voice_profile_yaml, Language.en)
+        topics_relevant = parse_topics_relevant(voice_profile_yaml, Language.en)
         writer = CommentWriter(brand_id_fk=brand_id_fk)
         pre_draft = _DraftJSON(title=title, body=body_md, key_takeaway=key_takeaway)
         with cost_context(ctx):
@@ -128,6 +130,7 @@ async def regenerate_draft_text(
                 good_examples,
                 Language.en,
                 voice_principles,
+                topics_relevant,
             )
         new_title, new_body, new_kt = result.title, result.body, result.key_takeaway
     else:
