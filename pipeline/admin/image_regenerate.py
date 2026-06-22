@@ -40,14 +40,17 @@ async def regenerate_cover_image(
     client = SanityClient()
     publisher = SanityPublisher(client=client)
 
-    # 1. Read the existing draft (need the title to build a prompt). We
-    #    accept either the draft id ``drafts.post-xxx`` or the published id
-    #    ``post-xxx`` — Sanity stores both. Normalise to draft id.
-    if not sanity_draft_id.startswith("drafts."):
-        sanity_draft_id = f"drafts.{sanity_draft_id}"
-
-    groq = '*[_id == $id][0]{title, topicId, sourceUrl}'
-    doc = await client.query(groq, {"id": sanity_draft_id})
+    # 1. Read the existing draft (need the title + topicId). Accept either the
+    #    draft id ``drafts.post-xxx`` or the published id ``post-xxx`` — Sanity
+    #    stores both, and a language sibling may be in either state.
+    stripped = (
+        sanity_draft_id[len("drafts.") :]
+        if sanity_draft_id.startswith("drafts.")
+        else sanity_draft_id
+    )
+    draft_form = f"drafts.{stripped}"
+    groq = "*[_id == $a || _id == $b][0]{title, topicId, sourceUrl}"
+    doc = await client.query(groq, {"a": draft_form, "b": stripped})
     if not doc:
         raise LookupError(f"draft {sanity_draft_id!r} not found in Sanity")
 
@@ -76,10 +79,11 @@ async def regenerate_cover_image(
     # 3. Generate + resize + upload — wrap in a cost context so the
     #    Replicate call inside ImageGenerator records against this draft.
     #    Brand resolution is naïve here (icon-only); Step 4 broadens this.
+    from sqlalchemy import select  # noqa: PLC0415
+
     from pipeline.admin.cost_recorder import CostContext, cost_context  # noqa: PLC0415
     from pipeline.admin.db import session_scope  # noqa: PLC0415
     from pipeline.admin.models import Brand  # noqa: PLC0415
-    from sqlalchemy import select  # noqa: PLC0415
 
     icon_brand_id_fk: int | None = None
     try:
@@ -91,7 +95,9 @@ async def regenerate_cover_image(
     except Exception:  # noqa: BLE001
         icon_brand_id_fk = None
 
-    ctx = CostContext(brand_id_fk=icon_brand_id_fk, draft_id=sanity_draft_id)
+    # Cost is recorded ONCE per regeneration (one image generated), attributed
+    # to the originating draft — applying it to siblings is a free patch.
+    ctx = CostContext(brand_id_fk=icon_brand_id_fk, draft_id=draft_form)
     with cost_context(ctx):
         gen = ImageGenerator()
         master_url = await gen.generate(
@@ -103,20 +109,37 @@ async def regenerate_cover_image(
             resized, filename=f"icon-{topic_id}-regen.png"
         )
 
-    # 4. Patch the draft's coverImage reference.
-    await client.patch(
-        sanity_draft_id,
-        {
-            "coverImage": {
-                "_type": "image",
-                "asset": {"_type": "reference", "_ref": asset_id},
-            }
-        },
+    # 4. Apply the new cover to ALL language siblings of this topic — one cover
+    #    per topic (NTS_069). The cover lives only in Sanity (admin.db stores no
+    #    image ref), as a per-document ``coverImage`` asset reference, so before
+    #    this fix Regenerate patched a single language and the siblings kept the
+    #    old asset. We patch every sibling in ONE Sanity transaction → atomic,
+    #    no partial state (same posture as the NTS_062 delete-sync). Falls back
+    #    to the originating doc when topicId is unknown.
+    cover_ref = {
+        "_type": "image",
+        "asset": {"_type": "reference", "_ref": asset_id},
+    }
+    sibling_ids: list[str] = []
+    if topic_id and topic_id != "unknown":
+        rows = await client.query(
+            '*[_type == "post" && topicId == $tid]{_id}', {"tid": topic_id}
+        )
+        if isinstance(rows, list):
+            sibling_ids = [
+                r["_id"] for r in rows if isinstance(r, dict) and r.get("_id")
+            ]
+    if not sibling_ids:
+        sibling_ids = [draft_form]
+
+    await client.mutate(
+        [{"patch": {"id": sid, "set": {"coverImage": cover_ref}}} for sid in sibling_ids]
     )
     log.info(
         "image.regenerated",
-        draft_id=sanity_draft_id,
         asset_id=asset_id,
         topic_id=topic_id,
+        applied_to=len(sibling_ids),
+        ids=sibling_ids,
     )
     return asset_id
