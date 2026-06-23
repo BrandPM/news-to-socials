@@ -2,37 +2,49 @@
 
 Two kinds of work runs out-of-band from an HTTP request:
 
-* ``kick_off_pipeline_run`` — invoked by ``POST /sources/{id}/run`` and
-  ``POST /sources/run-all``. Creates a ``runs`` row immediately so the
-  caller has a polling handle, then runs the actual pipeline in a
-  ``BackgroundTasks`` task that updates the row when done.
+* ``kick_off_pipeline_run`` + ``spawn_pipeline_run`` — invoked by
+  ``POST /sources/{id}/run`` and ``POST /sources/run-all``. The first creates
+  a ``runs`` row immediately so the caller has a polling handle; the second
+  launches the actual pipeline as a **detached OS subprocess** so the heavy /
+  long / wedged run never shares the admin-API event loop (NTS_074, the lesson
+  of NTS_073 where a blocking call in-loop took the whole admin down). The
+  worker process is killable (``cancel_run``) and its death is reconciled at
+  startup (``sweep_orphaned_runs``).
 
 * ``kick_off_image_regenerate`` — invoked by
   ``POST /drafts/{sanity_id}/regenerate-image``. Pure in-memory job
   registry — no DB row, just a UUID the client polls. Sufficient for
   the single-operator use case.
 
-Tests monkeypatch ``execute_pipeline_run`` / ``execute_image_regenerate``
+Tests monkeypatch ``spawn_pipeline_run`` / ``execute_image_regenerate``
 to short-circuit external work.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
+import os
+import signal
+import subprocess
+import sys
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 
 from pipeline.admin.db import get_session_factory
 from pipeline.admin.models import Run, Source
+from pipeline.common.config import get_settings
+from pipeline.common.logging import get_logger
+
+log = get_logger(__name__)
 
 
-# --- Pipeline-run jobs ----------------------------------------------------
+# --- Pipeline-run jobs (NTS_074: detached subprocess, off the event loop) --
 
 
 def kick_off_pipeline_run(
@@ -42,9 +54,9 @@ def kick_off_pipeline_run(
 ) -> int:
     """Create a 'running' row in ``runs`` and return its id.
 
-    The caller is expected to schedule ``execute_pipeline_run(run_id)`` via
-    ``BackgroundTasks.add_task`` — we don't do that here because we don't
-    want jobs.py to depend on FastAPI.
+    The caller then hands the id to :func:`spawn_pipeline_run` to launch the
+    detached worker. Two steps (not one) so the caller gets a polling handle
+    even if the spawn itself fails — that failure marks the row 'failed'.
     """
     factory = get_session_factory()
     with factory() as session:
@@ -60,25 +72,236 @@ def kick_off_pipeline_run(
         return run.id
 
 
-async def execute_pipeline_run(run_id: int) -> None:
-    """Run the pipeline for the sources referenced by ``run_id`` and update
-    the row when finished. Imported lazily so tests can monkeypatch the
-    actual pipeline entry point without paying the import cost.
-    """
-    from pipeline.run import run_pipeline_for_run  # noqa: PLC0415
+def _build_run_command(run_id: int) -> list[str]:
+    """argv for the detached run-worker. Optionally wrapped in
+    ``systemd-run --user --scope`` so the run gets its own cgroup + MemoryMax
+    instead of sharing the admin-API unit's limit (NTS_074)."""
+    settings = get_settings()
+    base = [
+        sys.executable,
+        "-m",
+        "pipeline.run",
+        "for-run",
+        "--run-id",
+        str(run_id),
+    ]
+    if settings.admin_run_via_systemd_run:
+        return [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            f"--unit=nts-run-{run_id}",
+            "-p",
+            f"MemoryMax={settings.admin_run_memory_max}",
+            *base,
+        ]
+    return base
 
-    factory = get_session_factory()
+
+def _run_worker_log_target():
+    """Open the admin log in append mode so the detached worker's structlog
+    stdout lands in the same file ``/runs/{id}/events`` reads. Falls back to
+    DEVNULL when the path isn't writable (local dev / CI on Mac)."""
     try:
-        await run_pipeline_for_run(run_id)
+        path = Path(get_settings().admin_log_path)
+        if path.parent.exists():
+            return open(path, "a", encoding="utf-8")  # noqa: SIM115
+    except OSError:
+        pass
+    return subprocess.DEVNULL
+
+
+def spawn_pipeline_run(run_id: int) -> int | None:
+    """Launch the pipeline for ``run_id`` as a DETACHED subprocess and record
+    its pid on the run row. Returns the pid, or ``None`` if the spawn failed
+    (in which case the run row is force-failed).
+
+    ``start_new_session=True`` puts the worker in its own session / process
+    group, detached from the API's controlling tty + stdio, so ``cancel_run``
+    can signal the whole group cleanly. The fork+exec is cheap and
+    non-blocking — safe to call from a sync route (FastAPI threadpool).
+
+    NOTE on restart: under the admin-API systemd unit's default
+    ``KillMode=control-group`` a service restart also kills this worker (it
+    stays in the unit cgroup despite the new session); the startup
+    ``sweep_orphaned_runs`` then force-fails the dead row. For runs that should
+    survive a restart AND get their own cgroup/MemoryMax, set
+    ``admin_run_via_systemd_run=True`` (wraps the spawn in
+    ``systemd-run --user --scope``).
+    """
+    cmd = _build_run_command(run_id)
+    log_target = _run_worker_log_target()
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — argv is built from trusted parts
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_target,
+            stderr=log_target,
+            start_new_session=True,
+            close_fds=True,
+        )
     except Exception as exc:  # noqa: BLE001
-        with factory() as session:
-            row = session.get(Run, run_id)
-            if row is not None:
-                row.status = "failed"
-                row.finished_at = datetime.now(tz=timezone.utc)
-                row.log_excerpt = (row.log_excerpt or "") + f"\nERROR: {exc!r}"
-                session.commit()
-        raise
+        log.exception("run.spawn_failed", run_id=run_id)
+        _force_fail_run(run_id, f"spawn failed: {type(exc).__name__}: {exc}")
+        return None
+    finally:
+        # The child dup'd the fd; the parent's copy is no longer needed.
+        if log_target not in (subprocess.DEVNULL, None) and hasattr(
+            log_target, "close"
+        ):
+            log_target.close()
+    _record_run_pid(run_id, proc.pid)
+    log.info("run.spawned", run_id=run_id, pid=proc.pid)
+    return proc.pid
+
+
+def _record_run_pid(run_id: int, pid: int) -> None:
+    factory = get_session_factory()
+    with factory() as session:
+        row = session.get(Run, run_id)
+        if row is not None:
+            row.pid = pid
+            session.commit()
+
+
+def _force_fail_run(run_id: int, note: str) -> None:
+    factory = get_session_factory()
+    with factory() as session:
+        row = session.get(Run, run_id)
+        if row is not None and row.status == "running":
+            row.status = "failed"
+            row.finished_at = datetime.now(tz=timezone.utc)
+            row.log_excerpt = (
+                f"{row.log_excerpt}\n{note}" if row.log_excerpt else note
+            )
+            session.commit()
+
+
+# --- Cancel (NTS_074 Task 2) ----------------------------------------------
+
+CANCEL_NOTE = "[NTS_074] cancelled by operator"
+
+
+def _process_alive(pid: int | None) -> bool:
+    """True if ``pid`` names a live process. ``os.kill(pid, 0)`` is a
+    signal-nothing existence probe."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_process_group(pid: int) -> None:
+    """Best-effort SIGTERM to the worker's process group (start_new_session
+    makes pgid == pid). Swallows 'already dead' / permission errors."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return
+    except (ProcessLookupError, PermissionError):
+        return
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def cancel_run(run_id: int) -> str:
+    """Idempotently cancel a run. Returns one of:
+
+    * ``"not_found"``        — no such run (route → 404)
+    * ``"cancelled"``        — was running, now cancelled (worker killed)
+    * ``"already:<status>"`` — already terminal, no-op (route → 200)
+
+    Kills the worker process-group by stored pid BEFORE flipping the row to
+    ``cancelled`` + ``finished_at`` (SIGTERM with no handler terminates the
+    worker before it can write its own terminal status, so no race). All sync
+    + cheap — call from a sync route (threadpool) or a worker thread, never
+    the event loop.
+    """
+    factory = get_session_factory()
+    with factory() as session:
+        row = session.get(Run, run_id)
+        if row is None:
+            return "not_found"
+        if row.status != "running":
+            return f"already:{row.status}"
+        if row.pid and row.pid > 0:
+            _terminate_process_group(row.pid)
+        row.status = "cancelled"
+        row.finished_at = datetime.now(tz=timezone.utc)
+        row.log_excerpt = (
+            f"{row.log_excerpt}\n{CANCEL_NOTE}"
+            if row.log_excerpt
+            else CANCEL_NOTE
+        )
+        session.commit()
+    log.info("run.cancelled", run_id=run_id)
+    return "cancelled"
+
+
+# --- Orphan sweep (NTS_074 Task 3) ----------------------------------------
+
+# A 'running' row with NULL pid younger than this is presumed to be in the
+# brief insert→spawn window, not an orphan — leave it for a later sweep.
+ORPHAN_NULL_PID_GRACE_S = 120
+
+
+def sweep_orphaned_runs(*, now: datetime | None = None) -> int:
+    """Force-fail runs stuck in 'running' whose worker process is gone.
+
+    Closes the class of orphans an API/box restart leaves behind (e.g. the
+    historical Run #42):
+
+    * pid present + process alive → genuine in-flight run, left alone.
+    * pid present + process dead  → orphaned, marked failed immediately.
+    * pid NULL + started >grace   → legacy in-process run, or the worker died
+      before recording a pid; treated as orphaned. The grace window dodges the
+      insert→spawn race for freshly-created rows.
+
+    Marked ``failed`` (not ``cancelled``) to match the time-based
+    :func:`close_stale_runs` backstop — both close zombies the same way; a
+    deliberate operator stop is the only thing that yields ``cancelled``.
+    Idempotent. Runs on the scheduler thread (off the event loop), same place
+    as ``close_stale_runs``; the 6h ``close_stale_runs`` stays as a backstop
+    for pid-reuse false-negatives.
+    """
+    now = now or datetime.now(tz=timezone.utc)
+    factory = get_session_factory()
+    closed = 0
+    with factory() as session:
+        running = session.scalars(
+            select(Run).where(Run.status == "running")
+        ).all()
+        for run in running:
+            if run.pid and _process_alive(run.pid):
+                continue  # alive worker — real run in flight
+            if run.pid is None:
+                age = (now - _as_utc(run.started_at)).total_seconds()
+                if age < ORPHAN_NULL_PID_GRACE_S:
+                    continue  # too young — likely mid-spawn, not an orphan
+            run.status = "failed"
+            run.finished_at = now
+            note = (
+                "[NTS_074 orphan-sweep] marked failed — orphaned by restart "
+                f"(worker pid {run.pid} not alive)"
+            )
+            run.log_excerpt = (
+                f"{run.log_excerpt}\n{note}" if run.log_excerpt else note
+            )
+            closed += 1
+        if closed:
+            session.commit()
+    return closed
 
 
 # --- Stale-run cleanup (NTS_056 Task 3) -----------------------------------

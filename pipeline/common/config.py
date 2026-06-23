@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     # production; tests disable it so no scheduler thread leaks across the suite.
     admin_run_scheduler: bool = True
     stale_run_max_age_hours: int = 6
+    # NTS_074 — the pipeline run executes as a DETACHED subprocess
+    # (``python -m pipeline.run for-run --run-id N``) off the admin-API event
+    # loop. When True the spawn is wrapped in ``systemd-run --user --scope`` so
+    # the run gets its OWN cgroup + MemoryMax instead of sharing the admin-API
+    # unit's 512M (requires ``loginctl enable-linger`` for the service user).
+    # Off by default — plain subprocess works everywhere incl. local/CI.
+    admin_run_via_systemd_run: bool = False
+    admin_run_memory_max: str = "1G"
     # Where /runs/{id}/log + /runs/{id}/events read structured pipeline
     # events from. After NTS_025 the pipeline runs inside the admin-api
     # systemd unit, which redirects stdout to admin-api.log; the legacy

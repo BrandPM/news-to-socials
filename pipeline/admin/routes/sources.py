@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -181,7 +181,6 @@ async def test_source(source_id: int, limit: int = 5) -> SourceTestOut:
 )
 def run_source(
     source_id: int,
-    background: BackgroundTasks,
     x_triggered_by: str | None = Header(default=None, alias="X-Triggered-By"),
 ) -> RunTriggerOut:
     triggered_by = _resolve_triggered_by(x_triggered_by)
@@ -193,7 +192,10 @@ def run_source(
     run_id = jobs.kick_off_pipeline_run(
         brand_id_fk=brand_id_fk, source_ids=[source_id], triggered_by=triggered_by
     )
-    background.add_task(jobs.execute_pipeline_run, run_id)
+    # NTS_074: launch as a detached subprocess, NOT a BackgroundTask sharing
+    # the event loop. This sync handler runs in the threadpool and the
+    # fork+exec is non-blocking, so the run never touches the API loop.
+    jobs.spawn_pipeline_run(run_id)
     return RunTriggerOut(run_id=run_id)
 
 
@@ -204,7 +206,6 @@ def run_source(
 )
 def run_all_sources(
     payload: RunAllIn,
-    background: BackgroundTasks,
     x_triggered_by: str | None = Header(default=None, alias="X-Triggered-By"),
 ) -> RunTriggerOut:
     """Schedule the pipeline for every active source of one brand.
@@ -247,7 +248,9 @@ def run_all_sources(
         source_ids=source_ids,
         triggered_by=triggered_by,
     )
-    background.add_task(jobs.execute_pipeline_run, run_id)
+    # NTS_074: detached subprocess (see run_source) — cron's POST contract is
+    # unchanged; the run just no longer shares the admin-API event loop.
+    jobs.spawn_pipeline_run(run_id)
     return RunTriggerOut(run_id=run_id)
 
 

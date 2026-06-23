@@ -1065,10 +1065,11 @@ async def run_pipeline(
 async def run_pipeline_for_run(run_id: int) -> None:
     """Execute the pipeline for an already-recorded ``runs`` row.
 
-    Used by ``pipeline.admin.jobs.execute_pipeline_run`` (i.e. the
-    ``POST /sources/{id}/run`` endpoint). Looks up the source list from
-    the run row, then delegates to :func:`run_pipeline` with
-    ``existing_run_id`` set so we don't double-record.
+    Entry point of the detached run-worker (NTS_074): the admin API spawns
+    ``python -m pipeline.run for-run --run-id N`` (see
+    :func:`pipeline.admin.jobs.spawn_pipeline_run`), which calls this. Looks up
+    the source list from the run row, then delegates to :func:`run_pipeline`
+    with ``existing_run_id`` set so we don't double-record.
     """
     # Resolve brand slug from the existing run row so the client uses the
     # right brand context. Step 4 switches AdminConfigClient to take the
@@ -1248,6 +1249,30 @@ def main(
     typer.echo(f"\nProcessed {len(results)} topics:")
     for r in results:
         typer.echo(f"  {r}")
+
+
+@app.command("for-run")
+def for_run(
+    run_id: int = typer.Option(..., "--run-id", help="Existing runs.id to execute"),
+) -> None:
+    """Detached run-worker entry point (NTS_074).
+
+    Executes the pipeline for an already-recorded ``runs`` row in THIS process
+    — the admin API spawns ``python -m pipeline.run for-run --run-id N`` as a
+    detached subprocess so the run never shares the API event loop. The run
+    row's terminal status (success/failed) is written by
+    :func:`run_pipeline_for_run`; an operator cancel or a worker crash is
+    reconciled by ``pipeline.admin.jobs`` (cancel_run / sweep_orphaned_runs).
+    """
+    try:
+        asyncio.run(run_pipeline_for_run(run_id))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        # run_pipeline_for_run records its own terminal status on the row;
+        # surface a non-zero exit for journald/systemd visibility.
+        typer.echo(f"ERROR: {type(exc).__name__}: {exc}", err=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

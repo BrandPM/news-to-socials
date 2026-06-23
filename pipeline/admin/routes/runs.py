@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
+from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
 from pipeline.admin.models import CostRecord, Run, Topic
 from pipeline.admin.schemas import (
@@ -65,6 +66,28 @@ def get_latest_run(brand_id: int | None = None) -> RunOut:
         row = session.scalars(stmt).first()
         if row is None:
             raise HTTPException(status_code=404, detail="no runs yet")
+        return RunOut.model_validate(row)
+
+
+@router.post("/{run_id}/cancel", response_model=RunOut)
+def cancel_run(run_id: int) -> RunOut:
+    """Cancel a running pipeline run (NTS_074 Task 2).
+
+    Kills the detached worker process (by stored pid) and marks the run
+    ``cancelled`` + ``finished_at``. Idempotent: cancelling an already-finished
+    or already-cancelled run is a 200 no-op; only a missing run is a 404.
+
+    Sync handler (FastAPI threadpool) — the kill + DB write never touch the
+    event loop. ``cancelled`` is a distinct status from ``failed`` so an
+    operator stop never trips the failed-run notifications / Telegram alerter.
+    """
+    outcome = jobs.cancel_run(run_id)
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="run not found")
+    with session_scope() as session:
+        row = session.get(Run, run_id)
+        if row is None:  # vanished between cancel + read — treat as 404
+            raise HTTPException(status_code=404, detail="run not found")
         return RunOut.model_validate(row)
 
 

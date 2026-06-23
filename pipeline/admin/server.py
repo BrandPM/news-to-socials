@@ -94,6 +94,20 @@ def _build_lifespan(settings):
                     # Runs on a BackgroundScheduler worker thread — NEVER the
                     # event loop. Swallows everything so a bad sweep can't
                     # crash the scheduler.
+                    #
+                    # NTS_074: the pid-based orphan sweep runs FIRST so a
+                    # restart-orphaned run (dead worker pid) is force-failed
+                    # promptly — the ~15s-after-boot first tick closes the
+                    # Run #42 class without blocking startup. close_stale_runs
+                    # stays as the 6h time-based backstop (pid-reuse cases).
+                    try:
+                        orphaned = jobs.sweep_orphaned_runs()
+                        if orphaned:
+                            logger.info(
+                                "orphan-sweep force-failed %d run(s)", orphaned
+                            )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("orphan-sweep failed")
                     try:
                         closed = jobs.close_stale_runs(max_age_hours=max_age)
                         if closed:
