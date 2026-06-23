@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the News-to-Socials failure alerter every 15 minutes
+Requires=nts-monitor.service
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

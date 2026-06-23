@@ -1,0 +1,23 @@
+[Unit]
+Description=News-to-Socials: push failure alerts to Telegram (NTS_073)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials/repo
+EnvironmentFile=/opt/news-to-socials/repo/.env
+ExecStart=/opt/news-to-socials/repo/.venv/bin/python -m pipeline.monitoring.alerts
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# ProtectSystem=strict makes the whole FS read-only except these paths.
+ReadWritePaths=/var/log/news-to-socials /opt/news-to-socials/repo
+MemoryMax=256M
+
+StandardOutput=append:/var/log/news-to-socials/monitor.log
+StandardError=append:/var/log/news-to-socials/monitor.log
