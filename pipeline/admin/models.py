@@ -438,3 +438,24 @@ class SourceHealthRecord(Base):
         Index("ix_health_source_fetched", "source_id", "fetched_at"),
         Index("ix_health_brand_fetched", "brand_id_fk", "fetched_at"),
     )
+
+
+class AlertSent(Base):
+    """Dedup ledger for the Telegram push-alerter (NTS_073).
+
+    One row per notification id that has already been pushed to the
+    monitoring chat. The alerter (:mod:`pipeline.monitoring.alerts`) only
+    sends ids absent from this table, then records them here. When a
+    notification clears (the underlying failed run is closed/deleted) the
+    row is removed so a recurrence re-alerts.
+
+    Not brand-scoped: notification ids (``run-47``, ``source-3``) are
+    already globally unique, and the alerter sweeps all brands at once.
+    """
+
+    __tablename__ = "alert_sent"
+
+    notification_id: Mapped[str] = mapped_column(String, primary_key=True)
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
