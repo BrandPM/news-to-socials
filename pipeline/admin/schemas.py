@@ -27,7 +27,7 @@ SourceType = Literal["rss", "web", "telegram"]
 PromptType = Literal[
     "writer_polish", "writer_draft", "topic_picker", "image_prompt", "writer_translate"
 ]
-RunStatus = Literal["running", "success", "failed", "dry_run"]
+RunStatus = Literal["running", "success", "failed", "dry_run", "cancelled"]
 TopicStatus = Literal[
     "passed", "filtered_banned", "filtered_dup", "filtered_score", "failed"
 ]
@@ -252,6 +252,9 @@ class RunOut(BaseModel):
     started_at: datetime
     finished_at: datetime | None
     status: RunStatus
+    # NTS_074 — os pid of the detached run-worker (None for legacy in-process
+    # runs). Surfaced so the UI can tell a cancellable live run from a stale row.
+    pid: int | None = None
     stats: dict[str, Any] | None
     log_excerpt: str | None
     languages_completed: list[str] = []

@@ -225,6 +225,11 @@ class Run(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False)
+    # NTS_074 — os pid of the detached run-worker subprocess. Written by the
+    # spawning endpoint; read by POST /runs/{id}/cancel (kill) and the restart
+    # orphan-sweep (dead pid + status='running' → force-fail). NULL for legacy
+    # in-process runs and the row-insert→spawn window.
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     stats: Mapped[str | None] = mapped_column(Text, nullable=True)
     log_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     # S6 — JSON array of language codes the run finished fanout for.
@@ -248,7 +253,7 @@ class Run(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('running', 'success', 'failed', 'dry_run')",
+            "status IN ('running', 'success', 'failed', 'dry_run', 'cancelled')",
             name="ck_runs_status",
         ),
         Index("ix_runs_started_at", "started_at"),
