@@ -39,9 +39,23 @@ class RssSource(Source):
 
     async def fetch(self, since: datetime | None = None) -> Iterable[RawItem]:
         log.info("rss.fetch.start", source=self.name, url=self.url)
-        # feedparser is sync; the network hit is negligible vs LLM calls below,
-        # so we keep it inline rather than wrapping with anyio.to_thread.
-        parsed = feedparser.parse(self.url)
+        # NTS_058 incident: feedparser.parse(url) does its OWN synchronous,
+        # un-timeoutable network request. Called inside this async coroutine it
+        # blocks the whole event loop — a single slow feed (rssexport.rbc.ru)
+        # wedged the admin API and tripped Vercel's 504. Fetch the bytes through
+        # the shared async client (retry + UA + hard timeout) and only hand the
+        # already-downloaded content to feedparser, which then never touches the
+        # network. A single broken feed must NOT take down run-all, so any
+        # network/timeout error is logged and yields an empty item list.
+        try:
+            resp = await self._http_get(self.url, timeout=20.0)
+        except Exception as exc:  # noqa: BLE001 — one bad feed must not kill run-all
+            log.warning(
+                "rss.fetch.error", source=self.name, url=self.url, err=str(exc)
+            )
+            return []
+
+        parsed = feedparser.parse(resp.content)
         if parsed.bozo:
             log.warning("rss.bozo", source=self.name, err=str(parsed.bozo_exception))
 
