@@ -39,6 +39,7 @@ from .routes import config as config_routes
 from .routes import cost as cost_routes
 from .routes import dashboard as dashboard_routes
 from .routes import drafts as drafts_routes
+from .routes import health as health_routes
 from .routes import prompts as prompts_routes
 from .routes import runs as runs_routes
 from .routes import sources as sources_routes
@@ -197,6 +198,10 @@ def create_app() -> FastAPI:
     app.include_router(
         notifications_routes.router, prefix="/api/v1/notifications",
         tags=["notifications"], dependencies=auth,
+    )
+    app.include_router(
+        health_routes.router, prefix="/api/v1/health",
+        tags=["health"], dependencies=auth,
     )
     return app
 
