@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.common.config import get_settings
 
-from . import jobs
+from . import jobs, watchdog
 from .auth import require_admin_token
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,10 @@ def _build_lifespan(settings):
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scheduler = None
+        # NTS_058 Task 2: feed the systemd watchdog from the event loop. If the
+        # loop wedges (the original incident), the pings stop and systemd
+        # restarts the unit. No-ops when not running under systemd.
+        watchdog_task = watchdog.start_watchdog()
         if settings.admin_run_scheduler:
             try:
                 from apscheduler.schedulers.background import (  # noqa: PLC0415
@@ -116,6 +120,8 @@ def _build_lifespan(settings):
         try:
             yield
         finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
             if scheduler is not None:
                 try:
                     scheduler.shutdown(wait=False)

@@ -16,6 +16,15 @@ ExecStart=/opt/news-to-socials/repo/.venv/bin/uvicorn pipeline.admin.server:app 
 Restart=always
 RestartSec=5
 MemoryMax=512M
+# Watchdog (NTS_058): the app pings WATCHDOG=1 from the asyncio event loop via
+# sd_notify (pipeline/admin/watchdog.py). If the loop wedges — the NTS_058
+# incident, where a blocking feedparser.parse froze everything — the pings stop
+# and systemd force-restarts the unit. NotifyAccess=main lets the (single,
+# non-forking) uvicorn process send notifications. Kept Type=simple: the
+# watchdog protocol works under it, and we avoid the Type=notify READY=1
+# startup handshake that uvicorn does not perform on its own.
+WatchdogSec=30
+NotifyAccess=main
 # Graceful shutdown (NTS_059): uvicorn treats SIGINT as a clean-shutdown
 # signal (the default SIGTERM also works, but SIGINT mirrors Ctrl-C and is
 # what uvicorn documents). Bound the stop so a stuck process is SIGKILLed
