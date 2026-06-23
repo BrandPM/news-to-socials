@@ -85,7 +85,11 @@ async def execute_pipeline_run(run_id: int) -> None:
 
 # A run stuck in 'running' past this many hours is presumed dead — the
 # worker crashed or the box rebooted mid-fanout (e.g. NTS_055 runs #13/#21).
-STALE_RUN_MAX_AGE_HOURS = 24
+# Lowered 24h -> 6h in NTS_058: when the event loop wedged and the unit was
+# restarted, the in-flight Run row stayed 'running' and lingered in the Active
+# panel for a full day. A real run never legitimately exceeds a few hours, so
+# 6h closes zombies promptly while leaving genuine long fan-outs alone.
+STALE_RUN_MAX_AGE_HOURS = 6
 
 
 def _as_utc(dt: datetime) -> datetime:

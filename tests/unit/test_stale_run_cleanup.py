@@ -64,9 +64,10 @@ def test_running_25h_is_failed(factory_and_brand) -> None:
         assert "NTS_056 cleanup" in run.log_excerpt
 
 
-def test_running_23h_is_untouched(factory_and_brand) -> None:
+def test_running_3h_is_untouched(factory_and_brand) -> None:
+    # Below the 6h threshold (NTS_058): a genuinely in-flight run is left alone.
     factory, brand_id = factory_and_brand
-    run_id = _make_run(factory, brand_id, status="running", age_hours=23)
+    run_id = _make_run(factory, brand_id, status="running", age_hours=3)
 
     closed = jobs.close_stale_runs(now=NOW)
     assert closed == 0
@@ -75,6 +76,19 @@ def test_running_23h_is_untouched(factory_and_brand) -> None:
         run = session.get(Run, run_id)
         assert run.status == "running"
         assert run.finished_at is None
+
+
+def test_running_7h_is_failed(factory_and_brand) -> None:
+    # Just past the lowered 6h threshold (NTS_058) — a zombie like Run #13.
+    factory, brand_id = factory_and_brand
+    run_id = _make_run(factory, brand_id, status="running", age_hours=7)
+
+    assert jobs.close_stale_runs(now=NOW) == 1
+
+    with factory() as session:
+        run = session.get(Run, run_id)
+        assert run.status == "failed"
+        assert run.finished_at is not None
 
 
 def test_old_success_is_untouched(factory_and_brand) -> None:
