@@ -66,9 +66,14 @@ def client_and_icon(tmp_path, monkeypatch):
 
 
 def _stub_fanout_via_real_resolver(monkeypatch):
-    """Stub the worker: resolve languages with prod logic, record completion."""
+    """Stub the spawn seam: resolve languages with prod logic, record completion.
 
-    async def fake_execute(run_id: int) -> None:
+    NTS_074: the run is launched via the sync ``spawn_pipeline_run`` seam (a
+    detached subprocess in prod). The stub runs synchronously in-handler so the
+    completion is visible by the time the 202 returns.
+    """
+
+    def fake_spawn(run_id: int) -> int | None:
         factory = admin_db.get_session_factory()
         with factory() as session:
             run = session.get(Run, run_id)
@@ -76,9 +81,11 @@ def _stub_fanout_via_real_resolver(monkeypatch):
             langs = [lang.value for lang in _languages_for_brand(brand)]
             run.languages_completed = json.dumps(langs)
             run.status = "success"
+            run.pid = 424242
             session.commit()
+        return 424242
 
-    monkeypatch.setattr(admin_jobs, "execute_pipeline_run", fake_execute)
+    monkeypatch.setattr(admin_jobs, "spawn_pipeline_run", fake_spawn)
 
 
 def test_cron_run_all_fans_out_to_all_four_languages(

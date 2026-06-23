@@ -285,10 +285,11 @@ def test_run_all_sources_returns_202_with_run_id(monkeypatch, client, icon_brand
 
     called: list[int] = []
 
-    async def fake_execute(run_id: int) -> None:
+    def fake_spawn(run_id: int) -> int | None:
         called.append(run_id)
+        return 4242
 
-    monkeypatch.setattr(admin_jobs, "execute_pipeline_run", fake_execute)
+    monkeypatch.setattr(admin_jobs, "spawn_pipeline_run", fake_spawn)
 
     # Brand must be active for run-all (M4). Use the brand-update endpoint.
     # Activate by directly setting the active=true via PUT /brands/{id}
@@ -365,10 +366,11 @@ def test_run_creates_run_row_returns_202(monkeypatch, client, icon_brand_id) -> 
 
     called: list[int] = []
 
-    async def fake_execute(run_id: int) -> None:
+    def fake_spawn(run_id: int) -> int | None:
         called.append(run_id)
+        return 4242
 
-    monkeypatch.setattr(admin_jobs, "execute_pipeline_run", fake_execute)
+    monkeypatch.setattr(admin_jobs, "spawn_pipeline_run", fake_spawn)
 
     resp = client.post(f"/api/v1/sources/{created['id']}/run", headers=AUTH)
     assert resp.status_code == 202

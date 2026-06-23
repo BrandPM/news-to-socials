@@ -7,9 +7,9 @@ any value outside ``{cron, manual, cli}`` with a 400.
 
 The fanout itself (brand.languages → run.languages_completed) is exercised
 in ``test_multilang_fanout.py`` and ``tests/unit/test_run_pipeline_fanout.py``;
-here we stub ``execute_pipeline_run`` with a faithful stand-in that copies
-the brand's language roster into the run so the audit assertion mirrors
-production without paying for real LLM calls.
+here we stub the ``spawn_pipeline_run`` seam (NTS_074: a detached subprocess in
+prod) with a faithful stand-in that copies the brand's language roster into the
+run so the audit assertion mirrors production without paying for real LLM calls.
 """
 
 from __future__ import annotations
@@ -68,18 +68,25 @@ def client_and_icon(tmp_path, monkeypatch):
 
 
 def _stub_fanout(monkeypatch):
-    """Stub execute_pipeline_run to simulate a completed multilingual run."""
+    """Stub the spawn seam to simulate a completed multilingual run.
 
-    async def fake_execute(run_id: int) -> None:
+    NTS_074: the run is launched via the sync ``spawn_pipeline_run`` seam (a
+    detached subprocess in prod); the stub runs in-handler so the simulated
+    completion is visible by the time the 202 returns.
+    """
+
+    def fake_spawn(run_id: int) -> int | None:
         factory = admin_db.get_session_factory()
         with factory() as session:
             run = session.get(Run, run_id)
             brand = session.get(Brand, run.brand_id_fk)
             run.languages_completed = brand.languages  # JSON-as-TEXT, mirrors prod
             run.status = "success"
+            run.pid = 424242
             session.commit()
+        return 424242
 
-    monkeypatch.setattr(admin_jobs, "execute_pipeline_run", fake_execute)
+    monkeypatch.setattr(admin_jobs, "spawn_pipeline_run", fake_spawn)
 
 
 def test_run_all_cron_header_records_provenance_and_languages(
@@ -165,3 +172,44 @@ def select_first_source(brand_id: int):
     from sqlalchemy import select
 
     return select(Source).where(Source.brand_id_fk == brand_id)
+
+
+# --- NTS_074: cancel endpoint (HTTP contract) -----------------------------
+
+
+def test_cancel_running_run_returns_cancelled(monkeypatch, client_and_icon) -> None:
+    """POST /runs/{id}/cancel flips a running run to cancelled and is a 200."""
+    client, icon_id = client_and_icon
+
+    # Spawn stub: create the row as 'running' with a pid, but DON'T complete it
+    # (override the default fanout stub so the run stays cancellable).
+    def fake_spawn(run_id: int) -> int | None:
+        factory = admin_db.get_session_factory()
+        with factory() as session:
+            session.get(Run, run_id).pid = 4242
+            session.commit()
+        return 4242
+
+    monkeypatch.setattr(admin_jobs, "spawn_pipeline_run", fake_spawn)
+    # Don't actually signal a real pid during the test.
+    monkeypatch.setattr(admin_jobs, "_terminate_process_group", lambda pid: None)
+
+    run_id = client.post(
+        "/api/v1/sources/run-all", headers=AUTH, json={"brand_id": icon_id}
+    ).json()["run_id"]
+
+    resp = client.post(f"/api/v1/runs/{run_id}/cancel", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "cancelled"
+    assert resp.json()["finished_at"] is not None
+
+    # Idempotent: a second cancel is still a 200 no-op.
+    resp2 = client.post(f"/api/v1/runs/{run_id}/cancel", headers=AUTH)
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["status"] == "cancelled"
+
+
+def test_cancel_unknown_run_is_404(client_and_icon) -> None:
+    client, _ = client_and_icon
+    resp = client.post("/api/v1/runs/999999/cancel", headers=AUTH)
+    assert resp.status_code == 404
