@@ -3,7 +3,7 @@
 S6 multilingual fanout exposed a long-standing bug in the publisher's
 inline ``slugify`` (``pipeline/publisher/sanity.py``): it stripped every
 non-Latin character, so Cyrillic/Polish titles collapsed to ``"untitled"``
-and every non-EN draft landed at ``icon.finance/insights/untitled``.
+and every non-EN draft landed at ``iconfinance.io/insights/untitled``.
 
 This module replaces that with the ``python-slugify`` library (already
 listed in ``pyproject.toml``), which transliterates non-Latin scripts via
@@ -19,7 +19,7 @@ from __future__ import annotations
 from slugify import slugify
 
 # Per-language URL suffix. Empty string for the primary language (English)
-# so icon.finance/insights/<slug> stays clean. Non-primary languages get
+# so iconfinance.io/insights/<slug> stays clean. Non-primary languages get
 # their ISO code appended; that's what disambiguates the same article
 # across the four locales we publish into.
 LANG_SUFFIX: dict[str, str] = {

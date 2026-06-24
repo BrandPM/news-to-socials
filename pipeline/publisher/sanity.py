@@ -1,7 +1,7 @@
 """Sanity publisher (ADR-018).
 
 This is the writer-only client for the existing Sanity CMS that already
-powers icon.finance/insights and /studio/* in the Lovable project.
+powers www.iconfinance.io/insights and /studio/* (ADR-018).
 
 We use Sanity's HTTP API directly (not the official @sanity/client TypeScript
 SDK, which is JS-only). Endpoints we hit:

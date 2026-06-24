@@ -101,6 +101,27 @@ class Settings(BaseSettings):
     # default so the Content hub's Rejected tab has documents to show.
     delete_rejected_from_sanity: bool = Field(default=False)
 
+    @property
+    def public_site_host(self) -> str:
+        """Bare public host (no scheme / path) derived from
+        ``public_site_base_url`` — for the rare caller that needs just the
+        domain. Single source of truth: never hardcode the domain elsewhere."""
+        from urllib.parse import urlparse  # noqa: PLC0415
+
+        return urlparse(self.public_site_base_url).netloc or self.public_site_base_url
+
+    @property
+    def outbound_user_agent(self) -> str:
+        """User-Agent string for outbound HTTP (RSS / web fetches). Carries the
+        public site URL so source operators can identify us, built from the
+        single domain source of truth rather than a hardcoded literal."""
+        return f"{APP_NAME}/{APP_VERSION} (+{self.public_site_base_url.rstrip('/')})"
+
+
+# App identity for outbound User-Agent etc. (kept here so the domain lives in
+# exactly one place — see Settings.public_site_base_url).
+APP_NAME = "news-to-socials"
+APP_VERSION = "0.0.1"
 
 _settings: Settings | None = None
 

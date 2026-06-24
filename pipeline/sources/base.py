@@ -50,7 +50,7 @@ class Source(ABC):
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=timeout,
-            headers={"User-Agent": "news-to-socials/0.0.1 (+https://icon.finance)"},
+            headers={"User-Agent": get_settings().outbound_user_agent},
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()

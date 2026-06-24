@@ -12,7 +12,7 @@ together the modules under ``pipeline/`` into one runnable pipeline:
         → SanityPublisher.publish_draft (creates draft in Sanity Studio)
 
 Andriy approves through /studio (drafts → publish). The published document
-appears at icon.finance/:lang/insights/:slug.
+appears at www.iconfinance.io/:lang/insights/:slug.
 
 Usage:
     python -m scripts.run_pipeline                              # all active sources from admin.db

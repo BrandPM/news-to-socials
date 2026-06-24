@@ -15,7 +15,9 @@ ExecStart=/opt/news-to-socials/repo/.venv/bin/uvicorn pipeline.admin.server:app 
     --host 127.0.0.1 --port 8080 --timeout-graceful-shutdown 15
 Restart=always
 RestartSec=5
-MemoryMax=512M
+# NTS_076: matched to the value already applied on prod (was 512M; raised to
+# 1536M live during NTS_074 when detached runs shared this unit's cgroup).
+MemoryMax=1536M
 # Watchdog (NTS_058): the app pings WATCHDOG=1 from the asyncio event loop via
 # sd_notify (pipeline/admin/watchdog.py). If the loop wedges — the NTS_058
 # incident, where a blocking feedparser.parse froze everything — the pings stop

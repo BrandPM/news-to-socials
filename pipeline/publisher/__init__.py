@@ -1,7 +1,7 @@
 """Publishers: write content to the right downstream system.
 
 * ``sanity``       — primary publisher (Wave 1+; ADR-018). Writes drafts
-                     to the existing Sanity CMS at icon.finance.
+                     to the existing Sanity CMS at www.iconfinance.io.
 * ``telegram_bot`` — Telegram channels via Bot API (Wave 3 — postponed).
 * ``meta_graph``   — Facebook pages + Instagram Business (Wave 2).
 * ``dispatcher``   — channel router (kept; mostly used for Wave 2/3).
