@@ -1,4 +1,4 @@
-"""Telegram push-alerts for pipeline failures (IT_PROJ_NTS_073).
+"""Telegram push-alerts for pipeline failures + visibility (NTS_073/NTS_075).
 
 Run on a 15-minute systemd timer (``nts-monitor.timer``). Each pass:
 
@@ -12,6 +12,20 @@ Run on a 15-minute systemd timer (``nts-monitor.timer``). Each pass:
    records them.
 4. Optionally emits a single "recovered" message when previously-alerting
    notifications have cleared, and prunes their ledger rows.
+5. NTS_075 — emits **pipeline-visibility** pulses so the manager sees the
+   pipeline breathing in Telegram, not just failures:
+
+   * ``run_started:{id}``    — a run entered ``status='running'``.
+   * ``run_finished:{id}``   — a run reached ``success``/``cancelled``.
+     ``failed`` is **deliberately excluded**: the NTS_073 ``run_failed``
+     alert already owns failed runs, so a failed run gets exactly one
+     message, never two.
+   * ``published:{sanity_id}`` — a draft was published to Sanity.
+
+   Each pulse has its own ``alert_sent`` key (so it sends once) and is
+   windowed to the last 24h so the first tick after a deploy can't replay
+   the whole backlog. These keys are never part of the "recovered"
+   reconciliation — they are one-shot pulses, not clearable incidents.
 
 Safety contract (this runs unattended):
 
@@ -28,12 +42,13 @@ from __future__ import annotations
 
 import asyncio
 import html
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
 from pipeline.admin.db import session_scope
-from pipeline.admin.models import AlertSent, Brand
+from pipeline.admin.models import AlertSent, Brand, DraftApproval, Run
 from pipeline.admin.notifications_core import compute_notifications
 from pipeline.admin.schemas import NotificationItemOut
 from pipeline.common.config import get_settings
@@ -55,6 +70,32 @@ MAX_INDIVIDUAL_ALERTS = 5
 # to the in-app notifications list — it is not an ops incident.
 ALERTABLE_KINDS = ("run_failed", "source_unhealthy")
 _SEVERITY_RANK = {"danger": 0, "warning": 1}
+
+# NTS_075 — visibility pulses. Their alert_sent keys carry these prefixes so
+# we can tell them apart from the NTS_073 incident ids ("run-47", "source-3")
+# and keep them OUT of the "recovered" reconciliation (one-shot pulses, not
+# clearable incidents).
+VISIBILITY_PREFIXES = ("run_started:", "run_finished:", "published:")
+
+# Only look back this far when detecting visibility pulses — bounds the query
+# and stops the first tick after a deploy from replaying the whole backlog.
+VISIBILITY_WINDOW = timedelta(hours=24)
+
+# Run.triggered_by → human label for the "Кто" line. Unknown values fall back
+# to the escaped raw value.
+_TRIGGER_LABELS = {
+    "cron": "cron (по расписанию)",
+    "manual": "менеджер (вручную)",
+    "cli": "CLI",
+}
+
+# Terminal status → emoji for the run_finished pulse. 'failed' is rendered
+# here for completeness/tests but is never enqueued (run_failed owns it).
+_FINISHED_EMOJI = {"success": "✅", "cancelled": "⏹", "failed": "🔴"}
+
+
+def _is_visibility_key(notification_id: str) -> bool:
+    return notification_id.startswith(VISIBILITY_PREFIXES)
 
 
 # --- Message rendering (pure, unit-tested) ---------------------------------
@@ -127,6 +168,251 @@ def format_resolved(cleared_count: int) -> str:
     )
 
 
+# --- Visibility pulses (NTS_075, pure renderers) ---------------------------
+
+
+def _fmt_hm(dt: datetime) -> str:
+    """``HH:MM`` in UTC. Naive datetimes (SQLite) are treated as UTC."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%H:%M")
+
+
+def format_run_started(
+    *, run_id: int, triggered_by: str, source_count: int, started_at: datetime
+) -> str:
+    """🚀 pulse when a run starts parsing."""
+    who = _TRIGGER_LABELS.get(triggered_by, html.escape(triggered_by))
+    return (
+        "🚀 <b>Парсинг запущен</b>\n"
+        f"Кто: {who}\n"
+        f"Источников: {source_count}\n"
+        f"🕓 {_fmt_hm(started_at)} UTC · Run #{run_id}"
+    )
+
+
+def format_run_finished(
+    *,
+    run_id: int,
+    status: str,
+    fetched: int,
+    relevant: int,
+    drafted: int,
+    finished_at: datetime,
+) -> str:
+    """✅/🔴/⏹ pulse when a run reaches a terminal status.
+
+    ``relevant`` is ``stats['scored']`` — the items that cleared the
+    relevance threshold (``score >= min_score``) — out of ``fetched``.
+    """
+    emoji = _FINISHED_EMOJI.get(status, "✅")
+    return (
+        f"{emoji} <b>Прогон завершён · Run #{run_id}</b>\n"
+        f"Найдено релевантных: {relevant}/{fetched} · черновиков: {drafted}\n"
+        f"🕓 {_fmt_hm(finished_at)} UTC"
+    )
+
+
+def format_published(
+    *,
+    title: str | None,
+    language: str | None,
+    live_url: str | None,
+    published_at: datetime,
+) -> str:
+    """📤 pulse when a draft is published. ``title`` is user-derived → escaped."""
+    safe_title = html.escape(title or "—")
+    lang = html.escape((language or "—").upper())
+    lines = [
+        f'📤 <b>Опубликовано: "{safe_title}"</b>',
+        f"Язык: {lang} · 🕓 {_fmt_hm(published_at)} UTC",
+    ]
+    if live_url:
+        href = html.escape(live_url, quote=True)
+        lines.append(f'→ <a href="{href}">{html.escape(live_url)}</a>')
+    return "\n".join(lines)
+
+
+# --- Visibility pulses (detection) -----------------------------------------
+
+
+def _count_sources(source_ids_json: str | None) -> int:
+    """``len()`` of the JSON-as-TEXT ``runs.source_ids`` list; 0 on garbage."""
+    try:
+        val = json.loads(source_ids_json or "[]")
+    except (ValueError, TypeError):
+        return 0
+    return len(val) if isinstance(val, list) else 0
+
+
+def _parse_stats(stats_json: str | None) -> dict:
+    """``runs.stats`` is ``{fetched, scored, drafted, errors}`` JSON-as-TEXT."""
+    if not stats_json:
+        return {}
+    try:
+        val = json.loads(stats_json)
+    except (ValueError, TypeError):
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
+    """``run_started`` + ``run_finished`` pulses not yet in the ledger.
+
+    ``failed`` runs are excluded from ``run_finished`` — the NTS_073
+    ``run_failed`` alert owns them, so a failed run is never double-sent.
+    """
+    now = datetime.now(tz=timezone.utc)
+    window_start = now - VISIBILITY_WINDOW
+    out: list[tuple[str, str]] = []
+    with session_scope() as session:
+        running = (
+            session.execute(
+                select(Run)
+                .where(Run.status == "running", Run.started_at >= window_start)
+                .order_by(Run.started_at.desc())
+                .limit(50)
+            )
+            .scalars()
+            .all()
+        )
+        for r in running:
+            key = f"run_started:{r.id}"
+            if key in already:
+                continue
+            out.append(
+                (
+                    key,
+                    format_run_started(
+                        run_id=r.id,
+                        triggered_by=r.triggered_by,
+                        source_count=_count_sources(r.source_ids),
+                        started_at=r.started_at,
+                    ),
+                )
+            )
+
+        finished = (
+            session.execute(
+                select(Run)
+                .where(
+                    Run.status.in_(("success", "cancelled")),
+                    Run.finished_at.is_not(None),
+                    Run.finished_at >= window_start,
+                )
+                .order_by(Run.finished_at.desc())
+                .limit(50)
+            )
+            .scalars()
+            .all()
+        )
+        for r in finished:
+            key = f"run_finished:{r.id}"
+            if key in already:
+                continue
+            stats = _parse_stats(r.stats)
+            out.append(
+                (
+                    key,
+                    format_run_finished(
+                        run_id=r.id,
+                        status=r.status,
+                        fetched=int(stats.get("fetched", 0) or 0),
+                        relevant=int(stats.get("scored", 0) or 0),
+                        drafted=int(stats.get("drafted", 0) or 0),
+                        finished_at=r.finished_at,
+                    ),
+                )
+            )
+    return out
+
+
+async def _fetch_published_meta(
+    brand_id: int, sanity_published_id: str
+) -> dict | None:
+    """Resolve a published doc's ``title``/``language`` + public ``live_url``.
+
+    The localised slug + title live only in Sanity, so this queries the
+    brand's dataset and reuses ``_build_live_url`` for the canonical URL.
+    Returns ``None`` (skip the pulse) if the brand has no creds or the
+    query fails — never raises (the timer runs unattended).
+    """
+    # Lazy import: routes.drafts pulls in FastAPI; keep module import cheap.
+    from pipeline.admin.routes.drafts import (  # noqa: PLC0415
+        _build_live_url,
+        _build_sanity_client_for_brand,
+    )
+
+    try:
+        client, brand_slug = _build_sanity_client_for_brand(brand_id)
+    except Exception:  # noqa: BLE001
+        log.warning("alerts.published_no_client", brand_id=brand_id)
+        return None
+    groq = '*[_id == $id][0]{title, language, "slug": slug.current}'
+    try:
+        doc = await client.query(groq, {"id": sanity_published_id})  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        log.exception("alerts.published_query_failed", pub_id=sanity_published_id)
+        return None
+    if not isinstance(doc, dict):
+        return None
+    language = doc.get("language") or "en"
+    return {
+        "title": doc.get("title"),
+        "language": language,
+        "live_url": _build_live_url(brand_slug, language, doc.get("slug")),
+    }
+
+
+async def _gather_published_events(already: set[str]) -> list[tuple[str, str]]:
+    """``published`` pulses for draft_approvals published in the last 24h.
+
+    "Published" = ``published_at`` + ``sanity_published_id`` are set (the
+    approve→publish step records both; ``status`` stays ``'approved'``).
+    """
+    now = datetime.now(tz=timezone.utc)
+    window_start = now - VISIBILITY_WINDOW
+    with session_scope() as session:
+        rows = (
+            session.execute(
+                select(DraftApproval)
+                .where(
+                    DraftApproval.published_at.is_not(None),
+                    DraftApproval.sanity_published_id.is_not(None),
+                    DraftApproval.published_at >= window_start,
+                )
+                .order_by(DraftApproval.published_at.desc())
+                .limit(50)
+            )
+            .scalars()
+            .all()
+        )
+        # Detach the few primitives we need before the session closes.
+        pending = [
+            (a.sanity_published_id, a.brand_id_fk, a.published_at)
+            for a in rows
+            if f"published:{a.sanity_published_id}" not in already
+        ]
+
+    out: list[tuple[str, str]] = []
+    for pub_id, brand_id, published_at in pending:
+        meta = await _fetch_published_meta(brand_id, pub_id)
+        if meta is None:
+            continue
+        out.append(
+            (
+                f"published:{pub_id}",
+                format_published(
+                    title=meta["title"],
+                    language=meta["language"],
+                    live_url=meta["live_url"],
+                    published_at=published_at,
+                ),
+            )
+        )
+    return out
+
+
 # --- Orchestration ---------------------------------------------------------
 
 
@@ -191,7 +477,13 @@ async def run_alerts(
 
     # Preserve the danger-first ordering from _gather_alertable.
     new_ids = [item.id for item, _ in alertable if item.id not in already]
-    gone_ids = [iid for iid in already if iid not in current]
+    # Visibility pulses (run_started/finished/published) are one-shot — never
+    # part of the "recovered" reconciliation, so exclude their keys here.
+    gone_ids = [
+        iid
+        for iid in already
+        if iid not in current and not _is_visibility_key(iid)
+    ]
 
     chat_id = settings.telegram_monitoring_chat_id
     publisher = publisher or TelegramPublisher()
@@ -217,6 +509,22 @@ async def run_alerts(
             sent.extend(overflow)
         except Exception:  # noqa: BLE001
             log.exception("alerts.summary_send_failed", count=len(overflow))
+
+    # NTS_075 — pipeline-visibility pulses. Own dedup keys, no cap (windowed
+    # to 24h so volume is naturally bounded), gathered defensively.
+    visibility: list[tuple[str, str]] = []
+    try:
+        visibility.extend(_gather_run_events(already))
+        visibility.extend(await _gather_published_events(already))
+    except Exception:  # noqa: BLE001 — unattended; never crash the timer
+        log.exception("alerts.visibility_gather_failed")
+    for key, message in visibility:
+        try:
+            await publisher._send_message(chat_id, message)
+        except Exception:  # noqa: BLE001
+            log.exception("alerts.visibility_send_failed", key=key)
+            continue
+        sent.append(key)
 
     if sent:
         now = datetime.now(tz=timezone.utc)
