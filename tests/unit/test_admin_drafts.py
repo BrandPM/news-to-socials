@@ -348,7 +348,7 @@ def test_get_draft_state_published_only_surfaces_publication_info(
     assert info["note"] == "ship it"
     assert info["published_at"].startswith("2026-05-25T08:31")
     assert info["live_url"] == (
-        "https://icon.finance/insights/eu-credit-fund-framework-lands"
+        "https://www.iconfinance.io/en/insights/eu-credit-fund-framework-lands"
     )
 
 
@@ -383,7 +383,7 @@ def test_get_draft_state_published_only_without_approval_row(
     info = body["publication_info"]
     assert info["published_at"] is None
     assert info["approver"] is None
-    assert info["live_url"] == "https://icon.finance/insights/legacy"
+    assert info["live_url"] == "https://www.iconfinance.io/en/insights/legacy"
 
 
 def test_get_draft_state_both_returns_draft_plus_publication_info(
@@ -731,7 +731,7 @@ def test_list_drafts_status_published_uses_non_drafts_groq(
     assert body["by_status"] == {"pending": 0, "published": 1, "rejected": 0}
     assert body["items"][0]["status"] == "published"
     assert body["items"][0]["live_url"] == (
-        "https://icon.finance/insights/live-post"
+        "https://www.iconfinance.io/en/insights/live-post"
     )
     # Counts GROQ + items GROQ both must reference the non-drafts clause.
     # (counts call is index 0, items call is index 1.)
@@ -910,3 +910,59 @@ def test_get_draft_state_rejected_surfaces_rejection_info(
     # The draft envelope is still populated so the rejected-view can
     # show the read-only preview.
     assert body["draft"]["title"] == "Rejected piece"
+
+
+# ---------------------------------------------------------------------------
+# _build_live_url (NTS_075) — canonical {base}/{language}/insights/{slug}
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "language,slug,expected",
+    [
+        ("en", "post", "https://www.iconfinance.io/en/insights/post"),
+        ("ru", "post-ru", "https://www.iconfinance.io/ru/insights/post-ru"),
+        ("uk", "post-uk", "https://www.iconfinance.io/uk/insights/post-uk"),
+        ("pl", "post-pl", "https://www.iconfinance.io/pl/insights/post-pl"),
+    ],
+)
+def test_build_live_url_per_language(monkeypatch, language, slug, expected):
+    """icon brand → {base}/{language}/insights/{slug} for every language,
+    using the new public domain from settings.public_site_base_url."""
+    monkeypatch.setattr(config_module, "_settings", None)
+    monkeypatch.delenv("PUBLIC_SITE_BASE_URL", raising=False)
+    from pipeline.admin.routes.drafts import _build_live_url
+
+    assert _build_live_url("icon", language, slug) == expected
+
+
+def test_build_live_url_respects_configured_base(monkeypatch):
+    """PUBLIC_SITE_BASE_URL override wins; trailing slash is trimmed."""
+    monkeypatch.setattr(config_module, "_settings", None)
+    monkeypatch.setenv("PUBLIC_SITE_BASE_URL", "https://staging.example.com/")
+    from pipeline.admin.routes.drafts import _build_live_url
+
+    assert (
+        _build_live_url("icon", "en", "post")
+        == "https://staging.example.com/en/insights/post"
+    )
+
+
+def test_build_live_url_non_icon_brand_is_none(monkeypatch):
+    monkeypatch.setattr(config_module, "_settings", None)
+    from pipeline.admin.routes.drafts import _build_live_url
+
+    assert _build_live_url("acme", "en", "post") is None
+
+
+@pytest.mark.parametrize(
+    "language,slug",
+    [(None, "post"), ("", "post"), ("en", None), ("en", "")],
+)
+def test_build_live_url_missing_language_or_slug_is_none(
+    monkeypatch, language, slug
+):
+    monkeypatch.setattr(config_module, "_settings", None)
+    from pipeline.admin.routes.drafts import _build_live_url
+
+    assert _build_live_url("icon", language, slug) is None

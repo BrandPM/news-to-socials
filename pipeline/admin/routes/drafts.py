@@ -434,7 +434,9 @@ async def list_drafts(
         rejected_at = None
         rejection_reason = None
         if status == "published":
-            live_url = _build_live_url(brand_slug, slug_val)
+            live_url = _build_live_url(
+                brand_slug, str(raw.get("language") or "en"), slug_val
+            )
             if approval_row is not None:
                 published_at = approval_row.published_at
         elif status == "rejected":
@@ -538,16 +540,24 @@ def _portable_text_to_markdown(body: object) -> str | None:
     return "\n\n".join(chunks) if chunks else None
 
 
-def _build_live_url(brand_slug: str, slug: str | None) -> str | None:
+def _build_live_url(
+    brand_slug: str, language: str | None, slug: str | None
+) -> str | None:
     """Public URL for the published post. Currently only Icon Finance has
     one — other brands return ``None`` rather than guessing a domain
     we can't verify. Worth promoting to a Brand column when a second
     brand needs the link.
+
+    Canonical shape is ``{base}/{language}/insights/{slug}`` for every
+    language (including ``en`` → ``/en/insights/<slug>``); the slug is
+    already localised per-language in Sanity. The base domain comes from
+    ``settings.public_site_base_url`` (NTS_075) — no hardcoded domains.
     """
-    if not slug:
+    if not slug or not language:
         return None
     if brand_slug == "icon":
-        return f"https://icon.finance/insights/{slug}"
+        base = get_settings().public_site_base_url.rstrip("/")
+        return f"{base}/{language}/insights/{slug}"
     return None
 
 
@@ -788,7 +798,11 @@ async def get_draft(
             published_at=approval_row.published_at if approval_row else None,
             approver=approval_row.decided_by if approval_row else None,
             note=approval_row.note if approval_row else None,
-            live_url=_build_live_url(pub_brand_slug, pub_slug),
+            live_url=_build_live_url(
+                pub_brand_slug,
+                str(published_doc.get("language") or "en"),  # type: ignore[union-attr]
+                pub_slug,
+            ),
         )
 
     rejection_info: RejectionInfoOut | None = None

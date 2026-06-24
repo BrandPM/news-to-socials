@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     # NTS_025 § "Credential encryption".
     brands_encryption_key: str = Field(default="", repr=False)
 
+    # Public-facing site (NTS_075). Base URL of the live marketing site the
+    # "View live" link points at. Canonical live URL is
+    # ``{base}/{language}/insights/{slug}``. Override per-env via
+    # PUBLIC_SITE_BASE_URL.
+    public_site_base_url: str = "https://www.iconfinance.io"
+
     # Optional services
     ml_service_url: str = ""
     browser_render_url: str = ""
