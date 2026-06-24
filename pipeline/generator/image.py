@@ -7,8 +7,8 @@ Strategy:
 * Send a strong negative prompt to avoid embedded text / watermarks /
   signatures, which would conflict with our captions/CTAs.
 * Returns the URL of the generated PNG hosted on Replicate's CDN. The
-  caller is responsible for downloading and re-uploading into Directus
-  ``/files`` so we don't depend on the temporary CDN past the post lifetime.
+  caller is responsible for downloading and re-uploading into Sanity
+  assets so we don't depend on the temporary CDN past the post lifetime.
 """
 
 from __future__ import annotations

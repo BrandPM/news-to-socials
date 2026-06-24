@@ -6,7 +6,7 @@ Wraps tenacity with sane defaults for our case:
 * respects ``Retry-After`` on 429 if the caller raises an HTTPError carrying it
 * retries on connection errors, timeouts, and 5xx / 429
 
-Apply to **every** outbound call (Claude, OpenAI, Replicate, Meta, Directus,
+Apply to **every** outbound call (OpenAI, Replicate, Meta, Sanity,
 Telegram, httpx fetches). Non-retryable 4xx must raise and abort.
 """
 

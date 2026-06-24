@@ -42,10 +42,6 @@ class Settings(BaseSettings):
     sanity_api_version: str = "2024-01-01"
     sanity_api_token: str = ""
 
-    # Directus (DEPRECATED — kept for backwards-compat, see ADR-018)
-    directus_url: str = ""
-    directus_token: str = ""
-
     # Pipeline runtime
     pipeline_db_path: Path = Path("./pipeline.db")
     admin_db_path: Path = Path("./admin.db")

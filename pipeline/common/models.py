@@ -4,7 +4,7 @@ Keep these small and **stable**. Anything brand- or channel-specific belongs
 in the relevant submodule, not here.
 
 Naming aligns with our Master Documentation §3 and §12 glossary:
-* Source  — RSS / Telegram / web origin (config in Directus.sources)
+* Source  — RSS / Telegram / web origin (config in admin.db ``sources``)
 * RawItem — what a Source returns
 * Topic   — a RawItem that passed the relevance + dedup gate
 * Draft   — LLM output (title + body + key takeaway), pre-format

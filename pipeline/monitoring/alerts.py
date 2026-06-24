@@ -33,9 +33,6 @@ Safety contract (this runs unattended):
   is a **no-op** + ``log.warning("alerts.telegram_not_configured")``.
 * No exception escapes :func:`run_alerts`. A single send that fails is
   logged and skipped; its id is *not* recorded, so the next pass retries.
-
-This module deliberately does **not** touch the legacy Directus
-``daily_summary.py``.
 """
 
 from __future__ import annotations

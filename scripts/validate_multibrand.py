@@ -30,7 +30,7 @@ async def main() -> int:
     # TODO(stage-5): wire this once the pipeline orchestrator exists.
     # The shape of the run is:
     #   1. pick the synthetic Topic (Visa launches X)
-    #   2. for each brand in Directus.brands.active=true:
+    #   2. for each brand in admin.db brands where active=true:
     #        for each language in brand.languages:
     #            generate Draft
     #            for each Channel routing to that brand+language:

@@ -1,10 +1,19 @@
 # Operational runbook
 
-When something goes wrong and the daily-summary TG message is empty for
-12h+, walk this list. The most likely failure modes are at the top.
+> **⚠️ OUTDATED — pre-ADR-018 (Directus era).** This runbook describes the
+> original Directus + `news-poll`/`news-dispatch`/`news-stale`/`news-summary`/
+> `news-bot` stack, all removed in NTS_076. The current deployment is the
+> **admin API** (`nts-admin-api.service`) that triggers runs on demand, the
+> **Sanity** publisher, and the **`nts-monitor.timer`** alerter (NTS_073/075).
+> Pipeline runs + their logs/events are inspected via the admin API and
+> `journalctl -u nts-admin-api`. The sections below are kept as historical
+> reference until this runbook is rewritten for the Sanity stack.
 
-> All commands assume you're on the production VPS as the `news-deploy`
-> user, in `/opt/news-to-socials`.
+When something goes wrong, walk this list. The most likely failure modes
+are at the top.
+
+> All commands assume you're on the production VPS as the service user, in
+> `/opt/news-to-socials`.
 
 ## 0. Quick triage
 

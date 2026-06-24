@@ -22,6 +22,6 @@ class WebSource(Source):
     type = SourceType.web
 
     async def fetch(self, since: datetime | None = None) -> Iterable[RawItem]:
-        # TODO(stage-3+): per-source selectors stored in Directus.sources.opts.
+        # TODO(stage-3+): per-source selectors stored in admin.db sources.opts.
         log.warning("web.fetch.not_implemented", source=self.name)
         return []

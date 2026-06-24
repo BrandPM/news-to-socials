@@ -75,13 +75,12 @@ news-to-socials/
 │   ├── selector/     # topic_picker, dedup — pick + deduplicate
 │   ├── generator/    # comment_writer, anti_ai_check, image, image_resizer
 │   ├── adapter/      # blog, telegram, facebook, instagram — per-channel format
-│   ├── publisher/    # directus, telegram_bot, meta_graph, dispatcher
+│   ├── publisher/    # sanity (primary), telegram_bot, meta_graph
 │   ├── queue/        # publish_queue, publish_windows, rate_limit
-│   ├── scheduler/    # poll_sources, dispatch_queue, stale_posts
-│   ├── monitoring/   # daily_summary, alerts, health_check
+│   ├── admin/        # FastAPI admin API (runs, drafts, brands, prompts)
+│   ├── monitoring/   # alerts — Telegram failure/visibility alerter
 │   └── common/       # config, db, retry, logging, models
-├── bot/              # approval_bot.py — Telegram inline-button approval
-├── cms/              # Directus docker-compose + schema snapshots
+├── cms_DEPRECATED/   # old Directus docker-compose + schema (pre-ADR-018)
 ├── infra/            # systemd units + backup scripts
 ├── docs/             # README, ARCHITECTURE, RUNBOOK, ADR/
 ├── scripts/          # one-shot tools: tune_dedup, validate_multibrand, observation_report

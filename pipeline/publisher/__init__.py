@@ -2,12 +2,12 @@
 
 * ``sanity``       — primary publisher (Wave 1+; ADR-018). Writes drafts
                      to the existing Sanity CMS at www.iconfinance.io.
-* ``telegram_bot`` — Telegram channels via Bot API (Wave 3 — postponed).
+* ``telegram_bot`` — Telegram Bot API client. Used by the monitoring
+                     alerter (NTS_073); also the Wave 3 channel publisher.
 * ``meta_graph``   — Facebook pages + Instagram Business (Wave 2).
-* ``dispatcher``   — channel router (kept; mostly used for Wave 2/3).
-* ``directus``     — DEPRECATED writer for the previous CMS choice.
-                     Kept in the repo for reference and possible reuse on
-                     other brands. Not used in production. See ADR-018.
+
+The Directus writer + channel dispatcher were removed in NTS_076 (dead
+since the ADR-018 Sanity pivot).
 """
 
 from .sanity import SanityClient, SanityPublisher, SanityPostInput

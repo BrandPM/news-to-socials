@@ -1,1 +1,1 @@
-"""Production monitoring: daily summary, alerts, health endpoint."""
+"""Production monitoring: the Telegram failure/visibility alerter (NTS_073/075)."""
