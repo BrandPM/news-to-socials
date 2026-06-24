@@ -29,7 +29,7 @@ import subprocess
 import sys
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -37,7 +37,7 @@ from typing import Any
 from sqlalchemy import select
 
 from pipeline.admin.db import get_session_factory
-from pipeline.admin.models import Run, Source
+from pipeline.admin.models import Run
 from pipeline.common.config import get_settings
 from pipeline.common.logging import get_logger
 

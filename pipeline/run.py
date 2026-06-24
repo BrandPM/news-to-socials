@@ -496,7 +496,10 @@ async def _build_topics_for_source(
 
     if source_record.source_type != "rss":
         log.warning("source.unsupported_type", type=source_record.source_type)
-        return []
+        # Must match the declared (topics, fetched_count) shape — the caller
+        # unpacks the tuple, so a bare ``[]`` would crash on a non-rss source
+        # (NTS_076 audit fix).
+        return [], 0
 
     source = RssSource(
         source_id=(

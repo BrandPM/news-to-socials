@@ -7,7 +7,6 @@ business logic lives in the modules; the CLI just wires them together.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
 
 import typer
 

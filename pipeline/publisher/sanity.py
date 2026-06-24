@@ -32,7 +32,6 @@ References:
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -43,7 +42,7 @@ import httpx
 
 from ..common.config import get_settings
 from ..common.logging import get_logger
-from ..common.models import Channel, Draft, Language, Post, PostStatus
+from ..common.models import Channel, Draft, Language, Post
 from ..common.retry import with_retry
 from ..common.slug import compute_slug
 
@@ -166,7 +165,7 @@ class SanityClient:
         draft_id = doc["_id"] if doc["_id"].startswith("drafts.") else f"drafts.{doc['_id']}"
         doc["_id"] = draft_id
 
-        result = await self.mutate([{"create": doc}])
+        await self.mutate([{"create": doc}])
         log.info("sanity.draft_created", id=draft_id)
         return draft_id
 
