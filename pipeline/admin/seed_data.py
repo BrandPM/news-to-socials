@@ -132,6 +132,18 @@ def get_active_translate_prompt() -> tuple[str, str]:
     return ("v1.0 — faithful EN→target translation (NTS_065)", _TRANSLATE_PROMPT)
 
 
+def get_active_image_prompt() -> tuple[str, str]:
+    """Return ``(version_name, content)`` for the active image_prompt — the
+    NTS_075 cover-image scene brief. Seeding it makes the default visible +
+    editable in the Prompts UI; generation falls back to the same constant
+    when no active row exists."""
+    from pipeline.generator.image_prompt import (  # noqa: PLC0415
+        _DEFAULT_IMAGE_PROMPT_TEMPLATE,
+    )
+
+    return ("v1.0 — topic-aware cover scene (NTS_075)", _DEFAULT_IMAGE_PROMPT_TEMPLATE)
+
+
 # Pipeline config defaults — match icon_brand_config() at seed time.
 ICON_SEED_THRESHOLD = 7
 ICON_SEED_TOPICS_PER_RUN = 3

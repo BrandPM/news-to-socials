@@ -42,6 +42,8 @@ from pipeline.admin.schemas import (
     BrandSummary,
     BrandTestSanityOut,
     BrandUpdate,
+    ImageStylesOut,
+    ImageStylesUpdateIn,
     validate_languages_payload,
 )
 
@@ -296,6 +298,53 @@ def update_banned_phrases(
         session.flush()
         banned = read_banned_by_language(new_yaml, languages)
         return BannedByLanguageOut(languages=languages, banned=banned)
+
+
+@router.get("/{brand_id}/image-styles", response_model=ImageStylesOut)
+def get_image_styles(brand_id: int) -> ImageStylesOut:
+    """Cover-image style prompts from ``image.style_prompts`` in the voice
+    profile (NTS_075 L3) — the list generation actually uses. Empty means the
+    brand falls back to the built-in default set."""
+    from pipeline.admin.image_styles import read_image_styles  # noqa: PLC0415
+
+    with session_scope() as session:
+        row = session.get(Brand, brand_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="brand not found")
+        return ImageStylesOut(styles=read_image_styles(row.voice_profile_yaml or ""))
+
+
+@router.put("/{brand_id}/image-styles", response_model=ImageStylesOut)
+def update_image_styles(
+    brand_id: int, payload: ImageStylesUpdateIn
+) -> ImageStylesOut:
+    """Replace the brand's cover-image style prompts inside the voice profile,
+    preserving voice / banned_phrases / topics_relevant. The next run +
+    Regenerate pick the new list up via parse_image_style_prompts."""
+    import yaml  # noqa: PLC0415
+
+    from pipeline.admin.image_styles import (  # noqa: PLC0415
+        read_image_styles,
+        write_image_styles,
+    )
+
+    with session_scope() as session:
+        row = session.get(Brand, brand_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="brand not found")
+        try:
+            new_yaml = write_image_styles(
+                row.voice_profile_yaml or "", payload.styles
+            )
+        except yaml.YAMLError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"voice_profile_yaml is not valid YAML: {exc}",
+            ) from exc
+        row.voice_profile_yaml = new_yaml
+        row.updated_at = datetime.now(tz=timezone.utc)
+        session.flush()
+        return ImageStylesOut(styles=read_image_styles(new_yaml))
 
 
 @router.delete("/{brand_id}", status_code=status.HTTP_204_NO_CONTENT)

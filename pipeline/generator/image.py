@@ -27,9 +27,47 @@ from ..common.retry import with_retry
 log = get_logger(__name__)
 
 _NEGATIVE = (
-    "text, watermark, logo, signature, blurry, low quality, "
-    "deformed, extra fingers, jpeg artifacts"
+    "text, words, letters, captions, watermark, logo, signature, blurry, "
+    "low quality, deformed, extra fingers, jpeg artifacts"
 )
+
+# NTS_075 L1 — the built-in fallback style set for Icon, used when the brand's
+# voice profile carries no ``image.style_prompts`` (L3). Deliberately diverse:
+# not just luxury interiors (the W6 failure mode that made every cover a blank
+# marble room) but abstract finance, urban architecture, macro texture,
+# editorial illustration, and documentary photography across palettes, angles,
+# and times of day. Each entry is a self-contained visual directive that wraps
+# the per-topic scene as ``{scene}, {style}``.
+DEFAULT_ICON_IMAGE_STYLES: list[str] = [
+    "abstract financial geometry, intersecting gold and graphite lines on a "
+    "deep navy field, precise and minimal, soft studio gradient",
+    "flowing data-network visualization, luminous nodes and connective threads, "
+    "dark teal background, cinematic depth, no text",
+    "modern business district, glass skyscrapers shot from below at golden hour, "
+    "warm reflective façades, crisp architectural photography",
+    "downtown financial quarter at blue hour, illuminated office towers, cool "
+    "blue and amber palette, long-exposure calm, wide cityscape",
+    "macro detail of brushed metal and stone, raking light revealing texture, "
+    "neutral monochrome palette, shallow depth of field",
+    "macro still life of layered paper and ledger surfaces, warm desk light, "
+    "muted sepia tones, tactile and editorial",
+    "minimalist concept composition, a single sculptural object centred in vast "
+    "negative space, soft daylight, restrained and quiet",
+    "editorial flat-vector illustration, geometric financial motifs, muted earth "
+    "tones with one accent colour, clean magazine aesthetic",
+    "documentary photograph of a calm modern boardroom, natural window light, "
+    "neutral palette, candid unposed framing",
+    "aerial documentary view of a coastal financial capital, soft haze, balanced "
+    "natural colour, sense of scale and distance",
+    "abstract market-flow artwork, sweeping translucent ribbons suggesting "
+    "capital movement, charcoal background with cool highlights",
+    "architectural interior of a contemporary atrium, clean lines and columns, "
+    "diffused daylight, airy and spacious, understated palette",
+    "cinematic landscape metaphor, distant mountain horizon at dawn, vast open "
+    "sky, muted gradient, contemplative and premium",
+    "macro of polished currency and metal coins arranged abstractly, dramatic "
+    "side lighting, warm metallic tones, no readable text",
+]
 
 
 @dataclass(frozen=True)
@@ -59,14 +97,26 @@ class ImageGenerator:
         brand_visual: BrandVisual,
         *,
         operation: str = "image_master",
+        scene: str | None = None,
     ) -> str:
         if not brand_visual.image_style_prompts:
             raise ValueError(f"brand {brand_visual.brand_id} has no image_style_prompts")
 
         style = random.choice(brand_visual.image_style_prompts)  # noqa: S311
-        prompt = f"{topic.raw.title}, {style}"
+        # NTS_075 L2: prefer the LLM-derived visual scene (relevant to THIS
+        # article) over the bare headline, which was a weak signal that let
+        # Flux collapse into its default luxury interior. Fall back to the
+        # title when no scene was built (LLM off/failed) — image generation
+        # must never be blocked by the scene step.
+        base = (scene or topic.raw.title or "").strip()
+        prompt = f"{base}, {style}"
 
-        log.info("image.generate", brand=brand_visual.brand_id, prompt_len=len(prompt))
+        log.info(
+            "image.generate",
+            brand=brand_visual.brand_id,
+            prompt_len=len(prompt),
+            has_scene=bool(scene),
+        )
         if self._client is None:
             raise RuntimeError("REPLICATE_API_TOKEN missing; cannot generate image")
         start = time.monotonic()

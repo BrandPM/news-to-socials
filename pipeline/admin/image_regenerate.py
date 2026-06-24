@@ -14,6 +14,7 @@ from __future__ import annotations
 from pipeline.common.logging import get_logger
 from pipeline.common.models import Channel, RawItem, Topic
 from pipeline.generator.image import BrandVisual, ImageGenerator
+from pipeline.generator.image_prompt import build_scene_prompt
 from pipeline.generator.image_resizer import fetch_master, resize_for_channel
 from pipeline.publisher.sanity import SanityClient, SanityPublisher
 
@@ -23,13 +24,38 @@ log = get_logger(__name__)
 # Module-level so tests can monkeypatch a fake brand visual without
 # importing the whole brand config.
 def _brand_visual_for(brand_id: str) -> BrandVisual:
-    from pipeline.run import icon_brand_config  # noqa: PLC0415
+    """Build the brand's image visual, reading styles from its voice profile.
+
+    NTS_075 L3 — styles live in ``brand.voice_profile_yaml`` (``image.
+    style_prompts``), same as a real run, so Regenerate honours operator
+    edits. Falls back to the built-in default set if the profile carries
+    none / the DB read fails (never blocks a regenerate)."""
+    from pipeline.run import _resolve_brand_image_styles  # noqa: PLC0415
 
     if brand_id != "icon":
         raise NotImplementedError(
             f"brand {brand_id!r} not supported yet (S5)"
         )
-    return icon_brand_config().visual
+
+    voice_yaml: str | None = None
+    try:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from pipeline.admin.db import session_scope  # noqa: PLC0415
+        from pipeline.admin.models import Brand  # noqa: PLC0415
+
+        with session_scope() as session:
+            row = session.execute(
+                select(Brand).where(Brand.slug == "icon")
+            ).scalar_one_or_none()
+            voice_yaml = row.voice_profile_yaml if row is not None else None
+    except Exception:  # noqa: BLE001
+        voice_yaml = None
+
+    return BrandVisual(
+        brand_id="icon",
+        image_style_prompts=_resolve_brand_image_styles(voice_yaml),
+    )
 
 
 async def regenerate_cover_image(
@@ -99,9 +125,16 @@ async def regenerate_cover_image(
     # to the originating draft — applying it to siblings is a free patch.
     ctx = CostContext(brand_id_fk=icon_brand_id_fk, draft_id=draft_form)
     with cost_context(ctx):
+        # NTS_075 L2: Regenerate uses the same smart per-topic scene as a run.
+        # Exception: when the operator supplied a custom_prompt, that is the
+        # whole point of the override — send it verbatim (no LLM scene). Both
+        # the scene LLM call and the Replicate call record against this draft.
+        scene: str | None = None
+        if not custom_prompt:
+            scene = await build_scene_prompt(title, brand_id_fk=icon_brand_id_fk)
         gen = ImageGenerator()
         master_url = await gen.generate(
-            fake_topic, visual, operation="image_regenerate"
+            fake_topic, visual, operation="image_regenerate", scene=scene
         )
         master_bytes = await fetch_master(master_url)
         resized = resize_for_channel(master_bytes, Channel.blog)

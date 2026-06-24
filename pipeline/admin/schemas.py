@@ -541,6 +541,22 @@ class BannedPhraseUpdateIn(BaseModel):
     phrases: list[str]
 
 
+class ImageStylesOut(BaseModel):
+    """Cover-image style prompts as stored in ``image.style_prompts`` (NTS_075).
+    Brand-wide (one cover per topic shared across languages), so no per-language
+    split. ``styles`` is the raw list (empty → generation uses the default set)."""
+
+    styles: list[str]
+
+
+class ImageStylesUpdateIn(BaseModel):
+    """Replace the brand's cover-image style prompts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    styles: list[str]
+
+
 class BrandTestSanityOut(BaseModel):
     ok: bool
     error: str | None = None

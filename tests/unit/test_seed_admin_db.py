@@ -62,8 +62,8 @@ def test_seed_is_idempotent(tmp_admin_db) -> None:
     assert len(second.skipped) == len(first.inserted)
     assert len(_all(Brand)) == 5
     assert len(_all(Source)) == 3
-    # writer_polish + writer_draft + writer_translate (NTS_065).
-    assert len(_all(Prompt)) == 3
+    # writer_polish + writer_draft + writer_translate (NTS_065) + image_prompt (NTS_075).
+    assert len(_all(Prompt)) == 4
     assert len(_all(PipelineConfig)) == 1
 
 
@@ -71,10 +71,16 @@ def test_seed_marks_one_writer_polish_prompt_active(tmp_admin_db) -> None:
     seed(brand_slug="icon")
     prompts = _all(Prompt)
     actives = [p for p in prompts if p.is_active]
-    # One active per seeded type: draft + polish + translate (NTS_065).
-    assert len(actives) == 3
+    # One active per seeded type: draft + polish + translate (NTS_065) +
+    # image_prompt (NTS_075).
+    assert len(actives) == 4
     types_active = sorted(p.prompt_type for p in actives)
-    assert types_active == ["writer_draft", "writer_polish", "writer_translate"]
+    assert types_active == [
+        "image_prompt",
+        "writer_draft",
+        "writer_polish",
+        "writer_translate",
+    ]
 
 
 def test_seed_writes_pipeline_config_with_yaml_and_banned_phrases(

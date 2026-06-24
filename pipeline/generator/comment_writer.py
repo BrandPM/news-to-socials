@@ -556,6 +556,49 @@ def parse_topics_relevant(
     return []
 
 
+def parse_image_style_prompts(voice_profile_yaml: str) -> list[str]:
+    """Extract the brand's cover-image style directives (NTS_075 L3).
+
+    Image styles are brand-wide and language-agnostic (a cover is generated
+    once per topic and shared across language siblings, NTS_069), so unlike
+    the voice parsers there is no per-language dimension.
+
+    Two shapes are accepted, in precedence order:
+
+    * **Nested** (documented shape)::
+
+          image:
+            style_prompts:
+              - "minimalist editorial illustration, muted earth tones"
+              - "documentary photography, soft natural light"
+
+    * **Flat** (top-level fallback)::
+
+          image_style_prompts: ["...", "..."]
+
+    Missing keys / malformed YAML → ``[]`` (caller falls back to the
+    built-in default set, so a bad profile never blocks image generation).
+    """
+    try:
+        data = yaml.safe_load(voice_profile_yaml) or {}
+    except yaml.YAMLError as exc:
+        log.warning("comment_writer.image_styles_parse_failed", err=str(exc))
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    image = data.get("image")
+    if isinstance(image, dict):
+        nested = image.get("style_prompts")
+        if isinstance(nested, list):
+            return [str(s) for s in nested if s and str(s).strip()]
+
+    flat = data.get("image_style_prompts")
+    if isinstance(flat, list):
+        return [str(s) for s in flat if s and str(s).strip()]
+    return []
+
+
 class CommentWriter:
     def __init__(
         self,

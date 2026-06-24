@@ -66,8 +66,9 @@ def fake_image_stack(monkeypatch, tmp_path):
         def __init__(self, *a, **k) -> None:
             pass
 
-        async def generate(self, topic, visual, operation=None):  # noqa: ANN001
+        async def generate(self, topic, visual, operation=None, scene=None):  # noqa: ANN001
             captured["generate"].append(operation)
+            captured.setdefault("scenes", []).append(scene)
             return "https://replicate.test/master.png"
 
     async def fake_fetch_master(url):  # noqa: ANN001

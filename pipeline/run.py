@@ -50,8 +50,16 @@ from pipeline.common.models import (
     RawItem,
     Topic,
 )
-from pipeline.generator.comment_writer import CommentWriter
-from pipeline.generator.image import BrandVisual, ImageGenerator
+from pipeline.generator.comment_writer import (
+    CommentWriter,
+    parse_image_style_prompts,
+)
+from pipeline.generator.image import (
+    DEFAULT_ICON_IMAGE_STYLES,
+    BrandVisual,
+    ImageGenerator,
+)
+from pipeline.generator.image_prompt import build_scene_prompt
 from pipeline.generator.image_resizer import fetch_master, resize_for_channel
 from pipeline.publisher.sanity import (
     SanityCategoryMapping,
@@ -176,13 +184,12 @@ def icon_brand_config() -> BrandConfig:
             "    - \"Moreover, the proposal represents a paradigm shift. Furthermore, it is at the forefront of innovation. In conclusion, allocators should take note.\"\n"
             "    - \"Growing uncertainty creates significant challenges that require immediate action.\"\n"
         ),
+        # NTS_075 L1/L3: styles now live in the brand voice profile
+        # (``image.style_prompts``); this hardcoded config is only a fallback
+        # for brands with no profile yet, so it carries the rich default set.
         visual=BrandVisual(
             brand_id="icon",
-            image_style_prompts=[
-                "minimalist editorial illustration, muted earth tones, abstract financial geometry",
-                "subtle marble texture, classical proportions, dim warm lighting",
-                "documentary photography, soft natural light, neutral palette, depth of field",
-            ],
+            image_style_prompts=list(DEFAULT_ICON_IMAGE_STYLES),
         ),
         context=BrandContext(
             brand_id="icon",
@@ -201,6 +208,19 @@ def icon_brand_config() -> BrandConfig:
         ),
         categories=SanityCategoryMapping.icon_default(),
     )
+
+
+def _resolve_brand_image_styles(voice_profile_yaml: str | None) -> list[str]:
+    """Cover-image styles for a brand: from its voice profile, else default.
+
+    NTS_075 L3 — ``image.style_prompts`` is read from the brand's
+    ``voice_profile_yaml`` (same place voice/banned_phrases live and are
+    edited), with a back-compat fall back to the built-in
+    :data:`DEFAULT_ICON_IMAGE_STYLES` when the profile carries none, so an
+    empty/legacy profile never leaves a brand with zero styles.
+    """
+    styles = parse_image_style_prompts(voice_profile_yaml or "")
+    return styles or list(DEFAULT_ICON_IMAGE_STYLES)
 
 
 # --------------------------------------------------------------------------
@@ -384,7 +404,15 @@ async def generate_image_for_topic(
 
     try:
         gen = ImageGenerator()
-        master_url = await gen.generate(topic, brand.visual)
+        # NTS_075 L2: derive a topic-specific visual scene ONCE per topic
+        # (this helper is the single per-topic seam, NTS_069) from the
+        # EN-canonical headline + summary. Falls back to the headline inside
+        # ImageGenerator if the LLM is off/fails. Runs inside the run's cost
+        # context, so the image_prompt cost is recorded against the run.
+        scene = await build_scene_prompt(
+            topic.raw.title, topic.raw.summary, brand_id_fk=brand.id_fk
+        )
+        master_url = await gen.generate(topic, brand.visual, scene=scene)
         master_bytes = await fetch_master(master_url)
         # Blog channel cover (1792x1008) — used on /insights.
         resized = resize_for_channel(master_bytes, Channel.blog)
@@ -887,11 +915,16 @@ async def run_pipeline(
         or config.voice_profile
         or brand.voice_profile_yaml
     )
+    # NTS_075 L3: cover-image styles come from the brand voice profile
+    # (``image.style_prompts``), not hardcode — default set as fallback.
     brand = BrandConfig(
         slug=brand_row.slug,
         name=brand_row.name,
         voice_profile_yaml=voice_yaml,
-        visual=brand.visual,
+        visual=BrandVisual(
+            brand_id=brand_row.slug,
+            image_style_prompts=_resolve_brand_image_styles(voice_yaml),
+        ),
         context=brand.context,
         categories=brand.categories,
         id_fk=brand_row.id,
