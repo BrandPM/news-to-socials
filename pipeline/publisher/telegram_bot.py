@@ -2,11 +2,15 @@
 
 Uses raw HTTP because we don't need the full ``python-telegram-bot``
 framework here — just two endpoints (``sendPhoto`` and ``sendMessage``).
-The bot itself (approval flow) uses the framework; that lives in ``bot/``.
+Also the transport for the NTS_073/075 monitoring alerter.
 
 Mitigations baked in:
 * 429 ``retry_after`` honoured via tenacity (see common/retry.py).
 * HTML parse_mode by default — matches what the adapter produces.
+* Bot token is redacted from HTTP errors before they reach logs — the
+  token sits in the request URL (``.../bot<token>/...``), and an
+  unredacted ``httpx.HTTPStatusError`` would otherwise write it into the
+  monitoring logs on any API error (e.g. a 429). NTS_076.
 """
 
 from __future__ import annotations
@@ -20,6 +24,29 @@ from ..common.retry import with_retry
 from ..adapter.telegram import will_fit_caption
 
 log = get_logger(__name__)
+
+
+def _redact(text: str, token: str) -> str:
+    """Strip the bot token from a string before it can reach logs."""
+    return text.replace(token, "<bot-token-redacted>") if token else text
+
+
+def _raise_for_status_redacted(resp: httpx.Response, token: str) -> None:
+    """``resp.raise_for_status()`` but with the token scrubbed from the error.
+
+    Re-raises the SAME ``httpx.HTTPStatusError`` type (so tenacity's retry
+    predicate, which keys on the type + ``response.status_code``, is
+    unchanged) — only the message string is redacted, and ``from None``
+    drops the original (URL-bearing) exception from the chain.
+    """
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise httpx.HTTPStatusError(
+            _redact(str(exc), token),
+            request=exc.request,
+            response=exc.response,
+        ) from None
 
 
 class TelegramPublisher:
@@ -53,7 +80,7 @@ class TelegramPublisher:
                     "disable_web_page_preview": False,
                 },
             )
-            resp.raise_for_status()
+            _raise_for_status_redacted(resp, self.bot_token)
             data = resp.json()["result"]
             log.info("telegram.sent", chat=chat_id, message_id=data["message_id"])
             return str(data["message_id"])
@@ -70,7 +97,7 @@ class TelegramPublisher:
                     "parse_mode": "HTML",
                 },
             )
-            resp.raise_for_status()
+            _raise_for_status_redacted(resp, self.bot_token)
             data = resp.json()["result"]
             log.info("telegram.photo_sent", chat=chat_id, message_id=data["message_id"])
             return str(data["message_id"])
