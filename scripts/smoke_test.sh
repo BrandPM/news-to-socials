@@ -82,12 +82,16 @@ elif [[ "$CODE" == "200" ]]; then fail "200 but ${MS}ms >= ${HEALTH_MS}ms"
 else fail "HTTP $CODE"; fi
 
 # --- 2. /health/deep components --------------------------------------------
+# Response shape: {"status":"ok","components":{"db":"ok","sanity":"ok",...}}.
+# db/sanity are NESTED under .components — not top-level.
 echo "[2] GET /api/v1/health/deep"
 DCODE=$(curl -s "${AUTH[@]}" -o /tmp/_sm_deep.json -w '%{http_code}' "$BASE_URL/api/v1/health/deep" 2>/dev/null || echo 000)
 if [[ "$DCODE" == "200" ]]; then
-  DB=$(jget db </tmp/_sm_deep.json); SAN=$(jget sanity </tmp/_sm_deep.json)
-  [[ "$DB" == "ok" ]] && pass "db=$DB" || fail "db=$DB"
-  [[ -n "$SAN" ]] && pass "sanity=$SAN" || fail "sanity component missing"
+  ST=$(jget status </tmp/_sm_deep.json)
+  DB=$(jget components.db </tmp/_sm_deep.json)
+  SAN=$(jget components.sanity </tmp/_sm_deep.json)
+  [[ "$ST" == "ok" && "$DB" == "ok" ]] && pass "status=ok components.db=ok" || fail "status=$ST components.db=$DB"
+  [[ "$ST" == "ok" && "$SAN" == "ok" ]] && pass "status=ok components.sanity=ok" || fail "status=$ST components.sanity=$SAN"
 else fail "HTTP $DCODE"; fi
 
 # --- 3. image-styles endpoint (NTS_075) ------------------------------------
@@ -143,11 +147,18 @@ else
     RID=$(curl -s "${AUTH[@]}" -H "X-Triggered-By: cli" -X POST "$BASE_URL/api/v1/sources/$SRC/run" 2>/dev/null | jget run_id)
     if [[ -z "$RID" ]]; then fail "trigger returned no run_id"; else
       pass "triggered run_id=$RID on source $SRC"
-      # poll up to ~5s for the detached worker to record its pid
-      PID=""; for _ in 1 2 3 4 5 6 7 8 9 10; do
-        PID=$(curl -s "${AUTH[@]}" "$BASE_URL/api/v1/runs/$RID" 2>/dev/null | jget pid)
-        [[ -n "$PID" && "$PID" != "None" ]] && break; sleep 0.5; done
-      [[ -n "$PID" && "$PID" != "None" ]] && pass "detached worker pid=$PID recorded" || fail "no pid recorded (run not detached?)"
+      # Read pid AS SOON AS the detached worker records it — a small run can
+      # finish in ~6s, so poll fast right after creation and accept the first
+      # non-null value. pid lives at .run.pid (RunOut nested in the run-detail
+      # RunDetailWithCostOut); the top level has no pid. pid persists in the
+      # row after finish/cancel, so once seen it stays PASS.
+      PID=""; PID_SEEN=0
+      for ((i=0; i<30; i++)); do
+        P=$(curl -s "${AUTH[@]}" "$BASE_URL/api/v1/runs/$RID" 2>/dev/null | jget run.pid)
+        if [[ -n "$P" && "$P" != "None" ]]; then PID="$P"; PID_SEEN=1; break; fi
+        sleep 0.3
+      done
+      [[ "$PID_SEEN" == "1" ]] && pass "detached worker pid=$PID recorded" || fail "no pid recorded (run not detached?)"
       # cancel, then cancel again — must be idempotent (both 200, status cancelled)
       C1=$(curl -s "${AUTH[@]}" -o /tmp/_sm_c1.json -w '%{http_code}' -X POST "$BASE_URL/api/v1/runs/$RID/cancel" 2>/dev/null)
       C2=$(curl -s "${AUTH[@]}" -o /tmp/_sm_c2.json -w '%{http_code}' -X POST "$BASE_URL/api/v1/runs/$RID/cancel" 2>/dev/null)
