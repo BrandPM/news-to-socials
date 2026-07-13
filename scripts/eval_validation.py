@@ -22,11 +22,9 @@ import asyncio
 import statistics
 from dataclasses import dataclass
 
-from sqlalchemy import select
-
 from pipeline.admin import db as admin_db
 from pipeline.admin.judge import ESCALATION_MODEL, STREAM_MODEL, run_judge
-from pipeline.admin.models import Brand, DraftApproval, Topic
+from pipeline.admin.models import Brand
 from scripts.backfill_slugs import _build_sanity_client
 
 
@@ -46,58 +44,58 @@ def _brand_id(brand_slug: str) -> int:
         return brand.id
 
 
-def _pick_drafts(brand_id: int, cls: str, n: int) -> list[tuple[str, str]]:
-    """Return up to n (sanity_draft_id, source_title) for a decision class."""
-    with admin_db.get_session_factory()() as s:
-        rows = s.execute(
-            select(DraftApproval.sanity_draft_id)
-            .where(
-                DraftApproval.brand_id_fk == brand_id,
-                DraftApproval.status == cls,
-            )
-            .order_by(DraftApproval.decided_at.desc())
-            .limit(n * 3)  # over-fetch; some won't be EN / won't resolve
-        ).scalars().all()
-        out: list[tuple[str, str]] = []
-        for did in rows:
-            title = s.execute(
-                select(Topic.title).where(Topic.draft_id == did).limit(1)
-            ).scalar_one_or_none()
-            out.append((did, title or ""))
-    return out
-
-
-async def _fetch_en_text(client, sanity_draft_id: str) -> str | None:
-    """Fetch the EN body for a draft id (tries drafts.* then published)."""
-    published = sanity_draft_id[len("drafts.") :] if sanity_draft_id.startswith("drafts.") else sanity_draft_id
-    groq = (
-        "*[_id in [$d, $p]][0]{language, title, "
-        '"body": body[]{children[]{text}}}'
-    )
-    doc = await client.query(groq, {"d": sanity_draft_id, "p": published})
-    if not isinstance(doc, dict) or (doc.get("language") or "en") != "en":
-        return None
+def _text_of(doc: dict) -> str:
     parts: list[str] = [str(doc.get("title") or "")]
     for block in doc.get("body") or []:
         for ch in (block or {}).get("children") or []:
             parts.append(str(ch.get("text") or ""))
-    text = "\n".join(p for p in parts if p).strip()
-    return text or None
+    return "\n".join(p for p in parts if p).strip()
+
+
+async def _query_class(client, cls: str, n: int, en_only: bool) -> list[Item]:
+    """Pull one class from Sanity. 'approved' = published posts; 'rejected' =
+    drafts.* flagged status=='rejected' (NTS_052 — the real rejection source;
+    admin.db draft_approvals never stores rejections)."""
+    if cls == "approved":
+        base = '_type == "post" && !(_id in path("drafts.**"))'
+    else:
+        base = '_type == "post" && _id in path("drafts.**") && status == "rejected"'
+    lang = ' && language == "en"' if en_only else ""
+    groq = (
+        f"*[{base}{lang} && defined(body)] | order(_createdAt desc) "
+        f"[0...{n}]{{_id, title, language, \"body\": body[]{{children[]{{text}}}}}}"
+    )
+    rows = await client.query(groq)
+    rows = rows if isinstance(rows, list) else []
+    out: list[Item] = []
+    for doc in rows:
+        if not isinstance(doc, dict) or not doc.get("_id"):
+            continue
+        text = _text_of(doc)
+        if not text:
+            continue
+        out.append(
+            Item(
+                sanity_draft_id=str(doc["_id"]),
+                cls=cls,
+                source_title=str(doc.get("title") or ""),
+                text=text,
+            )
+        )
+    return out
 
 
 async def _collect(client, brand_id: int, n: int) -> list[Item]:
     items: list[Item] = []
     for cls in ("approved", "rejected"):
-        got = 0
-        for did, src_title in _pick_drafts(brand_id, cls, n):
-            if got >= n:
-                break
-            text = await _fetch_en_text(client, did)
-            if not text:
-                continue
-            items.append(Item(sanity_draft_id=did, cls=cls, source_title=src_title, text=text))
-            got += 1
-        print(f"  collected {got} {cls} EN drafts")
+        got = await _query_class(client, cls, n, en_only=True)
+        if cls == "rejected" and len(got) < 3:
+            # Few EN rejections — widen to any language (judged with EN rubric;
+            # a documented limitation of the offline experiment).
+            got = await _query_class(client, cls, n, en_only=False)
+            print(f"  (widened rejected to all languages: {len(got)})")
+        items.extend(got)
+        print(f"  collected {len(got)} {cls} drafts")
     return items
 
 
