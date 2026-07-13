@@ -35,6 +35,7 @@ import hashlib
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -42,6 +43,7 @@ import openai
 import typer
 
 from pipeline.common.config import get_settings
+from pipeline.common.display_date import compute_display_date
 from pipeline.common.logging import configure_logging, get_logger
 from pipeline.common.models import (
     Channel,
@@ -642,6 +644,26 @@ async def _process_source(
             log.error("category.failed", topic=topic.id, err=str(exc))
             category = "special"
 
+        # ---- DISPLAY DATE: news date, not approval date (NTS_089).
+        # Computed once per topic from the source RSS pubDate (with clamps)
+        # and shared by every language sibling — one date per topic, mirroring
+        # the shared cover image. On approve it becomes the site publishedAt.
+        display_date_val, display_date_src = compute_display_date(
+            topic.raw.published_at, datetime.now(tz=timezone.utc)
+        )
+        display_date_iso = display_date_val.isoformat()
+        log.info(
+            "draft.display_date",
+            topic=topic.id,
+            display_date=display_date_iso,
+            source=display_date_src,
+            pub_date=(
+                topic.raw.published_at.isoformat()
+                if topic.raw.published_at
+                else None
+            ),
+        )
+
         # ---- DRAFTS: once per (topic, language).
         # NTS_065: English is canonical and generated FIRST; every non-EN
         # language is a faithful translation of that EN draft, not a fresh
@@ -711,6 +733,7 @@ async def _process_source(
                     key_takeaway=draft.key_takeaway,
                     cover_image_asset_id=asset_id,
                     cover_image_alt=draft.title[:120],
+                    display_date=display_date_iso,
                 )
 
                 if dry_run:

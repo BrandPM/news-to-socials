@@ -204,6 +204,8 @@ class PipelineConfigOut(BaseModel):
     topics_per_run: int
     banned_phrases: list[str]
     voice_profile: str
+    # NTS_089 — staleness threshold (days) for the Content Hub ⚠️ flag.
+    stale_draft_days: int
     updated_at: datetime
 
     @field_validator("banned_phrases", mode="before")
@@ -221,6 +223,7 @@ class PipelineConfigUpdate(BaseModel):
     topics_per_run: int | None = Field(default=None, ge=1, le=10)
     banned_phrases: list[str] | None = None
     voice_profile: str | None = None
+    stale_draft_days: int | None = Field(default=None, ge=1, le=60)
 
 
 # --- Runs ---------------------------------------------------------------
@@ -663,6 +666,26 @@ class DraftApprovalIn(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
+class DisplayDatePatchIn(BaseModel):
+    """Body for ``PATCH /drafts/{id}/display-date`` (NTS_089).
+
+    ``display_date`` is a bare ``YYYY-MM-DD`` (UTC, date-only). Future dates
+    are rejected by the route (scheduled publishing is out of scope, NTS_085).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+class DisplayDatePatchOut(BaseModel):
+    """Result of a display-date patch: the value written + which sibling
+    drafts it was applied to (one date per topic, all languages)."""
+
+    display_date: str
+    updated_draft_ids: list[str]
+
+
 class DraftDetailOut(BaseModel):
     sanity_id: str
     title: str | None
@@ -679,6 +702,10 @@ class DraftDetailOut(BaseModel):
     approval: DraftApprovalOut | None = None
     ai_tells_score: int | None = None
     ai_tells: list[str] = []
+    # NTS_089 — displayed publication date (date-only "YYYY-MM-DD", UTC).
+    # Editable in the Content Hub before publish; becomes publishedAt on
+    # approve. None on legacy drafts created before this feature.
+    display_date: str | None = None
 
 
 class PublishedDocOut(BaseModel):
@@ -810,6 +837,9 @@ class DraftListItem(BaseModel):
     # IT_PROJ_NTS_052 Content hub additions.
     status: DraftStatus = "pending"
     published_at: datetime | None = None
+    # NTS_089 — displayed publication date (date-only "YYYY-MM-DD", UTC).
+    # Powers the date badge + staleness ⚠️ on pending cards.
+    display_date: str | None = None
     rejected_at: datetime | None = None
     rejection_reason: str | None = None
     live_url: str | None = None

@@ -61,7 +61,7 @@ def mock_sanity_publish(monkeypatch):
     """
     from pipeline.publisher import sanity as sanity_mod
 
-    async def fake_promote(self, draft_id):  # noqa: ANN001
+    async def fake_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
         return draft_id.replace("drafts.", "")
 
     async def fake_delete(self, draft_id):  # noqa: ANN001
@@ -358,7 +358,7 @@ def test_approve_publishes_to_sanity_and_records_published_id(
     bid = icon_with_creds
     captured: dict = {}
 
-    async def capture_promote(self, draft_id):  # noqa: ANN001
+    async def capture_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
         captured["draft_id"] = draft_id
         return draft_id.replace("drafts.", "")
 
@@ -402,7 +402,7 @@ def test_approve_returns_502_when_sanity_publish_fails(
 
     from pipeline.publisher import sanity as sanity_mod
 
-    async def raise_publish(self, draft_id):  # noqa: ANN001
+    async def raise_publish(self, draft_id, *, published_at=None):  # noqa: ANN001
         raise sanity_mod.SanityPublishError("503 Sanity unreachable")
 
     monkeypatch.setattr(
@@ -856,7 +856,7 @@ def test_approve_all_siblings_publishes_each_and_reports_per_language(
             return drafts_rows
         return None  # mirror check: no published doc yet
 
-    async def fake_promote(self, draft_id):  # noqa: ANN001
+    async def fake_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
         publish_calls.append(draft_id)
         return draft_id.replace("drafts.", "")
 
@@ -912,7 +912,7 @@ def test_approve_all_siblings_skips_already_published(
             else None
         )
 
-    async def fake_promote(self, draft_id):  # noqa: ANN001
+    async def fake_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
         promote_calls.append(draft_id)
         return draft_id.replace("drafts.", "")
 
@@ -957,7 +957,7 @@ def test_approve_all_siblings_partial_failure_does_not_rollback(
             return drafts_rows
         return None
 
-    async def selective_promote(self, draft_id):  # noqa: ANN001
+    async def selective_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
         if "uk-003" in draft_id:
             raise sanity_mod.SanityPublishError("uk-specific failure")
         return draft_id.replace("drafts.", "")

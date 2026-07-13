@@ -201,6 +201,12 @@ class PipelineConfig(Base):
     )
     scoring_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
     topics_per_run: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    # NTS_089 — a pending draft whose display_date is older than this many
+    # days gets a ⚠️ staleness flag in the Content Hub ("news going stale").
+    # Editable from Settings without a deploy. Default 3.
+    stale_draft_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3, server_default="3"
+    )
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
     banned_phrases: Mapped[str] = mapped_column(Text, nullable=False, default="[]")

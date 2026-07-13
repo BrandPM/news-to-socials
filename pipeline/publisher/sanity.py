@@ -41,6 +41,7 @@ from typing import Any
 import httpx
 
 from ..common.config import get_settings
+from ..common.display_date import compute_published_at
 from ..common.logging import get_logger
 from ..common.models import Channel, Draft, Language, Post
 from ..common.retry import with_retry
@@ -364,6 +365,10 @@ class SanityPostInput:
     key_takeaway: str = ""
     cover_image_asset_id: str | None = None
     cover_image_alt: str = ""
+    # NTS_089 — displayed publication date (date-only, UTC "YYYY-MM-DD"),
+    # derived from the source RSS pubDate at draft creation. Drives the
+    # published ``publishedAt`` on approve. None → publish falls back to now.
+    display_date: str | None = None
 
 
 class SanityPublisher:
@@ -395,6 +400,9 @@ class SanityPublisher:
             "readTime": read_time,
             "publishedAt": datetime.now(tz=timezone.utc).isoformat(),
             "body": body_pt,
+            # NTS_089 — displayed publication date (date-only, editable in the
+            # Content Hub before publish). On approve it becomes publishedAt.
+            "displayDate": post.display_date,
             # NEW fields from the post.ts patch (see docs/sanity-post-patch.md)
             "keyTakeaway": post.key_takeaway[:280],
             "sourceUrl": post.source_url,
@@ -417,7 +425,9 @@ class SanityPublisher:
         draft_id = await self.client.create_draft(doc)
         return draft_id
 
-    async def promote_draft_to_published(self, draft_id: str) -> str:
+    async def promote_draft_to_published(
+        self, draft_id: str, *, published_at: datetime | None = None
+    ) -> str:
         """Publish ``drafts.post-XXX`` → ``post-XXX`` in one Sanity transaction.
 
         Sanity has no first-class publish API exposed over HTTP; the
@@ -428,6 +438,14 @@ class SanityPublisher:
         We do the same here, batched into a single ``mutate`` transaction
         so an interrupted request can't leave the doc both published AND
         as a stale draft.
+
+        NTS_089 — the published ``publishedAt`` is derived from the draft's
+        ``displayDate`` (the news date), NOT the approval moment, so the site
+        shows the real story date. ``published_at`` lets the caller pass a
+        single shared timestamp so every language sibling of a topic gets the
+        *identical* ``publishedAt`` (same pattern as the shared cover image);
+        when omitted it is computed from this draft's own ``displayDate``.
+        ``_updatedAt`` is deliberately left to Sanity.
 
         Returns the published ``_id`` (no ``drafts.`` prefix).
         Raises :class:`SanityPublishError` on missing draft or HTTP errors.
@@ -454,6 +472,12 @@ class SanityPublisher:
             if k not in {"_id", "_rev", "_createdAt", "_updatedAt"}
         }
         published_doc["_id"] = published_id
+
+        # NTS_089 — override publishedAt with the display-date-derived stamp.
+        stamp = published_at or compute_published_at(
+            doc.get("displayDate"), datetime.now(tz=timezone.utc)
+        )
+        published_doc["publishedAt"] = stamp.isoformat()
 
         try:
             await self.client.mutate(

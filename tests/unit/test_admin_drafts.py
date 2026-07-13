@@ -659,7 +659,7 @@ def test_list_drafts_merges_approval_status(
     # IT_PROJ_NTS_051 Task 3: /approve now publishes to Sanity, so stub
     # promote_draft_to_published so this list-side test doesn't try to
     # reach the live API.
-    async def fake_promote(self, draft_id):  # noqa: ANN001
+    async def fake_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
         return draft_id.replace("drafts.", "")
 
     monkeypatch.setattr(

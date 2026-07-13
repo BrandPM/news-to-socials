@@ -17,6 +17,8 @@ from pipeline.admin.schemas import (
     BatchApprovalOut,
     BatchApprovalResult,
     CostBreakdownItem,
+    DisplayDatePatchIn,
+    DisplayDatePatchOut,
     DraftApprovalIn,
     DraftApprovalOut,
     DraftDetailOut,
@@ -32,6 +34,7 @@ from pipeline.admin.schemas import (
     RejectionInfoOut,
 )
 from pipeline.common.config import get_settings
+from pipeline.common.display_date import compute_published_at, parse_display_date
 from pipeline.common.logging import get_logger
 
 log = get_logger(__name__)
@@ -263,7 +266,7 @@ def _selection_for_status(status: str) -> str:
     the card UI can render the timestamp + reason inline.
     """
     base = (
-        "{_id, title, language, topicId, _createdAt, "
+        "{_id, title, language, topicId, _createdAt, displayDate, publishedAt, "
         '"coverImageUrl": coverImage.asset->url, '
         '"slug": slug.current'
     )
@@ -483,6 +486,7 @@ async def list_drafts(
                 slug=slug_val,
                 status=status,  # type: ignore[arg-type]
                 published_at=published_at,
+                display_date=raw.get("displayDate"),
                 rejected_at=rejected_at,
                 rejection_reason=rejection_reason,
                 live_url=live_url,
@@ -640,6 +644,7 @@ def _build_draft_detail_out(
         approval=approval_out,
         ai_tells_score=ai_tells_score,
         ai_tells=ai_tells,
+        display_date=doc.get("displayDate"),
     )
 
 
@@ -681,7 +686,7 @@ async def get_draft(
         "{"
         '"draft": *[_id == $draft_id][0]{title, body, keyTakeaway, '
         'generatedBy, language, topicId, _createdAt, status, '
-        'rejectedAt, rejectionReason, rejectedBy, '
+        'rejectedAt, rejectionReason, rejectedBy, displayDate, '
         '"coverImageUrl": coverImage.asset->url},'
         '"published": *[_id == $pub_id][0]{_id, title, language, '
         '_createdAt, _updatedAt, generatedBy, '
@@ -859,10 +864,18 @@ async def get_draft(
 
 
 async def _publish_one_draft(
-    sanity_draft_id: str, brand_id: int, note: str | None
+    sanity_draft_id: str,
+    brand_id: int,
+    note: str | None,
+    published_at: datetime | None = None,
 ) -> tuple[DraftApproval, str | None, str | None]:
     """Approve + publish a single draft. Used by both /approve and the
     /approve-all-siblings batch handler.
+
+    ``published_at`` (NTS_089) is the display-date-derived stamp for the
+    site's ``publishedAt``; the batch handler passes one shared value so all
+    language siblings publish under the identical date. When ``None`` the
+    publisher computes it from this draft's own ``displayDate``.
 
     Returns ``(row, published_id, failure_detail)``. ``published_id`` is
     set on Sanity-publish success; ``failure_detail`` is set on
@@ -883,7 +896,7 @@ async def _publish_one_draft(
     # 2. Publish to Sanity.
     try:
         published_id = await publisher.promote_draft_to_published(
-            sanity_draft_id
+            sanity_draft_id, published_at=published_at
         )
     except SanityPublishError as exc:
         log.error(
@@ -978,7 +991,7 @@ async def approve_all_siblings(
     drafts_groq = (
         '*[_type == "post" && _id in path("drafts.**") && topicId == $tid && '
         '(generatedBy.brandSlug == $slug || !defined(generatedBy.brandSlug))]'
-        "{_id, language}"
+        "{_id, language, displayDate}"
     )
     try:
         rows = await sanity_client.query(  # type: ignore[attr-defined]
@@ -992,6 +1005,22 @@ async def approve_all_siblings(
 
     if not isinstance(rows, list):
         rows = []
+
+    # NTS_089 — one shared publishedAt for every sibling of the topic, so all
+    # languages publish under the identical date (same intent as the shared
+    # cover image). Siblings share the same displayDate by construction; take
+    # the first non-empty as the topic's date.
+    shared_display_date = next(
+        (
+            r.get("displayDate")
+            for r in rows
+            if isinstance(r, dict) and r.get("displayDate")
+        ),
+        None,
+    )
+    shared_published_at = compute_published_at(
+        shared_display_date, datetime.now(tz=timezone.utc)
+    )
 
     results: list[BatchApprovalResult] = []
     ok = 0
@@ -1027,7 +1056,7 @@ async def approve_all_siblings(
             continue
 
         _row, published_id, failure = await _publish_one_draft(
-            draft_id, brand_id, None
+            draft_id, brand_id, None, published_at=shared_published_at
         )
         if failure is not None:
             fail += 1
@@ -1056,6 +1085,98 @@ async def approve_all_siblings(
         fail_count=fail,
         results=results,
     )
+
+
+@router.patch(
+    "/{sanity_draft_id}/display-date", response_model=DisplayDatePatchOut
+)
+async def patch_display_date(
+    sanity_draft_id: str,
+    payload: DisplayDatePatchIn,
+    brand_id: int = Query(..., description="Active brand id"),
+) -> DisplayDatePatchOut:
+    """Set the displayed publication date on a draft + all its language
+    siblings (NTS_089).
+
+    One date per topic — the same shared-mutate pattern as the cover image
+    (NTS_069): editing the date on any language card updates every pending
+    sibling in a single Sanity transaction, so the topic never ends up with
+    mismatched dates. Future dates are rejected (scheduled publishing is out
+    of scope — NTS_085). Only pending ``drafts.*`` docs are patched; a
+    published post's date is fixed at publish time.
+    """
+    _ensure_brand_owns_draft(brand_id)
+    parsed = parse_display_date(payload.display_date)
+    if parsed is None:
+        raise HTTPException(
+            status_code=422, detail="display_date must be YYYY-MM-DD"
+        )
+    if parsed > datetime.now(tz=timezone.utc).date():
+        raise HTTPException(
+            status_code=422,
+            detail="display_date cannot be in the future (scheduled publishing is out of scope)",
+        )
+
+    normalised = _normalise_draft_id(sanity_draft_id)
+    client, brand_slug = _build_sanity_client_for_brand(brand_id)
+
+    # Resolve the topic, then every pending sibling draft under it.
+    try:
+        doc = await client.query(  # type: ignore[attr-defined]
+            "*[_id == $id][0]{topicId}", {"id": normalised}
+        )
+        topic_id = doc.get("topicId") if isinstance(doc, dict) else None
+        if topic_id:
+            sib_groq = (
+                '*[_type == "post" && _id in path("drafts.**") && '
+                "topicId == $tid && (generatedBy.brandSlug == $slug || "
+                "!defined(generatedBy.brandSlug))]._id"
+            )
+            ids = await client.query(  # type: ignore[attr-defined]
+                sib_groq, {"tid": topic_id, "slug": brand_slug}
+            )
+            target_ids = (
+                [str(i) for i in ids if i] if isinstance(ids, list) else []
+            )
+        else:
+            # No topicId (legacy draft) — patch just this doc if it exists.
+            target_ids = [normalised] if isinstance(doc, dict) and doc else []
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sanity query failed: {type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+
+    if not target_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no pending draft found for {normalised!r} — a published "
+                "post's date is fixed at publish time"
+            ),
+        )
+
+    iso = parsed.isoformat()
+    mutations = [
+        {"patch": {"id": tid, "set": {"displayDate": iso}}} for tid in target_ids
+    ]
+    try:
+        await client.mutate(mutations)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sanity mutate failed: {type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+
+    log.info(
+        "draft.display_date_patched",
+        draft_id=normalised,
+        display_date=iso,
+        siblings=len(target_ids),
+    )
+    return DisplayDatePatchOut(display_date=iso, updated_draft_ids=target_ids)
 
 
 @router.post("/{sanity_draft_id}/reject", response_model=DraftApprovalOut)
