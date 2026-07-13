@@ -1,0 +1,25 @@
+[Unit]
+Description=News-to-Socials: daily local snapshot of admin.db (NTS_088)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials/repo
+ExecStart=/opt/news-to-socials/repo/infra/backup/nts-backup.sh
+
+# Hardening: read-only FS except the dirs the dump touches. Both the repo and
+# the backups dir are RW: reading a WAL database registers the reader in the
+# -shm file, so the live admin.db's directory must be writable even for a
+# read-only snapshot; the backups dir holds the dumps + .last_ok heartbeat.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/news-deploy/backups /opt/news-to-socials/repo
+MemoryMax=256M
+
+StandardOutput=append:/var/log/news-to-socials/backup.log
+StandardError=append:/var/log/news-to-socials/backup.log

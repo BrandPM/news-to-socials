@@ -27,6 +27,12 @@ Run on a 15-minute systemd timer (``nts-monitor.timer``). Each pass:
    the whole backlog. These keys are never part of the "recovered"
    reconciliation — they are one-shot pulses, not clearable incidents.
 
+6. NTS_088 — a **backup-heartbeat** check. If the daily admin.db backup's
+   ``.last_ok`` heartbeat is missing or older than
+   ``settings.backup_max_age_hours`` (26h), fire one ``backup_stale:DATE``
+   alert. The dedup key carries today's date so at most one alert per
+   calendar day. Also a one-shot pulse (never "recovered").
+
 Safety contract (this runs unattended):
 
 * If ``telegram_bot_token`` or ``telegram_monitoring_chat_id`` is empty it
@@ -74,6 +80,16 @@ _SEVERITY_RANK = {"danger": 0, "warning": 1}
 # clearable incidents).
 VISIBILITY_PREFIXES = ("run_started:", "run_finished:", "published:")
 
+# NTS_088 — backup-heartbeat alert. Key is "backup_stale:YYYY-MM-DD" so it
+# sends at most once per calendar day (the date rolls the dedup key). Like
+# the visibility pulses it is a one-shot ledger entry, never part of the
+# "recovered" reconciliation.
+BACKUP_STALE_PREFIX = "backup_stale:"
+
+# One-shot alert_sent keys that must NOT be treated as clearable incidents in
+# the "recovered" reconciliation (visibility pulses + backup-stale pulses).
+ONESHOT_PREFIXES = (*VISIBILITY_PREFIXES, BACKUP_STALE_PREFIX)
+
 # Only look back this far when detecting visibility pulses — bounds the query
 # and stops the first tick after a deploy from replaying the whole backlog.
 VISIBILITY_WINDOW = timedelta(hours=24)
@@ -91,8 +107,10 @@ _TRIGGER_LABELS = {
 _FINISHED_EMOJI = {"success": "✅", "cancelled": "⏹", "failed": "🔴"}
 
 
-def _is_visibility_key(notification_id: str) -> bool:
-    return notification_id.startswith(VISIBILITY_PREFIXES)
+def _is_oneshot_key(notification_id: str) -> bool:
+    """One-shot pulse keys (visibility + backup-stale) — excluded from the
+    "recovered" reconciliation, which only clears real incidents."""
+    return notification_id.startswith(ONESHOT_PREFIXES)
 
 
 # --- Message rendering (pure, unit-tested) ---------------------------------
@@ -228,6 +246,63 @@ def format_published(
         href = html.escape(live_url, quote=True)
         lines.append(f'→ <a href="{href}">{html.escape(live_url)}</a>')
     return "\n".join(lines)
+
+
+# --- Backup heartbeat (NTS_088) --------------------------------------------
+
+
+def format_backup_stale(*, last_ok: datetime | None, age_hours: float | None, max_age_hours: int) -> str:
+    """🔴 alert when the daily admin.db backup heartbeat is missing/stale.
+
+    ``last_ok`` is the timestamp parsed from the heartbeat file (``None`` if
+    the file is absent or unparseable). ``age_hours`` is how old it is.
+    """
+    lines = ["🔴 <b>Бэкап admin.db не выполняется</b>"]
+    if last_ok is None:
+        lines.append("Последний успешный бэкап: <b>нет</b> (heartbeat отсутствует)")
+    else:
+        lines.append(f"Последний успешный бэкап: {_fmt_time(last_ok)} UTC")
+        if age_hours is not None:
+            lines.append(f"Возраст: {age_hours:.0f}ч (порог {max_age_hours}ч)")
+    lines.append("Проверь nts-backup.timer на VPS: <code>systemctl status nts-backup.timer</code>")
+    return "\n".join(lines)
+
+
+def check_backup_heartbeat(
+    *, now: datetime, heartbeat_path, max_age_hours: int
+) -> tuple[str, str] | None:
+    """Return a ``(alert_sent key, message)`` pulse if the backup is stale.
+
+    Stale = heartbeat file missing/unreadable, OR its timestamp is older
+    than ``max_age_hours``. The key is ``backup_stale:YYYY-MM-DD`` (today,
+    UTC) so at most one alert fires per calendar day. Returns ``None`` when
+    the backup is healthy. Never raises — a bad heartbeat file is treated
+    as "stale" (fail loud), not swallowed.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    path = Path(heartbeat_path)
+    key = f"{BACKUP_STALE_PREFIX}{now.strftime('%Y-%m-%d')}"
+    last_ok: datetime | None = None
+    age_hours: float | None = None
+
+    try:
+        raw = path.read_text().strip()
+        last_ok = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if last_ok.tzinfo is None:
+            last_ok = last_ok.replace(tzinfo=timezone.utc)
+        age_hours = (now - last_ok).total_seconds() / 3600.0
+    except (OSError, ValueError):
+        # Missing or garbage heartbeat → stale by definition.
+        return key, format_backup_stale(
+            last_ok=None, age_hours=None, max_age_hours=max_age_hours
+        )
+
+    if age_hours > max_age_hours:
+        return key, format_backup_stale(
+            last_ok=last_ok, age_hours=age_hours, max_age_hours=max_age_hours
+        )
+    return None
 
 
 # --- Visibility pulses (detection) -----------------------------------------
@@ -479,7 +554,7 @@ async def run_alerts(
     gone_ids = [
         iid
         for iid in already
-        if iid not in current and not _is_visibility_key(iid)
+        if iid not in current and not _is_oneshot_key(iid)
     ]
 
     chat_id = settings.telegram_monitoring_chat_id
@@ -515,6 +590,19 @@ async def run_alerts(
         visibility.extend(await _gather_published_events(already))
     except Exception:  # noqa: BLE001 — unattended; never crash the timer
         log.exception("alerts.visibility_gather_failed")
+
+    # NTS_088 — backup-heartbeat check. One-shot pulse (dedup key rolls daily),
+    # gathered defensively so a filesystem hiccup can't crash the timer.
+    try:
+        pulse = check_backup_heartbeat(
+            now=datetime.now(tz=timezone.utc),
+            heartbeat_path=settings.backup_heartbeat_path,
+            max_age_hours=settings.backup_max_age_hours,
+        )
+        if pulse is not None and pulse[0] not in already:
+            visibility.append(pulse)
+    except Exception:  # noqa: BLE001 — unattended; never crash the timer
+        log.exception("alerts.backup_check_failed")
     for key, message in visibility:
         try:
             await publisher._send_message(chat_id, message)

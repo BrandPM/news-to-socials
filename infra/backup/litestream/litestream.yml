@@ -1,0 +1,29 @@
+# TEMPLATE — /etc/litestream.yml
+# News-to-Socials admin.db → DigitalOcean Spaces continuous replication (NTS_088).
+#
+# This is Variant A (recommended, RPO ~seconds). It is PREPARED but NOT ACTIVE
+# until DO Spaces credentials exist on the VPS — see ../README.md "Litestream
+# activation".
+#
+# Credentials are NEVER stored here. Litestream reads the access keys from the
+# environment (LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY), which
+# the systemd unit loads from /etc/news-to-socials/backup.env (chmod 600, values
+# from Bitwarden). The ${...} placeholders below are also env-interpolated.
+#
+# PRECONDITION: admin.db MUST be in WAL mode (it is — NTS_059/061). Litestream
+# requires journal_mode=WAL. Do NOT flip journal mode on the live DB casually;
+# it needs a maintenance window.
+
+dbs:
+  - path: /opt/news-to-socials/repo/admin.db
+    replicas:
+      - type: s3
+        # DO Spaces is S3-compatible. FRA1 = same region as the droplet.
+        endpoint: ${LITESTREAM_ENDPOINT}   # https://fra1.digitaloceanspaces.com
+        region: ${LITESTREAM_REGION}       # fra1
+        bucket: ${LITESTREAM_BUCKET}       # e.g. nts-admin-db-backup
+        path: admin.db                     # key prefix inside the bucket
+        # access-key-id / secret-access-key come from the environment:
+        #   LITESTREAM_ACCESS_KEY_ID, LITESTREAM_SECRET_ACCESS_KEY
+        retention: 720h                    # 30 days of generations
+        snapshot-interval: 24h

@@ -83,6 +83,14 @@ class Settings(BaseSettings):
     # PUBLIC_SITE_BASE_URL.
     public_site_base_url: str = "https://www.iconfinance.io"
 
+    # Backup heartbeat (NTS_088). The daily admin.db backup (nts-backup.sh)
+    # writes an ISO-8601 UTC timestamp to this file on success. The
+    # nts-monitor alerter (pipeline.monitoring.alerts) fires a Telegram alert
+    # if it is missing or older than backup_max_age_hours. Cannot detect a
+    # full-VPS outage — external monitoring is a separate future item.
+    backup_heartbeat_path: Path = Path("/home/news-deploy/backups/.last_ok")
+    backup_max_age_hours: int = 26
+
     # Optional services
     ml_service_url: str = ""
     browser_render_url: str = ""

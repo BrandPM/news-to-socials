@@ -10,7 +10,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
@@ -115,6 +115,11 @@ def alert_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ADMIN_DB_PATH", str(tmp_path / "admin.db"))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tg-token")
     monkeypatch.setenv("TELEGRAM_MONITORING_CHAT_ID", "-100123")
+    # NTS_088 — a fresh backup heartbeat so the backup-staleness check is a
+    # no-op by default. Backup-specific tests point at their own path.
+    hb = tmp_path / ".last_ok"
+    hb.write_text(datetime.now(tz=timezone.utc).isoformat())
+    monkeypatch.setenv("BACKUP_HEARTBEAT_PATH", str(hb))
     admin_db.reset_for_tests()
     engine = admin_db.get_engine(path=tmp_path / "admin.db")
     admin_db.Base.metadata.create_all(engine)
@@ -461,6 +466,84 @@ def test_visibility_keys_not_treated_as_recovered(alert_env, monkeypatch) -> Non
              stats='{"fetched": 1, "scored": 1, "drafted": 1}')
 
     asyncio.run(alerts.run_alerts(publisher=FakePublisher()))
+    fake = FakePublisher()
+    res = asyncio.run(alerts.run_alerts(publisher=fake))
+    assert res["resolved"] == []
+    assert not any("Recovered" in html for _, html in fake.sent)
+
+
+# --- backup heartbeat (NTS_088) --------------------------------------------
+
+
+def test_check_backup_heartbeat_fresh_is_ok(tmp_path) -> None:
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    hb = tmp_path / ".last_ok"
+    hb.write_text((now - timedelta(hours=2)).isoformat())
+    assert (
+        alerts.check_backup_heartbeat(now=now, heartbeat_path=hb, max_age_hours=26)
+        is None
+    )
+
+
+def test_check_backup_heartbeat_missing_file_alerts(tmp_path) -> None:
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    hb = tmp_path / "does-not-exist"
+    pulse = alerts.check_backup_heartbeat(now=now, heartbeat_path=hb, max_age_hours=26)
+    assert pulse is not None
+    key, msg = pulse
+    assert key == "backup_stale:2026-07-13"
+    assert "heartbeat отсутствует" in msg
+
+
+def test_check_backup_heartbeat_stale_alerts(tmp_path) -> None:
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    hb = tmp_path / ".last_ok"
+    # 30h old > 26h threshold. 'Z' suffix must parse (nts-backup.sh writes it).
+    hb.write_text((now - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    pulse = alerts.check_backup_heartbeat(now=now, heartbeat_path=hb, max_age_hours=26)
+    assert pulse is not None
+    key, msg = pulse
+    assert key == "backup_stale:2026-07-13"
+    assert "Возраст: 30ч" in msg
+
+
+def test_backup_stale_fires_once_per_day(alert_env, monkeypatch, tmp_path) -> None:
+    """A stale heartbeat fires exactly one alert; a second pass the same day
+    does not re-send (dedup key carries the date)."""
+    # Point the alerter at a stale heartbeat and rebuild cached settings.
+    stale = tmp_path / "stale.last_ok"
+    stale.write_text(
+        (datetime.now(tz=timezone.utc) - timedelta(hours=48)).isoformat()
+    )
+    monkeypatch.setenv("BACKUP_HEARTBEAT_PATH", str(stale))
+    monkeypatch.setattr(config_module, "_settings", None)
+
+    fake1 = FakePublisher()
+    res1 = asyncio.run(alerts.run_alerts(publisher=fake1))
+    stale_keys = [s for s in res1["sent"] if s.startswith("backup_stale:")]
+    assert len(stale_keys) == 1
+    assert any("Бэкап admin.db не выполняется" in html for _, html in fake1.sent)
+
+    fake2 = FakePublisher()
+    res2 = asyncio.run(alerts.run_alerts(publisher=fake2))
+    assert not any(s.startswith("backup_stale:") for s in res2["sent"])
+    assert not any("Бэкап admin.db" in html for _, html in fake2.sent)
+
+
+def test_backup_stale_not_treated_as_recovered(alert_env, monkeypatch, tmp_path) -> None:
+    """Once the backup recovers, the one-shot backup_stale key must not
+    produce a 'Recovered' message."""
+    stale = tmp_path / "stale.last_ok"
+    stale.write_text(
+        (datetime.now(tz=timezone.utc) - timedelta(hours=48)).isoformat()
+    )
+    monkeypatch.setenv("BACKUP_HEARTBEAT_PATH", str(stale))
+    monkeypatch.setattr(config_module, "_settings", None)
+    asyncio.run(alerts.run_alerts(publisher=FakePublisher()))
+
+    # Backup recovers: heartbeat becomes fresh.
+    stale.write_text(datetime.now(tz=timezone.utc).isoformat())
+    monkeypatch.setattr(config_module, "_settings", None)
     fake = FakePublisher()
     res = asyncio.run(alerts.run_alerts(publisher=fake))
     assert res["resolved"] == []

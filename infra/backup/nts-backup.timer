@@ -1,0 +1,11 @@
+[Unit]
+Description=News-to-Socials: daily admin.db backup at 03:00 UTC (NTS_088)
+Requires=nts-backup.service
+
+[Timer]
+# 03:00 UTC daily. OnCalendar is UTC unless a timezone is given.
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

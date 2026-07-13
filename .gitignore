@@ -38,10 +38,17 @@ vertex_credentials.json
 
 # Local data
 *.db
+*.db-wal
+*.db-shm
+*.db.bak*
+*.db.pre-*.bak
 *.sqlite3
 *.sqlite3-journal
 data/
 /var/
+
+# Test run artefacts
+test-results/
 
 # Build artefacts
 *.log

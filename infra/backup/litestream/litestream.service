@@ -1,0 +1,30 @@
+[Unit]
+Description=Litestream continuous replication of admin.db → DO Spaces (NTS_088)
+After=network-online.target
+Wants=network-online.target
+# Only start if the creds file exists (prepared-not-active until then).
+ConditionPathExists=/etc/news-to-socials/backup.env
+
+[Service]
+# Runs as the DB owner so it can read admin.db + its WAL.
+User=news-deploy
+Group=news-deploy
+# DO Spaces access keys + endpoint/bucket/region. chmod 600, from Bitwarden.
+EnvironmentFile=/etc/news-to-socials/backup.env
+ExecStart=/usr/bin/litestream replicate -config /etc/litestream.yml
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+# Needs read access to the live DB dir (+ its -wal/-shm) and RW to litestream's
+# own state; ProtectSystem=strict makes everything else read-only.
+ReadWritePaths=/opt/news-to-socials/repo
+MemoryMax=256M
+
+StandardOutput=append:/var/log/news-to-socials/litestream.log
+StandardError=append:/var/log/news-to-socials/litestream.log
+
+[Install]
+WantedBy=multi-user.target
