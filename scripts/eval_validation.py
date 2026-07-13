@@ -85,22 +85,63 @@ async def _query_class(client, cls: str, n: int, en_only: bool) -> list[Item]:
     return out
 
 
-async def _collect(client, brand_id: int, n: int) -> list[Item]:
-    items: list[Item] = []
-    for cls in ("approved", "rejected"):
-        got = await _query_class(client, cls, n, en_only=True)
-        if cls == "rejected" and len(got) < 3:
-            # Few EN rejections — widen to any language (judged with EN rubric;
-            # a documented limitation of the offline experiment).
-            got = await _query_class(client, cls, n, en_only=False)
-            print(f"  (widened rejected to all languages: {len(got)})")
-        items.extend(got)
-        print(f"  collected {len(got)} {cls} drafts")
-    return items
+def _degrade(text: str) -> str:
+    """Turn a good draft into a KNOWN-BAD one: keep only a short stub, strip
+    all H2 structure, and inject a fabricated statistic + generic filler — the
+    exact failure modes the rubric is meant to punish (factuality, specificity,
+    structure, voice). Used to build a negative class when prod has no natural
+    rejections."""
+    words = text.replace("##", "").split()
+    stub = " ".join(words[:110])
+    return (
+        stub
+        + " In today's fast-paced world, it is important to note that, "
+        "according to our internal analysis, 73% of clients unlock synergies "
+        "and leverage best-in-class solutions to move the needle going forward. "
+        "At the end of the day, this is a game-changer that will delight "
+        "stakeholders across the board."
+    )
 
 
-async def _score_all(items: list[Item], model: str, brand_id: int) -> dict[str, list[float]]:
-    by_cls: dict[str, list[float]] = {"approved": [], "rejected": []}
+async def _collect(client, brand_id: int, n: int) -> tuple[list[Item], str]:
+    """Return (items, negative_class_name).
+
+    Positive class = approved (published). Negative class = real rejected
+    drafts (status=='rejected') if any exist; otherwise a synthetic 'degraded'
+    class derived from the approved drafts (documented in the report), because
+    prod has never recorded a rejection.
+    """
+    approved = await _query_class(client, "approved", n, en_only=True)
+    print(f"  collected {len(approved)} approved (EN) drafts")
+    rejected = await _query_class(client, "rejected", n, en_only=True)
+    if len(rejected) < 3:
+        widened = await _query_class(client, "rejected", n, en_only=False)
+        if len(widened) > len(rejected):
+            print(f"  (widened rejected to all languages: {len(widened)})")
+        rejected = widened
+
+    if rejected:
+        print(f"  collected {len(rejected)} rejected drafts")
+        return approved + rejected, "rejected"
+
+    # No natural negatives → synthesise a degraded copy of each approved draft.
+    degraded = [
+        Item(sanity_draft_id=f"{it.sanity_draft_id}#degraded", cls="degraded",
+             source_title=it.source_title, text=_degrade(it.text))
+        for it in approved
+    ]
+    print(
+        f"  NO rejected drafts exist in prod — built {len(degraded)} SYNTHETIC "
+        "degraded negatives from the approved set"
+    )
+    return approved + degraded, "degraded"
+
+
+async def _score_all(
+    items: list[Item], model: str, brand_id: int, neg: str
+) -> tuple[list[float], list[float], float]:
+    pos_scores: list[float] = []
+    neg_scores: list[float] = []
     costs: list[float] = []
     for it in items:
         try:
@@ -115,10 +156,9 @@ async def _score_all(items: list[Item], model: str, brand_id: int) -> dict[str, 
         except Exception as exc:  # noqa: BLE001
             print(f"    judge failed for {it.sanity_draft_id[:20]}: {exc}")
             continue
-        by_cls[it.cls].append(res.total)
+        (pos_scores if it.cls == "approved" else neg_scores).append(res.total)
         costs.append(res.cost_usd)
-    by_cls["_cost_per_draft"] = [statistics.mean(costs)] if costs else [0.0]  # type: ignore[assignment]
-    return by_cls
+    return pos_scores, neg_scores, (statistics.mean(costs) if costs else 0.0)
 
 
 def _mean(xs: list[float]) -> float:
@@ -138,22 +178,23 @@ def main() -> int:
 
     async def go() -> int:
         print("Collecting historical drafts...")
-        items = await _collect(client, brand_id, args.n)
+        items, neg = await _collect(client, brand_id, args.n)
         if not items:
             print("No EN drafts resolved — nothing to score.")
             return 1
-        print(f"\nScoring {len(items)} drafts with: {', '.join(models)}\n")
-        print(f"{'MODEL':26} {'approved':>9} {'rejected':>9} {'separation':>11} {'cost/draft':>11}")
-        print("-" * 70)
-        results = {}
+        print(f"\nNegative class: {neg!r}. Scoring {len(items)} drafts with: {', '.join(models)}\n")
+        header = f"{'MODEL':26} {'approved':>9} {neg:>10} {'separation':>11} {'cost/draft':>11}"
+        print(header)
+        print("-" * len(header))
         for model in models:
-            by = await _score_all(items, model, brand_id)
-            appr, rej = _mean(by["approved"]), _mean(by["rejected"])
-            sep = round(appr - rej, 2)
-            cost = round(by["_cost_per_draft"][0], 6)
-            results[model] = (appr, rej, sep, cost)
+            pos, negs, cost = await _score_all(items, model, brand_id, neg)
+            p, q = _mean(pos), _mean(negs)
+            sep = round(p - q, 2)
             verdict = "PASS" if sep >= 1.5 else "FAIL"
-            print(f"{model:26} {appr:>9} {rej:>9} {sep:>11} {cost:>11}  [{verdict} sep>=1.5]")
+            print(
+                f"{model:26} {p:>9} {q:>10} {sep:>11} {round(cost, 6):>11}  "
+                f"[{verdict} sep>=1.5]"
+            )
         return 0
 
     return asyncio.run(go())
