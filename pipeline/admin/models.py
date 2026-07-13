@@ -34,6 +34,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -206,6 +207,19 @@ class PipelineConfig(Base):
     # Editable from Settings without a deploy. Default 3.
     stale_draft_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=3, server_default="3"
+    )
+    # NTS_090 — embedding dedup (editable from Settings, no deploy).
+    #   dedup_enabled     master switch (dedup fails OPEN regardless).
+    #   dedup_threshold   cosine >= this → duplicate; [0.75, this) → yellow.
+    #   dedup_window_days how far back persisted embeddings/titles compare.
+    dedup_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("1")
+    )
+    dedup_threshold: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.85, server_default="0.85"
+    )
+    dedup_window_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7, server_default="7"
     )
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
@@ -469,4 +483,74 @@ class AlertSent(Base):
     notification_id: Mapped[str] = mapped_column(String, primary_key=True)
     sent_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=_utcnow
+    )
+
+
+class TopicEmbedding(Base):
+    """Persisted source-text embedding for cross-run/-source dedup (NTS_090).
+
+    The pipeline runs each source in its OWN ``run_pipeline`` invocation
+    (NTS_074 isolation), so an in-memory deduper can't see candidates from a
+    sibling source. This table is the shared memory: every kept topic's
+    embedding is stored here, and each new candidate is compared (numpy
+    brute-force cosine — fine at <10k rows) against the window of rows from
+    the last ``dedup_window_days``. Cleaned up on pipeline start.
+
+    ``embedding`` is a raw float32 buffer (``np.ndarray.tobytes()``); the
+    dimensionality is fixed by ``model`` (text-embedding-3-small → 1536).
+    """
+
+    __tablename__ = "topic_embeddings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("brands.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    embedding: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    # Normalised source title stored alongside so the L1 (title Jaccard) check
+    # can compare against the window without a second table.
+    title_norm: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, index=True
+    )
+
+    __table_args__ = (
+        Index("ix_topic_embeddings_brand_created", "brand_id_fk", "created_at"),
+    )
+
+
+class DedupLog(Base):
+    """Calibration dataset for dedup (NTS_090) — Telegram alone isn't enough.
+
+    One row per dedup decision that mattered: a ``skipped`` duplicate or a
+    ``yellow``-zone near-miss (0.75–threshold, NOT skipped). After a week of
+    real runs this table tells us whether ``dedup_threshold`` is too tight
+    (legit follow-ups skipped) or too loose (dupes leaking through).
+    """
+
+    __tablename__ = "dedup_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    topic_id: Mapped[str] = mapped_column(String, nullable=False)
+    matched_topic_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    similarity: Mapped[float] = mapped_column(Float, nullable=False)
+    # 1 = deterministic title match, 2 = embedding cosine.
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('skipped', 'yellow')", name="ck_dedup_log_action"
+        ),
+        CheckConstraint("level IN (1, 2)", name="ck_dedup_log_level"),
     )

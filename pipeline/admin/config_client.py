@@ -54,6 +54,11 @@ class ConfigRecord:
     topics_per_run: int
     banned_phrases: list[str]
     voice_profile: str
+    # NTS_090 — dedup tunables (defaults match the migration server_defaults;
+    # used when a config row predates the columns / the fallback path).
+    dedup_enabled: bool = True
+    dedup_threshold: float = 0.85
+    dedup_window_days: int = 7
 
 
 class BrandNotReadyError(RuntimeError):
@@ -302,6 +307,9 @@ class AdminConfigClient:
                     topics_per_run=row.topics_per_run,
                     banned_phrases=banned,
                     voice_profile=row.voice_profile,
+                    dedup_enabled=bool(getattr(row, "dedup_enabled", True)),
+                    dedup_threshold=float(getattr(row, "dedup_threshold", 0.85)),
+                    dedup_window_days=int(getattr(row, "dedup_window_days", 7)),
                 )
         from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
         from pipeline.run import icon_brand_config  # noqa: PLC0415

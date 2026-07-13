@@ -68,7 +68,8 @@ from pipeline.publisher.sanity import (
     SanityPostInput,
     SanityPublisher,
 )
-from pipeline.selector.dedup import DedupConfig, Deduper, extract_entities
+from pipeline.selector.dedup import extract_entities
+from pipeline.selector.dedup_service import DedupEngine, cleanup_old_embeddings
 from pipeline.selector.topic_picker import BrandContext, TopicPicker
 from pipeline.sources.base import Source
 
@@ -230,11 +231,30 @@ def _resolve_brand_image_styles(voice_profile_yaml: str | None) -> list[str]:
 # --------------------------------------------------------------------------
 
 
+# USD per 1M tokens for the dedup embedding model (OpenAI, 2026-07 pricing).
+_EMBED_USD_PER_1M = {"text-embedding-3-small": 0.02, "text-embedding-3-large": 0.13}
+
+
 async def _embed(text: str, *, model: str = "text-embedding-3-small") -> np.ndarray:
-    """Get an embedding from OpenAI. Cheap, ~$0.00002/topic."""
+    """Get an embedding from OpenAI. Cheap, ~$0.00002/topic.
+
+    NTS_090 (C1): every paid call records a ``cost_records`` row. Cost is
+    computed from the API's reported token usage × the model's per-1M price.
+    Recording is best-effort (``record_cost`` no-ops without a cost context).
+    """
+    from pipeline.admin.cost_recorder import record_cost  # noqa: PLC0415
+
     settings = get_settings()
     client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
     resp = await client.embeddings.create(model=model, input=text)
+    tokens = int(getattr(resp.usage, "total_tokens", 0) or 0)
+    record_cost(
+        provider="openai",
+        operation="embedding",
+        model=model,
+        tokens_in=tokens,
+        cost_usd=tokens / 1_000_000 * _EMBED_USD_PER_1M.get(model, 0.02),
+    )
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
 
@@ -332,52 +352,6 @@ async def assign_category(
         log.warning("category.invalid", got=cat, fallback="special")
         cat = "special"
     return cat
-
-
-async def dedup_filter(
-    candidates: list[tuple[RawItem, int]],
-    language: Language,
-    deduper: Deduper,
-    sanity_publisher: SanityPublisher,
-    brand: BrandConfig,
-) -> list[Topic]:
-    """Two-tier dedup: in-memory + Sanity GROQ query for previously posted."""
-    survivors: list[Topic] = []
-    for item, score in candidates:
-        text = f"{item.title}\n{item.summary or ''}"
-        url_hash = hashlib.sha1(str(item.url).encode("utf-8")).hexdigest()
-        topic_id = url_hash[:16]
-
-        # Tier 1: in-memory + entity overlap
-        try:
-            embedding = await _embed(text)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("embed.failed", url=str(item.url), err=str(exc))
-            continue
-        if deduper.is_duplicate(item, brand.slug, language, embedding):
-            log.info("dedup.local_hit", url=str(item.url))
-            continue
-
-        # Tier 2: ask Sanity — was this topic_id already published in this language?
-        if await sanity_publisher.is_topic_already_posted(topic_id, language):
-            log.info("dedup.sanity_hit", topic_id=topic_id, lang=language.value)
-            continue
-
-        entities = extract_entities(text)
-        deduper.remember(url_hash, brand.slug, language, embedding, entities)
-
-        survivors.append(
-            Topic(
-                id=topic_id,
-                brand_id=brand.slug,
-                raw=item,
-                relevance_score=float(score),
-                embedding=embedding.tolist(),
-                entities=sorted(entities),
-            )
-        )
-    log.info("dedup.done", in_=len(candidates), kept=len(survivors))
-    return survivors
 
 
 async def generate_image_for_topic(
@@ -546,7 +520,10 @@ async def _build_topics_for_source(
 
     topics: list[Topic] = []
     for item, score in scored:
-        text = f"{item.title}\n{item.summary or ''}"
+        # NTS_090 — embed the SOURCE EN text (title + first 500 chars of
+        # summary), never the generated article: dedup must happen before
+        # generation spend.
+        text = f"{item.title}\n{(item.summary or '')[:500]}"
         url_hash = hashlib.sha1(str(item.url).encode("utf-8")).hexdigest()
         topic_id = url_hash[:16]
         try:
@@ -567,6 +544,87 @@ async def _build_topics_for_source(
     return topics, fetched_count
 
 
+def _apply_dedup(
+    topics: list[Topic],
+    *,
+    brand_id_fk: int,
+    source_id: int | None,
+    run_id: int | None,
+    client,
+    dedup_enabled: bool,
+    dedup_threshold: float,
+    dedup_window_days: int,
+) -> tuple[list[Topic], int]:
+    """Two-level dedup over a source's scored topics (NTS_090). FAILS OPEN.
+
+    Returns ``(kept_topics_in_original_order, skipped_count)``. Skipped topics
+    are recorded as ``filtered_dup`` rows (so the admin Last-Run view shows the
+    reason) and logged to ``dedup_log``. Canonical selection uses first-seen
+    (window) + longest-summary tiebreak within the batch. Any error → all
+    topics kept, 0 skipped (dedup must never block a run).
+    """
+    if not dedup_enabled or len(topics) < 1:
+        return topics, 0
+    try:
+        engine = DedupEngine(
+            brand_id_fk=brand_id_fk,
+            threshold=dedup_threshold,
+            window_days=dedup_window_days,
+            run_id=run_id,
+        )
+        # Longest summary first → the richest input wins an intra-batch tie
+        # (becomes canonical); later shorter duplicates match + skip.
+        ordered = sorted(
+            topics, key=lambda t: len(t.raw.summary or ""), reverse=True
+        )
+        survivors: set[str] = set()
+        skipped = 0
+        for t in ordered:
+            emb = np.asarray(t.embedding, dtype=np.float32)
+            decision = engine.check(t.id, t.raw.title, emb)
+            if decision.action == "skipped":
+                skipped += 1
+                engine.record(t.id, decision)
+                client.record_topic_result(
+                    run_id=run_id,
+                    topic_id=t.id,
+                    source_id=source_id,
+                    title=t.raw.title,
+                    url=str(t.raw.url),
+                    score=int(t.relevance_score),
+                    status="filtered_dup",
+                    filter_reason=(
+                        f"duplicate_of:{decision.matched_topic_id} "
+                        f"sim={decision.similarity:.3f} level={decision.level}"
+                    ),
+                    language="en",
+                )
+                log.info(
+                    "dedup.skipped",
+                    topic=t.id,
+                    matched=decision.matched_topic_id,
+                    sim=round(decision.similarity, 3),
+                    level=decision.level,
+                )
+                continue
+            if decision.action == "yellow":
+                engine.record(t.id, decision)
+                log.info(
+                    "dedup.yellow",
+                    topic=t.id,
+                    matched=decision.matched_topic_id,
+                    sim=round(decision.similarity, 3),
+                )
+            engine.remember(t.id, t.raw.title, emb)
+            survivors.add(t.id)
+        # Preserve original (score) order among survivors.
+        kept = [t for t in topics if t.id in survivors]
+        return kept, skipped
+    except Exception as exc:  # noqa: BLE001 — HARD STOP: dedup fails OPEN
+        log.warning("dedup.pass_failed_fail_open", err=str(exc))
+        return topics, 0
+
+
 async def _process_source(
     *,
     source_record,  # config_client.SourceRecord
@@ -579,7 +637,9 @@ async def _process_source(
     client,  # AdminConfigClient
     run_id: int | None,
     min_score: int,
-    deduper: Deduper,
+    dedup_enabled: bool = True,
+    dedup_threshold: float = 0.85,
+    dedup_window_days: int = 7,
 ) -> tuple[list[dict[str, Any]], dict[str, int], set[str]]:
     """Process ONE source for ALL ``languages`` in a single pass.
 
@@ -599,7 +659,7 @@ async def _process_source(
     lets the orchestrator know which languages this source contributed
     to so ``runs.languages_completed`` can be aggregated centrally.
     """
-    stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
+    stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0, "deduped": 0}
     topics, fetched_count = await _build_topics_for_source(
         source_record=source_record,
         brand=brand,
@@ -613,10 +673,23 @@ async def _process_source(
     if not topics:
         return [], stats, set()
 
-    # ``limit`` caps the per-source pre-publish pool (matches old
-    # behaviour — used to be applied after dedup, but in the new structure
-    # we apply it after scoring so image-gen budget tracks the cap, not the
-    # post-dedup count).
+    # ---- DEDUP (NTS_090): drop near-duplicate news BEFORE any generation
+    # spend. Runs over the full scored pool, then the cap is applied to the
+    # survivors so image-gen budget tracks unique topics. Fails OPEN.
+    topics, deduped_count = _apply_dedup(
+        topics,
+        brand_id_fk=brand_id_fk,
+        source_id=source_record.id,
+        run_id=run_id,
+        client=client,
+        dedup_enabled=dedup_enabled,
+        dedup_threshold=dedup_threshold,
+        dedup_window_days=dedup_window_days,
+    )
+    stats["deduped"] = deduped_count
+
+    # ``limit`` caps the per-source pre-publish pool (applied AFTER dedup so
+    # the cap counts unique topics, not near-duplicates we're about to drop).
     topics = topics[:limit]
 
     results: list[dict[str, Any]] = []
@@ -673,20 +746,10 @@ async def _process_source(
         for language in _order_languages_en_first(languages):
             languages_attempted.add(language.value)
             try:
-                # Per-language dedup, two-tier (was inside dedup_filter):
-                # tier 1 in-memory + entity overlap, tier 2 GROQ to Sanity.
-                if deduper.is_duplicate(
-                    topic.raw,
-                    brand.slug,
-                    language,
-                    np.array(topic.embedding, dtype=np.float32),
-                ):
-                    log.info(
-                        "dedup.local_hit",
-                        url=str(topic.raw.url),
-                        lang=language.value,
-                    )
-                    continue
+                # Cross-source/-run near-duplicate dedup now runs at topic
+                # SELECTION (NTS_090, above) before any generation. Here we
+                # keep only the Sanity "already published this topic+language"
+                # guard — cheap idempotency against re-publishing.
                 if await sanity_publisher.is_topic_already_posted(
                     topic.id, language
                 ):
@@ -696,13 +759,6 @@ async def _process_source(
                         lang=language.value,
                     )
                     continue
-                deduper.remember(
-                    hashlib.sha1(str(topic.raw.url).encode("utf-8")).hexdigest(),
-                    brand.slug,
-                    language,
-                    np.array(topic.embedding, dtype=np.float32),
-                    set(topic.entities),
-                )
 
                 if language == Language.en:
                     draft = await generate_draft_for_language(
@@ -1046,7 +1102,7 @@ async def run_pipeline(
     sanity_token = None  # noqa: F841
 
     aggregate_results: list[dict[str, Any]] = []
-    aggregate_stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
+    aggregate_stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0, "deduped": 0}
     log_lines: list[str] = []
 
     # Cost-recording context spans the whole run; topic_id / draft_id
@@ -1062,7 +1118,13 @@ async def run_pipeline(
     # finished sequentially; now it fires for every language the run
     # touched at the end (one batch). The UI loses incremental progress
     # for the duration of the fanout but the schema stays compatible.
-    deduper = Deduper(DedupConfig())
+    # NTS_090 — dedup config (fail-open defaults if the row predates the cols).
+    dedup_enabled = getattr(config, "dedup_enabled", True)
+    dedup_threshold = getattr(config, "dedup_threshold", 0.85)
+    dedup_window_days = getattr(config, "dedup_window_days", 7)
+    # Cleanup old embeddings on pipeline start (best-effort, brand-scoped).
+    if dedup_enabled:
+        cleanup_old_embeddings(brand_id_fk, dedup_window_days)
     languages_seen: set[str] = set()
     with cost_context(CostContext(brand_id_fk=brand_id_fk, run_id=run_id)):
         for src in sources:
@@ -1078,7 +1140,9 @@ async def run_pipeline(
                     client=client,
                     run_id=run_id,
                     min_score=config.scoring_threshold,
-                    deduper=deduper,
+                    dedup_enabled=dedup_enabled,
+                    dedup_threshold=dedup_threshold,
+                    dedup_window_days=dedup_window_days,
                 )
                 aggregate_results.extend(results)
                 for k, v in stats.items():
@@ -1178,7 +1242,7 @@ async def run_pipeline_for_run(run_id: int) -> None:
     # ONE authoritative finish at the end. Generation logic is untouched — this
     # is pure run-lifecycle orchestration + the additive progress field.
     total = len(rows)
-    agg = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0}
+    agg = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0, "deduped": 0}
     client.update_run_progress(
         run_id,
         sources_total=total,

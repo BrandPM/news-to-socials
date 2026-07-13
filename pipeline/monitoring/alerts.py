@@ -214,18 +214,24 @@ def format_run_finished(
     relevant: int,
     drafted: int,
     finished_at: datetime,
+    deduped: int = 0,
 ) -> str:
     """✅/🔴/⏹ pulse when a run reaches a terminal status.
 
     ``relevant`` is ``stats['scored']`` — the items that cleared the
     relevance threshold (``score >= min_score``) — out of ``fetched``.
+    ``deduped`` (NTS_090) is ``stats['deduped']`` — near-duplicate topics
+    skipped before generation; shown only when > 0.
     """
     emoji = _FINISHED_EMOJI.get(status, "✅")
-    return (
-        f"{emoji} <b>Прогон завершён · Run #{run_id}</b>\n"
-        f"Найдено релевантных: {relevant}/{fetched} · черновиков: {drafted}\n"
-        f"🕓 {_fmt_hm(finished_at)} UTC"
-    )
+    lines = [
+        f"{emoji} <b>Прогон завершён · Run #{run_id}</b>",
+        f"Найдено релевантных: {relevant}/{fetched} · черновиков: {drafted}",
+    ]
+    if deduped > 0:
+        lines.append(f"🔁 dedup: {deduped} skipped")
+    lines.append(f"🕓 {_fmt_hm(finished_at)} UTC")
+    return "\n".join(lines)
 
 
 def format_published(
@@ -392,6 +398,7 @@ def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
                         fetched=int(stats.get("fetched", 0) or 0),
                         relevant=int(stats.get("scored", 0) or 0),
                         drafted=int(stats.get("drafted", 0) or 0),
+                        deduped=int(stats.get("deduped", 0) or 0),
                         finished_at=r.finished_at,
                     ),
                 )

@@ -101,14 +101,14 @@ def _mock_externals(monkeypatch, fail_for_language: str | None = None):
             source_id="s",
             source_name="s",
             url="https://test.example.com/a",
-            title="A wealth story",
+            title="Cross-border tax structuring for expats",
             summary="Summary A about cross-border tax structuring.",
         ),
         RawItem(
             source_id="s",
             source_name="s",
             url="https://test.example.com/b",
-            title="B wealth story",
+            title="Family office operations under new EU rules",
             summary="Summary B about family office operations.",
         ),
     ]

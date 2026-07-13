@@ -206,6 +206,10 @@ class PipelineConfigOut(BaseModel):
     voice_profile: str
     # NTS_089 — staleness threshold (days) for the Content Hub ⚠️ flag.
     stale_draft_days: int
+    # NTS_090 — embedding-dedup tunables.
+    dedup_enabled: bool
+    dedup_threshold: float
+    dedup_window_days: int
     updated_at: datetime
 
     @field_validator("banned_phrases", mode="before")
@@ -224,6 +228,10 @@ class PipelineConfigUpdate(BaseModel):
     banned_phrases: list[str] | None = None
     voice_profile: str | None = None
     stale_draft_days: int | None = Field(default=None, ge=1, le=60)
+    # NTS_090 — dedup tunables (editable from Settings, no deploy).
+    dedup_enabled: bool | None = None
+    dedup_threshold: float | None = Field(default=None, ge=0.5, le=0.99)
+    dedup_window_days: int | None = Field(default=None, ge=1, le=90)
 
 
 # --- Runs ---------------------------------------------------------------

@@ -69,6 +69,41 @@ def extract_entities(text: str) -> set[str]:
     return found
 
 
+# --- Level 1: deterministic title match (NTS_090) --------------------------
+
+# Small English stop-word list — enough to stop "the/a/of" inflating Jaccard
+# overlap between unrelated headlines. Kept tiny on purpose (no NLTK dep).
+_TITLE_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for",
+        "with", "at", "by", "from", "as", "is", "are", "was", "were", "be",
+        "been", "it", "its", "this", "that", "these", "those", "will", "has",
+        "have", "had", "s", "amid", "over", "after", "into", "up", "down",
+    }
+)
+_TITLE_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def normalize_title(title: str) -> frozenset[str]:
+    """Lowercase → tokenise (alnum) → drop stop-words + 1-char tokens.
+
+    Returns a token *set* for Jaccard. Punctuation and case are stripped so
+    "ECB Raises Rates!" and "ecb raises rates" collapse to the same set.
+    O(len(title)).
+    """
+    toks = _TITLE_TOKEN_RE.findall(title.lower())
+    return frozenset(t for t in toks if len(t) > 1 and t not in _TITLE_STOPWORDS)
+
+
+def jaccard(a: frozenset[str] | set[str], b: frozenset[str] | set[str]) -> float:
+    """|A∩B| / |A∪B|. 1.0 iff both empty; 0.0 if exactly one is empty. O(|A|+|B|)."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity between two 1-D unit-ish vectors."""
     if a.shape != b.shape:
