@@ -86,20 +86,22 @@ async def _query_class(client, cls: str, n: int, en_only: bool) -> list[Item]:
 
 
 def _degrade(text: str) -> str:
-    """Turn a good draft into a KNOWN-BAD one: keep only a short stub, strip
-    all H2 structure, and inject a fabricated statistic + generic filler — the
-    exact failure modes the rubric is meant to punish (factuality, specificity,
-    structure, voice). Used to build a negative class when prod has no natural
-    rejections."""
-    words = text.replace("##", "").split()
-    stub = " ".join(words[:110])
+    """Turn a good draft into a KNOWN-BAD one about the same topic: discard the
+    real body entirely (keep only the opening clause as a topic hint), then
+    write a single flat paragraph of pure generic filler + a fabricated
+    statistic — no H2 structure, no sourced facts, off-voice. This is a
+    genuinely bad draft, so it tests whether the rubric detects clearly-poor
+    content (used because prod has no natural rejections). A mild degradation
+    that keeps the good lead does NOT separate — the negative must be bad."""
+    topic_hint = text.replace("##", "").split(".")[0].strip()[:140]
     return (
-        stub
-        + " In today's fast-paced world, it is important to note that, "
-        "according to our internal analysis, 73% of clients unlock synergies "
-        "and leverage best-in-class solutions to move the needle going forward. "
-        "At the end of the day, this is a game-changer that will delight "
-        "stakeholders across the board."
+        f"{topic_hint}. In today's fast-paced world, it is important to note "
+        "that, according to our internal analysis, 73% of clients unlock "
+        "synergies by leveraging best-in-class solutions. At the end of the "
+        "day, this game-changer will move the needle and delight stakeholders "
+        "going forward. Experts agree that navigating these waters requires a "
+        "holistic, results-driven approach. Ultimately, the key takeaway is "
+        "that everyone should stay ahead of the curve and think outside the box."
     )
 
 
