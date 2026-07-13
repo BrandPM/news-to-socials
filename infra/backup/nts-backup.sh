@@ -16,7 +16,7 @@
 #
 # Env overrides (defaults are the prod layout):
 #   NTS_DB_PATH      live admin.db            [/opt/news-to-socials/repo/admin.db]
-#   NTS_BACKUP_DIR   where dumps are written  [/home/news-deploy/backups]
+#   NTS_BACKUP_DIR   where dumps are written  [/opt/news-to-socials/backups]
 #
 # Restore: see the "Restore admin.db" runbook (IT_PROJ_NTS_088) or
 # ./nts-restore.sh.
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 DB_PATH="${NTS_DB_PATH:-/opt/news-to-socials/repo/admin.db}"
-BACKUP_DIR="${NTS_BACKUP_DIR:-/home/news-deploy/backups}"
+BACKUP_DIR="${NTS_BACKUP_DIR:-/opt/news-to-socials/backups}"
 HEARTBEAT="$BACKUP_DIR/.last_ok"
 
 DAILY_KEEP_DAYS=30    # keep every daily dump this new

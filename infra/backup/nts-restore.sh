@@ -13,7 +13,7 @@
 #
 # Env overrides (prod defaults):
 #   NTS_DB_PATH      live admin.db            [/opt/news-to-socials/repo/admin.db]
-#   NTS_BACKUP_DIR   where dumps live         [/home/news-deploy/backups]
+#   NTS_BACKUP_DIR   where dumps live         [/opt/news-to-socials/backups]
 
 set -euo pipefail
 
@@ -25,7 +25,7 @@ if [ -z "$DATE" ]; then
 fi
 
 DB_PATH="${NTS_DB_PATH:-/opt/news-to-socials/repo/admin.db}"
-BACKUP_DIR="${NTS_BACKUP_DIR:-/home/news-deploy/backups}"
+BACKUP_DIR="${NTS_BACKUP_DIR:-/opt/news-to-socials/backups}"
 SRC="$BACKUP_DIR/admin-$DATE.db.gz"
 
 if [ ! -f "$SRC" ]; then

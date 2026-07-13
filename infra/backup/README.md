@@ -18,7 +18,7 @@ were removed in NTS_088.
 ## Files
 
 - `nts-backup.sh` — daily snapshot. Uses SQLite `.backup` (never `cp` on a live
-  WAL DB). Writes `admin-YYYY-MM-DD.db.gz` to `/home/news-deploy/backups/` and
+  WAL DB). Writes `admin-YYYY-MM-DD.db.gz` to `/opt/news-to-socials/backups/` and
   an ISO-8601 heartbeat to `.last_ok`. Env: `NTS_DB_PATH`, `NTS_BACKUP_DIR`.
 - `nts-restore.sh` — verify-only by default; `--apply` overwrites the live DB
   (stops the API, snapshots current DB first).
@@ -35,7 +35,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now nts-backup.timer
 sudo systemctl start nts-backup.service      # run once now
 systemctl list-timers | grep nts-backup
-ls -la /home/news-deploy/backups/
+ls -la /opt/news-to-socials/backups/
 ```
 
 The heartbeat is monitored by the existing `nts-monitor.timer` alerter

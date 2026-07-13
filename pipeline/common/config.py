@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     # nts-monitor alerter (pipeline.monitoring.alerts) fires a Telegram alert
     # if it is missing or older than backup_max_age_hours. Cannot detect a
     # full-VPS outage — external monitoring is a separate future item.
-    backup_heartbeat_path: Path = Path("/home/news-deploy/backups/.last_ok")
+    backup_heartbeat_path: Path = Path("/opt/news-to-socials/backups/.last_ok")
     backup_max_age_hours: int = 26
 
     # Optional services
