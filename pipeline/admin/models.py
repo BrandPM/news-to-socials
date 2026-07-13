@@ -221,6 +221,15 @@ class PipelineConfig(Base):
     dedup_window_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=7, server_default="7"
     )
+    # NTS_091 — LLM-judge eval (editable from Settings, no deploy).
+    #   eval_enabled    master switch (eval fails OPEN regardless).
+    #   eval_threshold  weighted total below this → draft flagged needs_attention.
+    eval_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("1")
+    )
+    eval_threshold: Mapped[float] = mapped_column(
+        Float, nullable=False, default=7.0, server_default="7.0"
+    )
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
     banned_phrases: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -553,4 +562,46 @@ class DedupLog(Base):
             "action IN ('skipped', 'yellow')", name="ck_dedup_log_action"
         ),
         CheckConstraint("level IN (1, 2)", name="ck_dedup_log_level"),
+    )
+
+
+class DraftScore(Base):
+    """LLM-as-judge score for one draft in one language (NTS_091).
+
+    Written automatically after EN generation + each translation. EN gets the
+    FULL rubric (factuality, specificity, voice_match, structure,
+    banned_leakage); RU/UK/PL get the REDUCED rubric (translation_fidelity,
+    banned_leakage) — factuality/structure are inherited from the EN canon
+    (NTS_065), which cuts eval cost ~60% vs full×4.
+
+    ``rubric_json`` holds the per-axis 0–10 scores + the judge's feedback +
+    deterministic banned hits. ``total`` is the weighted sum. Scores are only
+    comparable within one ``judge_prompt_version``. ``model`` records which
+    judge produced this row (gpt-4o for the stream; gpt-5.5 for escalated
+    yellow-band cases). ``flagged`` = total < the eval_threshold in force when
+    scored (denormalised so the UI + sort don't depend on the live threshold).
+    """
+
+    __tablename__ = "draft_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    draft_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    brand_id_fk: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("brands.id", ondelete="CASCADE"), nullable=True
+    )
+    lang: Mapped[str] = mapped_column(String(8), nullable=False)
+    rubric_json: Mapped[str] = mapped_column(Text, nullable=False)
+    total: Mapped[float] = mapped_column(Float, nullable=False)
+    flagged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    judge_prompt_version: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, index=True
+    )
+
+    __table_args__ = (
+        Index("ix_draft_scores_brand_created", "brand_id_fk", "created_at"),
+        Index("ix_draft_scores_version", "judge_prompt_version"),
     )

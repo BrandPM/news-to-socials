@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 from .routes import brands as brands_routes
 from .routes import config as config_routes
 from .routes import cost as cost_routes
+from .routes import eval as eval_routes
 from .routes import dashboard as dashboard_routes
 from .routes import drafts as drafts_routes
 from .routes import health as health_routes
@@ -216,6 +217,10 @@ def create_app() -> FastAPI:
     app.include_router(
         health_routes.router, prefix="/api/v1/health",
         tags=["health"], dependencies=auth,
+    )
+    app.include_router(
+        eval_routes.router, prefix="/api/v1/eval",
+        tags=["eval"], dependencies=auth,
     )
     return app
 

@@ -69,6 +69,7 @@ from pipeline.publisher.sanity import (
     SanityPublisher,
 )
 from pipeline.selector.dedup import extract_entities
+from pipeline.admin.judge import score_draft
 from pipeline.selector.dedup_service import DedupEngine, cleanup_old_embeddings
 from pipeline.selector.topic_picker import BrandContext, TopicPicker
 from pipeline.sources.base import Source
@@ -640,6 +641,8 @@ async def _process_source(
     dedup_enabled: bool = True,
     dedup_threshold: float = 0.85,
     dedup_window_days: int = 7,
+    eval_enabled: bool = True,
+    eval_threshold: float = 7.0,
 ) -> tuple[list[dict[str, Any]], dict[str, int], set[str]]:
     """Process ONE source for ALL ``languages`` in a single pass.
 
@@ -847,6 +850,29 @@ async def _process_source(
                         status="passed",
                         draft_id=draft_id,
                         language=language.value,
+                    )
+                    # ---- LLM-JUDGE EVAL (NTS_091): score the draft before the
+                    # manager sees it. EN gets the full rubric (vs the source);
+                    # non-EN gets the reduced rubric (vs the EN canon). FAILS
+                    # OPEN — score_draft never raises, so a dead judge cannot
+                    # block creation/publishing.
+                    if language == Language.en:
+                        _src = f"{topic.raw.title}\n{topic.raw.summary or ''}"
+                        _en_text = ""
+                    else:
+                        _src = ""
+                        _en_text = en_draft.body if en_draft else ""
+                    await score_draft(
+                        draft_id=draft_id,
+                        lang=language.value,
+                        draft_text=f"{draft.title}\n\n{draft.body}",
+                        eval_enabled=eval_enabled,
+                        eval_threshold=eval_threshold,
+                        source_text=_src,
+                        en_text=_en_text,
+                        voice_profile_yaml=brand.voice_profile_yaml or "",
+                        brand_id_fk=brand_id_fk,
+                        run_id=run_id,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.error(
@@ -1122,6 +1148,9 @@ async def run_pipeline(
     dedup_enabled = getattr(config, "dedup_enabled", True)
     dedup_threshold = getattr(config, "dedup_threshold", 0.85)
     dedup_window_days = getattr(config, "dedup_window_days", 7)
+    # NTS_091 — LLM-judge eval config (fail-open defaults if row predates cols).
+    eval_enabled = getattr(config, "eval_enabled", True)
+    eval_threshold = getattr(config, "eval_threshold", 7.0)
     # Cleanup old embeddings on pipeline start (best-effort, brand-scoped).
     if dedup_enabled:
         cleanup_old_embeddings(brand_id_fk, dedup_window_days)
@@ -1143,6 +1172,8 @@ async def run_pipeline(
                     dedup_enabled=dedup_enabled,
                     dedup_threshold=dedup_threshold,
                     dedup_window_days=dedup_window_days,
+                    eval_enabled=eval_enabled,
+                    eval_threshold=eval_threshold,
                 )
                 aggregate_results.extend(results)
                 for k, v in stats.items():

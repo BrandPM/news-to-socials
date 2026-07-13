@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
-from pipeline.admin.models import Brand, CostRecord, DraftApproval, Topic
+from pipeline.admin.models import Brand, CostRecord, DraftApproval, DraftScore, Topic
 from pipeline.admin.schemas import (
     BatchApprovalOut,
     BatchApprovalResult,
@@ -22,6 +22,7 @@ from pipeline.admin.schemas import (
     DraftApprovalIn,
     DraftApprovalOut,
     DraftDetailOut,
+    DraftScoreOut,
     DraftListItem,
     DraftListOut,
     DraftListSibling,
@@ -115,6 +116,45 @@ def _approval_to_out(row: DraftApproval | None) -> DraftApprovalOut | None:
         note=row.note,
         published_at=row.published_at,
         sanity_published_id=row.sanity_published_id,
+    )
+
+
+def _latest_scores(session, draft_ids: list[str]) -> dict[str, DraftScore]:
+    """Latest ``draft_scores`` row per draft_id (NTS_091). Bulk to avoid N+1."""
+    out: dict[str, DraftScore] = {}
+    if not draft_ids:
+        return out
+    for row in session.scalars(
+        select(DraftScore)
+        .where(DraftScore.draft_id.in_(draft_ids))
+        .order_by(DraftScore.created_at.desc())
+    ):
+        # First seen per draft_id wins (query is newest-first).
+        if row.draft_id not in out:
+            out[row.draft_id] = row
+            session.expunge(row)
+    return out
+
+
+def _score_to_out(row: DraftScore | None) -> DraftScoreOut | None:
+    if row is None:
+        return None
+    import json as _json  # noqa: PLC0415
+
+    try:
+        rubric = _json.loads(row.rubric_json or "{}")
+    except (ValueError, TypeError):
+        rubric = {}
+    return DraftScoreOut(
+        total=row.total,
+        flagged=row.flagged,
+        model=row.model,
+        judge_prompt_version=row.judge_prompt_version,
+        axes={k: float(v) for k, v in (rubric.get("axes") or {}).items()},
+        feedback=rubric.get("feedback"),
+        worst_axis=rubric.get("worst_axis"),
+        banned_hits=list(rubric.get("banned_hits") or []),
+        created_at=row.created_at,
     )
 
 
@@ -295,6 +335,11 @@ async def list_drafts(
     ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    sort: str = Query(
+        default="recent",
+        pattern="^(recent|score_asc|score_desc)$",
+        description="NTS_091 — 'score_asc' (weakest first) / 'score_desc' sorts the page by judge score; 'recent' keeps _createdAt order.",
+    ),
 ) -> DraftListOut:
     """List Sanity drafts for ``brand_id``, scoped by Content-hub status.
 
@@ -381,6 +426,7 @@ async def list_drafts(
     # Bulk-load approval status so the list view renders without N+1.
     approvals: dict[str, str] = {}
     approval_rows: dict[str, DraftApproval] = {}
+    scores: dict[str, DraftScore] = {}
     if sanity_ids:
         with session_scope() as session:
             for row in session.scalars(
@@ -392,6 +438,8 @@ async def list_drafts(
                 approvals[row.sanity_draft_id] = row.status
                 session.expunge(row)
                 approval_rows[row.sanity_draft_id] = row
+            # NTS_091 — latest judge score per draft, for the badge + sort.
+            scores = _latest_scores(session, list(sanity_ids))
 
     # Sibling lookup: one extra GROQ for every topic the current page
     # touches, returning the language + status mix per topic. Bulk so the
@@ -474,6 +522,7 @@ async def list_drafts(
                     )
                 )
 
+        _score_row = scores.get(sid)
         items.append(
             DraftListItem(
                 sanity_id=sid,
@@ -487,11 +536,24 @@ async def list_drafts(
                 status=status,  # type: ignore[arg-type]
                 published_at=published_at,
                 display_date=raw.get("displayDate"),
+                score_total=_score_row.total if _score_row else None,
+                score_flagged=_score_row.flagged if _score_row else False,
                 rejected_at=rejected_at,
                 rejection_reason=rejection_reason,
                 live_url=live_url,
                 siblings=sibs,
             )
+        )
+
+    # NTS_091 — optional score sort of the fetched page (weakest/strongest
+    # first). Items without a score sort last regardless of direction so the
+    # scored ones lead. Pagination stays _createdAt-based in GROQ; this
+    # reorders the current page for the "start with the weak ones" workflow.
+    if sort in ("score_asc", "score_desc"):
+        _miss = float("inf") if sort == "score_asc" else float("-inf")
+        items.sort(
+            key=lambda it: it.score_total if it.score_total is not None else _miss,
+            reverse=(sort == "score_desc"),
         )
 
     # ``has_more`` reflects pagination of the *filtered* slice, not the
@@ -848,6 +910,15 @@ async def get_draft(
             rejected_by=rejected_by,
         )
 
+    # NTS_091 — attach the latest judge score for this draft (its language).
+    score_out: DraftScoreOut | None = None
+    with session_scope() as session:
+        score_out = _score_to_out(
+            _latest_scores(session, [sanity_draft_id_normalised]).get(
+                sanity_draft_id_normalised
+            )
+        )
+
     return DraftStateOut(
         sanity_id=sanity_published_id,
         state=state,  # type: ignore[arg-type]
@@ -855,6 +926,7 @@ async def get_draft(
         published=published_out,
         publication_info=publication_info,
         rejection_info=rejection_info,
+        score=score_out,
     )
 
 

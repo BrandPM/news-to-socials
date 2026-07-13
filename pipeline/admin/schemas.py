@@ -210,6 +210,9 @@ class PipelineConfigOut(BaseModel):
     dedup_enabled: bool
     dedup_threshold: float
     dedup_window_days: int
+    # NTS_091 — LLM-judge eval tunables.
+    eval_enabled: bool
+    eval_threshold: float
     updated_at: datetime
 
     @field_validator("banned_phrases", mode="before")
@@ -232,6 +235,9 @@ class PipelineConfigUpdate(BaseModel):
     dedup_enabled: bool | None = None
     dedup_threshold: float | None = Field(default=None, ge=0.5, le=0.99)
     dedup_window_days: int | None = Field(default=None, ge=1, le=90)
+    # NTS_091 — LLM-judge eval tunables.
+    eval_enabled: bool | None = None
+    eval_threshold: float | None = Field(default=None, ge=0.0, le=10.0)
 
 
 # --- Runs ---------------------------------------------------------------
@@ -694,6 +700,38 @@ class DisplayDatePatchOut(BaseModel):
     updated_draft_ids: list[str]
 
 
+class EvalSummaryRow(BaseModel):
+    """One aggregation bucket for the measurability view (NTS_091)."""
+
+    key: str  # judge_prompt_version, or ISO "YYYY-Www"
+    avg_total: float
+    n: int
+    flagged: int
+
+
+class EvalSummaryOut(BaseModel):
+    """Average judge score by prompt version and by week — the measurable
+    signal for prompt iteration (no charting library; a table is enough)."""
+
+    by_version: list[EvalSummaryRow] = []
+    by_week: list[EvalSummaryRow] = []
+
+
+class DraftScoreOut(BaseModel):
+    """LLM-judge score for a draft (NTS_091). ``axes`` holds per-axis 0–10;
+    ``total`` is the weighted sum, comparable only within ``judge_prompt_version``."""
+
+    total: float
+    flagged: bool
+    model: str
+    judge_prompt_version: str
+    axes: dict[str, float] = {}
+    feedback: str | None = None
+    worst_axis: str | None = None
+    banned_hits: list[str] = []
+    created_at: datetime | None = None
+
+
 class DraftDetailOut(BaseModel):
     sanity_id: str
     title: str | None
@@ -799,6 +837,8 @@ class DraftStateOut(BaseModel):
     published: PublishedDocOut | None = None
     publication_info: PublicationInfoOut | None = None
     rejection_info: RejectionInfoOut | None = None
+    # NTS_091 — latest LLM-judge score for this draft (its language), if any.
+    score: DraftScoreOut | None = None
 
 
 class DraftListSibling(BaseModel):
@@ -848,6 +888,9 @@ class DraftListItem(BaseModel):
     # NTS_089 — displayed publication date (date-only "YYYY-MM-DD", UTC).
     # Powers the date badge + staleness ⚠️ on pending cards.
     display_date: str | None = None
+    # NTS_091 — latest judge score + flag, for the badge + score sort.
+    score_total: float | None = None
+    score_flagged: bool = False
     rejected_at: datetime | None = None
     rejection_reason: str | None = None
     live_url: str | None = None

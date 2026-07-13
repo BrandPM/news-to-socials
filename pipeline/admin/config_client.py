@@ -59,6 +59,9 @@ class ConfigRecord:
     dedup_enabled: bool = True
     dedup_threshold: float = 0.85
     dedup_window_days: int = 7
+    # NTS_091 — LLM-judge eval tunables.
+    eval_enabled: bool = True
+    eval_threshold: float = 7.0
 
 
 class BrandNotReadyError(RuntimeError):
@@ -310,6 +313,8 @@ class AdminConfigClient:
                     dedup_enabled=bool(getattr(row, "dedup_enabled", True)),
                     dedup_threshold=float(getattr(row, "dedup_threshold", 0.85)),
                     dedup_window_days=int(getattr(row, "dedup_window_days", 7)),
+                    eval_enabled=bool(getattr(row, "eval_enabled", True)),
+                    eval_threshold=float(getattr(row, "eval_threshold", 7.0)),
                 )
         from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
         from pipeline.run import icon_brand_config  # noqa: PLC0415
