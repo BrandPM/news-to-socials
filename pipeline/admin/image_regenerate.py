@@ -1,12 +1,17 @@
-"""Regenerate the cover image for an existing Sanity draft.
+"""Regenerate the cover image for an existing Sanity document.
 
 Flow:
 1. Fetch the draft from Sanity (need title + topic id for a prompt).
 2. Run ImageGenerator → master PNG URL on Replicate's CDN.
 3. Resize for the blog channel, upload as a Sanity asset.
-4. Patch the draft's ``coverImage`` reference to the new asset.
+4. Patch ``coverImage`` on every language sibling of the topic, atomically.
 
-Returns the new asset _id on success. Used by ``jobs.execute_image_regenerate``.
+Steps 2-4 live in :func:`generate_and_apply_cover`, which takes the target
+document ids explicitly and neither knows nor cares whether they are drafts
+or published posts. :func:`regenerate_cover_image` is the draft-facing entry
+point used by ``jobs.execute_image_regenerate``; ``scripts/
+backfill_cover_images.py`` (NTS_090) drives the same core over PUBLISHED ids
+to repair articles that went live without a cover.
 """
 
 from __future__ import annotations
@@ -58,6 +63,122 @@ def _brand_visual_for(brand_id: str) -> BrandVisual:
     )
 
 
+def _icon_brand_id_fk() -> int | None:
+    """The ``brands.id`` for icon, or None when admin.db can't be read.
+
+    Only used to attribute cost rows and resolve the brand's image prompt —
+    never load-bearing, so every failure degrades to None.
+    """
+    try:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from pipeline.admin.db import session_scope  # noqa: PLC0415
+        from pipeline.admin.models import Brand  # noqa: PLC0415
+
+        with session_scope() as session:
+            row = session.execute(
+                select(Brand).where(Brand.slug == "icon")
+            ).scalar_one_or_none()
+            return row.id if row is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def generate_and_apply_cover(
+    *,
+    title: str,
+    topic_id: str,
+    source_url: str,
+    target_ids: list[str],
+    client: SanityClient | None = None,
+    publisher: SanityPublisher | None = None,
+    cost_doc_id: str | None = None,
+    custom_prompt: str | None = None,
+    summary: str | None = None,
+    filename_suffix: str = "regen",
+) -> str:
+    """Generate ONE cover and attach it to every id in ``target_ids``.
+
+    The ids are used verbatim — draft (``drafts.post-x``) or published
+    (``post-x``), mixed freely — and patched in a single Sanity transaction
+    so a topic never ends up half-covered. Returns the new asset ``_id``.
+
+    Exactly one image is generated regardless of how many siblings receive
+    it (NTS_069: one cover per topic); the cost row is attributed to
+    ``cost_doc_id``.
+    """
+    if not target_ids:
+        raise ValueError("generate_and_apply_cover needs at least one target id")
+
+    client = client or SanityClient()
+    publisher = publisher or SanityPublisher(client=client)
+
+    fake_topic = Topic(
+        id=topic_id,
+        brand_id="icon",
+        raw=RawItem(
+            source_id="regen",
+            source_name="regen",
+            url=source_url,
+            title=title,
+        ),
+        relevance_score=10.0,
+    )
+    visual = _brand_visual_for("icon")
+    if custom_prompt:
+        visual = BrandVisual(
+            brand_id=visual.brand_id, image_style_prompts=[custom_prompt]
+        )
+
+    from pipeline.admin.cost_recorder import CostContext, cost_context  # noqa: PLC0415
+
+    icon_brand_id_fk = _icon_brand_id_fk()
+
+    ctx = CostContext(brand_id_fk=icon_brand_id_fk, draft_id=cost_doc_id)
+    with cost_context(ctx):
+        # NTS_075 L2: the same smart per-topic scene a real run builds.
+        # Exception: an operator-supplied custom_prompt is the whole point of
+        # the override — send it verbatim (no LLM scene).
+        scene: str | None = None
+        if not custom_prompt:
+            scene = await build_scene_prompt(
+                title, summary or "", brand_id_fk=icon_brand_id_fk
+            )
+        gen = ImageGenerator()
+        master_url = await gen.generate(
+            fake_topic, visual, operation="image_regenerate", scene=scene
+        )
+        master_bytes = await fetch_master(master_url)
+        resized = resize_for_channel(master_bytes, Channel.blog)
+        asset_id = await publisher.upload_cover_image(
+            resized, filename=f"icon-{topic_id}-{filename_suffix}.png"
+        )
+
+    # One cover per topic (NTS_069). The cover lives only in Sanity (admin.db
+    # stores no image ref) as a per-document ``coverImage`` asset reference,
+    # so before this fix Regenerate patched a single language and the siblings
+    # kept the old asset. Every sibling is patched in ONE Sanity transaction →
+    # atomic, no partial state (same posture as the NTS_062 delete-sync).
+    cover_ref = {
+        "_type": "image",
+        "asset": {"_type": "reference", "_ref": asset_id},
+    }
+    await client.mutate(
+        [
+            {"patch": {"id": sid, "set": {"coverImage": cover_ref}}}
+            for sid in target_ids
+        ]
+    )
+    log.info(
+        "image.cover_applied",
+        asset_id=asset_id,
+        topic_id=topic_id,
+        applied_to=len(target_ids),
+        ids=target_ids,
+    )
+    return asset_id
+
+
 async def regenerate_cover_image(
     sanity_draft_id: str,
     custom_prompt: str | None = None,
@@ -84,75 +205,8 @@ async def regenerate_cover_image(
     topic_id = doc.get("topicId") or "unknown"
     source_url = doc.get("sourceUrl") or "https://example.com/"
 
-    # 2. Build a synthetic Topic so ImageGenerator has its expected input.
-    fake_topic = Topic(
-        id=topic_id,
-        brand_id="icon",
-        raw=RawItem(
-            source_id="regen",
-            source_name="regen",
-            url=source_url,
-            title=title,
-        ),
-        relevance_score=10.0,
-    )
-    visual = _brand_visual_for("icon")
-    if custom_prompt:
-        visual = BrandVisual(
-            brand_id=visual.brand_id, image_style_prompts=[custom_prompt]
-        )
-
-    # 3. Generate + resize + upload — wrap in a cost context so the
-    #    Replicate call inside ImageGenerator records against this draft.
-    #    Brand resolution is naïve here (icon-only); Step 4 broadens this.
-    from sqlalchemy import select  # noqa: PLC0415
-
-    from pipeline.admin.cost_recorder import CostContext, cost_context  # noqa: PLC0415
-    from pipeline.admin.db import session_scope  # noqa: PLC0415
-    from pipeline.admin.models import Brand  # noqa: PLC0415
-
-    icon_brand_id_fk: int | None = None
-    try:
-        with session_scope() as session:
-            row = session.execute(
-                select(Brand).where(Brand.slug == "icon")
-            ).scalar_one_or_none()
-            icon_brand_id_fk = row.id if row is not None else None
-    except Exception:  # noqa: BLE001
-        icon_brand_id_fk = None
-
-    # Cost is recorded ONCE per regeneration (one image generated), attributed
-    # to the originating draft — applying it to siblings is a free patch.
-    ctx = CostContext(brand_id_fk=icon_brand_id_fk, draft_id=draft_form)
-    with cost_context(ctx):
-        # NTS_075 L2: Regenerate uses the same smart per-topic scene as a run.
-        # Exception: when the operator supplied a custom_prompt, that is the
-        # whole point of the override — send it verbatim (no LLM scene). Both
-        # the scene LLM call and the Replicate call record against this draft.
-        scene: str | None = None
-        if not custom_prompt:
-            scene = await build_scene_prompt(title, brand_id_fk=icon_brand_id_fk)
-        gen = ImageGenerator()
-        master_url = await gen.generate(
-            fake_topic, visual, operation="image_regenerate", scene=scene
-        )
-        master_bytes = await fetch_master(master_url)
-        resized = resize_for_channel(master_bytes, Channel.blog)
-        asset_id = await publisher.upload_cover_image(
-            resized, filename=f"icon-{topic_id}-regen.png"
-        )
-
-    # 4. Apply the new cover to ALL language siblings of this topic — one cover
-    #    per topic (NTS_069). The cover lives only in Sanity (admin.db stores no
-    #    image ref), as a per-document ``coverImage`` asset reference, so before
-    #    this fix Regenerate patched a single language and the siblings kept the
-    #    old asset. We patch every sibling in ONE Sanity transaction → atomic,
-    #    no partial state (same posture as the NTS_062 delete-sync). Falls back
-    #    to the originating doc when topicId is unknown.
-    cover_ref = {
-        "_type": "image",
-        "asset": {"_type": "reference", "_ref": asset_id},
-    }
+    # 2. Resolve every language sibling of the topic BEFORE paying for an
+    #    image. Falls back to the originating doc when topicId is unknown.
     sibling_ids: list[str] = []
     if topic_id and topic_id != "unknown":
         rows = await client.query(
@@ -165,14 +219,15 @@ async def regenerate_cover_image(
     if not sibling_ids:
         sibling_ids = [draft_form]
 
-    await client.mutate(
-        [{"patch": {"id": sid, "set": {"coverImage": cover_ref}}} for sid in sibling_ids]
-    )
-    log.info(
-        "image.regenerated",
-        asset_id=asset_id,
+    # 3. Generate one image and apply it to all of them. Cost is attributed to
+    #    the originating draft — applying it to siblings is a free patch.
+    return await generate_and_apply_cover(
+        title=title,
         topic_id=topic_id,
-        applied_to=len(sibling_ids),
-        ids=sibling_ids,
+        source_url=source_url,
+        target_ids=sibling_ids,
+        client=client,
+        publisher=publisher,
+        cost_doc_id=draft_form,
+        custom_prompt=custom_prompt,
     )
-    return asset_id
