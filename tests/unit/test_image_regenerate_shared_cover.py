@@ -33,7 +33,20 @@ def fake_image_stack(monkeypatch, tmp_path):
 
     monkeypatch.setattr(config_module, "_settings", None)
 
-    captured: dict = {"generate": [], "uploads": [], "transactions": [], "siblings": None}
+    captured: dict = {
+        "generate": [],
+        "uploads": [],
+        "transactions": [],
+        "siblings": None,
+        "queries": [],
+        # The document the regenerate reads. Tests may replace it — e.g. with a
+        # cover-less draft (NTS_091 Task B).
+        "doc": {
+            "title": "Tax Advisory",
+            "topicId": "topic-1",
+            "sourceUrl": "https://example.com/tax",
+        },
+    }
 
     class FakeClient:
         def __init__(self, *a, **k) -> None:
@@ -41,14 +54,11 @@ def fake_image_stack(monkeypatch, tmp_path):
 
         async def query(self, groq, params=None):  # noqa: ANN001
             params = params or {}
+            captured["queries"].append(groq)
             if "tid" in params:
                 return captured["siblings"]
             # The read for title/topicId.
-            return {
-                "title": "Tax Advisory",
-                "topicId": "topic-1",
-                "sourceUrl": "https://example.com/tax",
-            }
+            return captured["doc"]
 
         async def mutate(self, mutations):  # noqa: ANN001
             captured["transactions"].append(mutations)
@@ -126,6 +136,36 @@ def test_regenerate_with_missing_siblings_patches_what_exists(fake_image_stack):
     patched = _coverref_ids(fake_image_stack["transactions"][0])
     # Falls back to the originating draft form — no 500, no empty transaction.
     assert patched == {"drafts.post-solo": "image-NEWASSET"}
+
+
+def test_regenerate_generates_the_first_cover_when_there_is_none(fake_image_stack):
+    """NTS_091 Task B — the publish-guard banner's «Сгенерировать обложку»
+    drives this same path on a draft whose ``coverImage`` is null. Creating the
+    FIRST cover has to work, not only replacing an existing one: a cover-less
+    draft is exactly the case the button exists for.
+    """
+    fake_image_stack["doc"] = {
+        "title": "Tax Advisory",
+        "topicId": "topic-1",
+        "sourceUrl": "https://example.com/tax",
+        "coverImage": None,
+    }
+    fake_image_stack["siblings"] = [
+        {"_id": "drafts.post-en"},
+        {"_id": "drafts.post-ru"},
+    ]
+
+    asset = asyncio.run(ir.regenerate_cover_image("drafts.post-en"))
+
+    assert asset == "image-NEWASSET"
+    patched = _coverref_ids(fake_image_stack["transactions"][0])
+    assert patched == {
+        "drafts.post-en": "image-NEWASSET",
+        "drafts.post-ru": "image-NEWASSET",
+    }
+    # No precondition on the existing cover anywhere in the reads — a null
+    # cover must not filter the draft out and turn the button into a 404.
+    assert not any("coverImage" in q for q in fake_image_stack["queries"])
 
 
 def test_regenerate_generates_and_uploads_exactly_once(fake_image_stack):

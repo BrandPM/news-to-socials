@@ -1531,6 +1531,15 @@ def regenerate_image(
     payload: ImageRegenerateIn,
     background: BackgroundTasks,
 ) -> JobAcceptedOut:
+    """Generate one cover for this draft's topic and patch every sibling.
+
+    NTS_091 Task B: this is also the endpoint behind the publish-guard
+    banner's «Сгенерировать обложку», i.e. it runs on drafts whose
+    ``coverImage`` is *null*. There is deliberately no
+    already-has-a-cover precondition — creating the first cover and
+    replacing an existing one are the same operation here (pinned by
+    ``test_regenerate_generates_the_first_cover_when_there_is_none``).
+    """
     job = jobs.register_image_job()
     background.add_task(
         jobs.execute_image_regenerate,

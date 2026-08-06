@@ -183,7 +183,13 @@ async def regenerate_cover_image(
     sanity_draft_id: str,
     custom_prompt: str | None = None,
 ) -> str:
-    """Regenerate and re-attach a draft's cover image. Returns the new asset _id."""
+    """Regenerate and re-attach a draft's cover image. Returns the new asset _id.
+
+    Works on a draft that has NO cover yet — the read below asks for title /
+    topicId / sourceUrl and nothing about ``coverImage``, so "generate the
+    first cover" and "replace the cover" are one path (NTS_091 Task B: the
+    publish-guard banner's one-click fix calls exactly this).
+    """
     client = SanityClient()
     publisher = SanityPublisher(client=client)
 
