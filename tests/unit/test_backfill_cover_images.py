@@ -15,26 +15,41 @@ from scripts import backfill_cover_images as bf
 
 
 class FakeClient:
-    """Answers the script's two GROQ shapes from an in-memory dataset."""
+    """Answers the script's two GROQ shapes from an in-memory dataset.
+
+    The filter strings are the script's own constants, so the fake honours the
+    same scope the real GROQ would: a ``published`` query never sees drafts,
+    and the drafts pass sees published siblings only as reuse donors.
+    """
 
     def __init__(self, rows: list[dict]) -> None:
         self.rows = rows
         self.mutations: list[list[dict]] = []
 
+    @staticmethod
+    def _in_scope(groq: str, row: dict) -> bool:
+        if bf._PENDING_DRAFT in groq:
+            return bf._row_is_pending_draft(row)
+        if bf._PUBLISHED in groq:
+            return not row.get("isDraft")
+        # The drafts pass's donor query: pending drafts + every published post.
+        return bf._row_is_pending_draft(row) or not row.get("isDraft")
+
     async def query(self, groq, params=None):  # noqa: ANN001
         params = params or {}
+        rows = [r for r in self.rows if self._in_scope(groq, r)]
         if "topicId in $topics" in groq:
             wanted = set(params.get("topics") or [])
-            return [r for r in self.rows if r.get("topicId") in wanted]
+            return [r for r in rows if r.get("topicId") in wanted]
         # The cover-less-posts query.
-        return [r for r in self.rows if not r.get("coverImageRef")]
+        return [r for r in rows if not r.get("coverImageRef")]
 
     async def mutate(self, mutations):  # noqa: ANN001
         self.mutations.append(mutations)
         return {}
 
 
-def _row(sid, lang, topic="topic-1", cover=None, title=None):
+def _row(sid, lang, topic="topic-1", cover=None, title=None, status=None):
     return {
         "_id": sid,
         "topicId": topic,
@@ -45,7 +60,16 @@ def _row(sid, lang, topic="topic-1", cover=None, title=None):
         "sourceUrl": "https://example.com/a",
         "slug": f"slug-{lang}",
         "coverImageRef": cover,
+        "status": status,
+        "isDraft": str(sid).startswith("drafts."),
     }
+
+
+def _draft_row(lang, topic="topic-1", cover=None, status=None, title=None):
+    return _row(
+        f"drafts.post-{lang}", lang, topic=topic, cover=cover, title=title,
+        status=status,
+    )
 
 
 def test_no_candidates_when_every_post_has_a_cover() -> None:
@@ -55,10 +79,17 @@ def test_no_candidates_when_every_post_has_a_cover() -> None:
     assert asyncio.run(bf.find_candidates(client)) == []
 
 
-def test_drafts_are_not_candidates() -> None:
-    """The GROQ excludes drafts — Task A's guard owns those. Asserted via the
-    filter string so a future edit that drops it fails here."""
+def test_drafts_are_not_candidates_for_the_default_target() -> None:
+    """The default GROQ excludes drafts — ``--target drafts`` owns those.
+    Asserted via the filter string so a future edit that drops it fails here."""
     assert '!(_id in path("drafts.**"))' in bf._PUBLISHED
+
+
+def test_default_target_ignores_cover_less_drafts() -> None:
+    """A cover-less pending draft is invisible to the published sweep, so the
+    default invocation's behaviour is unchanged by NTS_091."""
+    client = FakeClient([_draft_row("en"), _draft_row("ru")])
+    assert asyncio.run(bf.find_candidates(client)) == []
 
 
 def test_siblings_are_grouped_into_one_topic() -> None:
@@ -223,4 +254,155 @@ def test_publishedat_is_never_touched(monkeypatch, apply_flag) -> None:
     asyncio.run(bf._run(client, apply=apply_flag))
     for tx in client.mutations:
         for m in tx:
+            assert set(m["patch"]["set"]) == {"coverImage"}
+
+
+# ---------------------------------------------------------------------------
+# NTS_091 Task A — ``--target drafts``: sweep the pending drafts the publish
+# guard now blocks for a missing cover.
+# ---------------------------------------------------------------------------
+
+DRAFTS = bf.TARGETS["drafts"]
+
+
+def test_drafts_target_finds_cover_less_pending_drafts() -> None:
+    client = FakeClient([_draft_row(lang) for lang in ("en", "ru", "uk", "pl")])
+    groups = asyncio.run(bf.find_candidates(client, DRAFTS))
+
+    assert len(groups) == 1, "4 languages of one story = ONE image, not four"
+    g = groups[0]
+    assert g.action == "generate"
+    assert [s.sanity_id for s in g.missing] == [
+        "drafts.post-en",
+        "drafts.post-ru",
+        "drafts.post-uk",
+        "drafts.post-pl",
+    ]
+    assert g.canonical.language == "en", "EN still drives the prompt"
+
+
+def test_drafts_target_skips_rejected_drafts() -> None:
+    """A rejected draft is heading for deletion — no cover, no spend."""
+    client = FakeClient(
+        [_draft_row("en", status="rejected"), _draft_row("ru", status="rejected")]
+    )
+    assert asyncio.run(bf.find_candidates(client, DRAFTS)) == []
+
+
+def test_drafts_target_treats_absent_status_as_pending() -> None:
+    """Pre-NTS_052 drafts carry no ``status`` field at all."""
+    client = FakeClient([_draft_row("en", status=None)])
+    groups = asyncio.run(bf.find_candidates(client, DRAFTS))
+    assert [s.sanity_id for s in groups[0].missing] == ["drafts.post-en"]
+
+
+def test_drafts_target_reuses_a_published_siblings_cover() -> None:
+    """One cover per topic (NTS_069) spans the draft/published boundary: if EN
+    is already live with a cover, the RU draft adopts it instead of paying for
+    a second image that would show a different picture for the same story."""
+    client = FakeClient(
+        [
+            _row("post-en", "en", cover="image-live"),
+            _draft_row("ru"),
+        ]
+    )
+    groups = asyncio.run(bf.find_candidates(client, DRAFTS))
+
+    assert len(groups) == 1
+    g = groups[0]
+    assert g.action == "reuse"
+    assert g.existing_cover_ref == "image-live"
+    # The published sibling is a donor only — never a patch target here.
+    assert [s.sanity_id for s in g.missing] == ["drafts.post-ru"]
+
+    outcome = asyncio.run(bf._apply_group(client, g))
+    assert "reused image-live" in outcome
+    assert [m["patch"]["id"] for m in client.mutations[0]] == ["drafts.post-ru"]
+
+
+def test_drafts_target_does_not_patch_a_cover_less_published_sibling() -> None:
+    """A published post with no cover belongs to the ``published`` pass. The
+    drafts pass lists it (``!``) but leaves it alone."""
+    client = FakeClient([_row("post-en", "en"), _draft_row("ru")])
+    groups = asyncio.run(bf.find_candidates(client, DRAFTS))
+
+    g = groups[0]
+    assert [s.sanity_id for s in g.missing] == ["drafts.post-ru"]
+    assert g.languages == "EN!,RU*"
+
+
+def test_drafts_target_generate_attributes_cost_to_the_draft(monkeypatch) -> None:
+    client = FakeClient([_draft_row(lang) for lang in ("en", "ru")])
+    groups = asyncio.run(bf.find_candidates(client, DRAFTS))
+
+    calls: list[dict] = []
+
+    async def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return "image-NEW"
+
+    from pipeline.admin import image_regenerate as ir
+
+    monkeypatch.setattr(ir, "generate_and_apply_cover", fake_generate)
+    monkeypatch.setattr(bf, "SanityPublisher", lambda **kw: object())
+
+    asyncio.run(bf._apply_group(client, groups[0]))
+
+    assert len(calls) == 1, "one image for the whole topic"
+    assert calls[0]["target_ids"] == ["drafts.post-en", "drafts.post-ru"]
+    # The spend lands on the draft the manager is about to review.
+    assert calls[0]["cost_doc_id"] == "drafts.post-en"
+
+
+def test_drafts_dry_run_writes_nothing_and_estimates(capsys) -> None:
+    client = FakeClient(
+        [
+            _draft_row("en", topic="topic-a"),
+            _draft_row("ru", topic="topic-a"),
+            _row("post-b-en", "en", topic="topic-b", cover="image-b"),
+            _row("drafts.post-b-ru", "ru", topic="topic-b"),
+        ]
+    )
+    rc = asyncio.run(bf._run(client, apply=False, target="drafts"))
+
+    assert rc == 0
+    assert client.mutations == []
+    out = capsys.readouterr().out
+    assert "[drafts]" in out
+    assert "2 topic(s) / 3 document(s)" in out
+    assert "1 topic(s) need a NEW image" in out
+    assert "1 topic(s) can REUSE" in out
+    assert "~$0.04 estimated" in out
+    assert "DRY RUN" in out
+
+
+def test_drafts_dry_run_reports_an_empty_queue(capsys) -> None:
+    client = FakeClient([_draft_row("en", cover="image-x")])
+    asyncio.run(bf._run(client, apply=False, target="drafts"))
+    assert "No pending drafts are missing a cover image" in capsys.readouterr().out
+
+
+def test_target_all_runs_both_passes(capsys) -> None:
+    client = FakeClient([_row("post-en", "en", topic="topic-a"), _draft_row("ru", topic="topic-b")])
+    asyncio.run(bf._run(client, apply=False, target="all"))
+
+    out = capsys.readouterr().out
+    assert "[published]" in out
+    assert "[drafts]" in out
+    # Published first — a cover it gains is a free donor for the drafts pass.
+    assert out.index("[published]") < out.index("[drafts]")
+
+
+def test_sweep_never_approves_or_publishes_a_draft(monkeypatch) -> None:
+    """The whole point of the drafts sweep: it sets coverImage and nothing
+    else. No status flip, no publish — the draft goes back in the queue."""
+    client = FakeClient(
+        [_row("post-en", "en", cover="image-live"), _draft_row("ru")]
+    )
+    asyncio.run(bf._run(client, apply=True, target="drafts"))
+
+    assert client.mutations, "the draft must actually be patched"
+    for tx in client.mutations:
+        for m in tx:
+            assert set(m["patch"]) == {"id", "set"}
             assert set(m["patch"]["set"]) == {"coverImage"}

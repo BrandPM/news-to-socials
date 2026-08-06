@@ -1,8 +1,19 @@
-"""Backfill ``coverImage`` on already-published Sanity posts (NTS_090).
+"""Backfill ``coverImage`` on Sanity posts — published and/or pending drafts.
 
 The incident behind IT_PROJ_NTS_090: articles went live with
-``coverImage: null``. Task A stops any new one from slipping through; this
-script repairs the ones already on the site.
+``coverImage: null``. NTS_090 Task A stops any new one from slipping through;
+this script repairs the ones already written.
+
+Two sets need repairing, selected with ``--target``:
+
+* ``published`` (default) — articles already on the site. Nothing but this
+  script can fix them; the guard came too late.
+* ``drafts`` (NTS_091) — PENDING drafts the new publish guard now blocks
+  because their only missing component is the cover. Sweeping them clears the
+  editorial queue in one command instead of one Regenerate click per draft.
+  They stay drafts: only ``coverImage`` is set, so each one re-enters the
+  normal review flow (a manager still approves, and now sees the new cover).
+* ``all`` — both passes, published first.
 
 Work is grouped by TOPIC, never by document — one cover per topic shared
 across its EN/RU/UK/PL siblings (NTS_069). Two shapes of repair:
@@ -10,14 +21,17 @@ across its EN/RU/UK/PL siblings (NTS_069). Two shapes of repair:
 * **reuse** — the topic already has a cover on at least one language (a
   partial fanout). The existing asset is patched onto the siblings that lack
   it. Costs nothing and, importantly, does not replace a cover a human may
-  have already looked at.
+  have already looked at. In the ``drafts`` pass the donor may be a PUBLISHED
+  sibling of the same topic — paying for a second image there would give one
+  story two different covers.
 * **generate** — no language of the topic has a cover. One image is generated
   from the EN-canonical title via the same path Regenerate uses
   (``build_scene_prompt`` → Flux → resize ``Channel.blog`` → upload) and
   patched onto every sibling in ONE Sanity transaction.
 
 Only ``coverImage`` is written. ``publishedAt`` is NTS_089's separate
-backfill and ``_updatedAt`` / ``dateModified`` belong to Sanity.
+backfill and ``_updatedAt`` / ``dateModified`` belong to Sanity. Nothing here
+approves or publishes anything.
 
 Default mode is **DRY RUN**: it prints the candidate table and writes
 nothing. ``--apply`` executes. A single topic's failure is isolated — the
@@ -26,6 +40,8 @@ rest still run, and the summary names what failed.
 Usage:
     .venv/bin/python -m scripts.backfill_cover_images --brand-slug icon
     .venv/bin/python -m scripts.backfill_cover_images --brand-slug icon --apply
+    .venv/bin/python -m scripts.backfill_cover_images --brand-slug icon \\
+        --target drafts
 """
 
 from __future__ import annotations
@@ -33,6 +49,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from pipeline.admin import db as admin_db
@@ -56,6 +73,10 @@ class Sibling:
     summary: str | None
     source_url: str | None
     cover_ref: str | None
+    # False for a sibling that is only here to *donate* a cover — e.g. the
+    # published EN of a topic whose RU draft is being swept. Its own missing
+    # cover (if any) belongs to the other target's pass, not this one.
+    patchable: bool = True
 
     @property
     def has_cover(self) -> bool:
@@ -72,7 +93,8 @@ class TopicGroup:
 
     @property
     def missing(self) -> list[Sibling]:
-        return [s for s in self.siblings if not s.has_cover]
+        """Siblings this pass will patch: cover-less AND in the target's scope."""
+        return [s for s in self._ordered() if not s.has_cover and s.patchable]
 
     @property
     def existing_cover_ref(self) -> str | None:
@@ -106,11 +128,28 @@ class TopicGroup:
         return self._ordered()[0]
 
     @property
+    def cost_doc(self) -> Sibling:
+        """Which document the generation cost is attributed to.
+
+        A document this pass actually patches, so a drafts sweep bills the
+        draft (``drafts.post-…``) rather than a published sibling that only
+        came along to donate a title.
+        """
+        patched = self.missing
+        return patched[0] if patched else self.canonical
+
+    @property
     def languages(self) -> str:
+        """``EN,RU*,PL!`` — ``*`` will be patched, ``!`` is out of scope."""
         out = []
         for s in self._ordered():
             code = (s.language or "??").upper()
-            out.append(code if s.has_cover else f"{code}*")
+            if s.has_cover:
+                out.append(code)
+            elif s.patchable:
+                out.append(f"{code}*")
+            else:
+                out.append(f"{code}!")
         return ",".join(out)
 
     @property
@@ -135,7 +174,7 @@ def _build_sanity_client(brand_slug: str) -> SanityClient:
         )
 
 
-def _sibling_from_row(row: dict) -> Sibling:
+def _sibling_from_row(row: dict, *, patchable: bool = True) -> Sibling:
     return Sibling(
         sanity_id=str(row.get("_id")),
         language=row.get("language"),
@@ -144,27 +183,86 @@ def _sibling_from_row(row: dict) -> Sibling:
         summary=row.get("excerpt") or row.get("keyTakeaway"),
         source_url=row.get("sourceUrl"),
         cover_ref=row.get("coverImageRef"),
+        patchable=patchable,
     )
 
 
-# Published posts only: a ``drafts.`` document is the Content Hub's problem
-# and Task A's guard now stops it from shipping cover-less.
-_PUBLISHED = '_type == "post" && !(_id in path("drafts.**"))'
+_POST = '_type == "post"'
+_IS_DRAFT = '_id in path("drafts.**")'
+# Published posts: a ``drafts.`` document is excluded here and owned by the
+# ``drafts`` target below.
+_PUBLISHED = f"{_POST} && !({_IS_DRAFT})"
+# Pending drafts, exactly as the Content Hub's "pending" tab defines them
+# (``_status_filter_clause`` in routes/drafts.py): a draft with no ``status``
+# field (every pre-NTS_052 draft) or an explicit pending one. A REJECTED draft
+# is deliberately out — nobody is going to publish it, so a cover would be
+# money spent on a document heading for deletion.
+_PENDING_DRAFT = f'{_POST} && {_IS_DRAFT} && (!defined(status) || status == "pending")'
+# Reuse donors for the drafts pass: the pending drafts themselves plus the
+# topic's published siblings, whose cover we adopt for free.
+_PENDING_OR_PUBLISHED = (
+    f'{_POST} && (!({_IS_DRAFT}) || !defined(status) || status == "pending")'
+)
 _NO_COVER = "(!defined(coverImage) || !defined(coverImage.asset._ref))"
 _PROJECTION = (
-    "{_id, topicId, language, title, excerpt, keyTakeaway, sourceUrl, "
+    "{_id, topicId, language, title, excerpt, keyTakeaway, sourceUrl, status, "
+    '"isDraft": _id in path("drafts.**"), '
     '"slug": slug.current, "coverImageRef": coverImage.asset._ref}'
 )
 
 
-async def find_candidates(client: SanityClient) -> list[TopicGroup]:
-    """Topics with at least one published post missing its cover.
+def _row_is_pending_draft(row: dict) -> bool:
+    return bool(row.get("isDraft")) and row.get("status") in (None, "", "pending")
 
-    Two queries: the cover-less posts, then every sibling of the topics they
-    belong to. The second query is what makes ``reuse`` possible — a topic
+
+@dataclass(frozen=True)
+class Target:
+    """One set of documents to repair.
+
+    ``holes`` selects the documents that MUST carry a cover (and are patched);
+    ``donors`` is the superset queried for siblings, so a cover already on the
+    topic can be adopted for free. ``in_scope`` is the Python-side twin of
+    ``holes`` — the donors query returns both kinds of row, and only the
+    in-scope ones are patch targets.
+    """
+
+    name: str
+    plural: str
+    holes: str
+    donors: str
+    in_scope: Callable[[dict], bool]
+
+
+TARGETS: dict[str, Target] = {
+    "published": Target(
+        name="published",
+        plural="published posts",
+        holes=_PUBLISHED,
+        donors=_PUBLISHED,
+        in_scope=lambda row: not row.get("isDraft"),
+    ),
+    "drafts": Target(
+        name="drafts",
+        plural="pending drafts",
+        holes=_PENDING_DRAFT,
+        donors=_PENDING_OR_PUBLISHED,
+        in_scope=_row_is_pending_draft,
+    ),
+}
+TARGET_CHOICES = ("published", "drafts", "all")
+
+
+async def find_candidates(
+    client: SanityClient, target: Target | None = None
+) -> list[TopicGroup]:
+    """Topics with at least one in-scope document missing its cover.
+
+    Two queries: the cover-less documents, then every sibling of the topics
+    they belong to. The second query is what makes ``reuse`` possible — a topic
     where only RU lost its cover should not pay for a new image.
     """
-    holes = await client.query(f"*[{_PUBLISHED} && {_NO_COVER}]{_PROJECTION}")
+    target = target or TARGETS["published"]
+    holes = await client.query(f"*[{target.holes} && {_NO_COVER}]{_PROJECTION}")
     if not isinstance(holes, list) or not holes:
         return []
 
@@ -182,7 +280,7 @@ async def find_candidates(client: SanityClient) -> list[TopicGroup]:
     groups: dict[str, TopicGroup] = {}
     if topic_ids:
         rows = await client.query(
-            f"*[{_PUBLISHED} && topicId in $topics]{_PROJECTION}",
+            f"*[{target.donors} && topicId in $topics]{_PROJECTION}",
             {"topics": sorted(set(topic_ids))},
         )
         for r in rows if isinstance(rows, list) else []:
@@ -190,10 +288,10 @@ async def find_candidates(client: SanityClient) -> list[TopicGroup]:
                 continue
             tid = str(r.get("topicId"))
             groups.setdefault(tid, TopicGroup(topic_id=tid)).siblings.append(
-                _sibling_from_row(r)
+                _sibling_from_row(r, patchable=target.in_scope(r))
             )
 
-    out = list(groups.values())
+    out = [g for g in groups.values() if g.missing]
     # A post with no topicId has no siblings we can identify — repair it alone.
     out.extend(
         TopicGroup(topic_id=None, siblings=[_sibling_from_row(r)]) for r in orphans
@@ -203,9 +301,10 @@ async def find_candidates(client: SanityClient) -> list[TopicGroup]:
     return out
 
 
-def print_table(groups: list[TopicGroup]) -> None:
+def print_table(groups: list[TopicGroup], target: Target | None = None) -> None:
+    target = target or TARGETS["published"]
     if not groups:
-        print("No published posts are missing a cover image. Nothing to do.")
+        print(f"No {target.plural} are missing a cover image. Nothing to do.")
         return
 
     to_generate = [g for g in groups if g.action == "generate"]
@@ -214,7 +313,8 @@ def print_table(groups: list[TopicGroup]) -> None:
     est = len(to_generate) * COST_PER_TOPIC_USD
 
     print(
-        f"\n{len(groups)} topic(s) / {docs} document(s) missing a cover image."
+        f"\n[{target.name}] {len(groups)} topic(s) / {docs} document(s) "
+        "missing a cover image."
     )
     print(
         f"  {len(to_generate)} topic(s) need a NEW image "
@@ -225,14 +325,15 @@ def print_table(groups: list[TopicGroup]) -> None:
         "language (free)\n"
     )
     header = (
-        f"{'ACTION':9}  {'LANGS (*=no cover)':22}  {'SLUG':44.44}  TOPIC"
+        f"{'ACTION':9}  {'LANGS (*=patch, !=other target)':32}  "
+        f"{'SLUG':44.44}  TOPIC"
     )
     print(header)
     print("-" * len(header))
     for g in groups:
         print(
             f"{g.action:9}  "
-            f"{g.languages:22}  "
+            f"{g.languages:32}  "
             f"{(g.canonical.slug or '<no-slug>'):44.44}  "
             f"{g.key}"
         )
@@ -278,32 +379,25 @@ async def _apply_group(client: SanityClient, group: TopicGroup) -> str:
         target_ids=targets,
         client=client,
         publisher=SanityPublisher(client=client),
-        # Cost attribution: the published doc id, not a ``drafts.`` id — no
-        # draft exists for these any more.
-        cost_doc_id=canon.sanity_id,
+        # Cost attribution: a document this pass actually patches. Published
+        # sweep → the ``post-…`` id (no draft exists for those any more);
+        # drafts sweep → the ``drafts.post-…`` id, so the spend shows up on
+        # the draft the manager is about to review.
+        cost_doc_id=group.cost_doc.sanity_id,
         summary=canon.summary,
         filename_suffix="backfill",
     )
     return f"generated {asset_id} for {len(targets)} doc(s)"
 
 
-async def _run(client: SanityClient, apply: bool) -> int:
-    groups = await find_candidates(client)
-    print_table(groups)
-    if not groups:
-        return 0
+async def _run_target(client: SanityClient, target: Target, apply: bool) -> tuple[int, int]:
+    """One pass over one target. Returns ``(repaired, total)`` topic counts."""
+    groups = await find_candidates(client, target)
+    print_table(groups, target)
+    if not groups or not apply:
+        return 0, len(groups)
 
-    if not apply:
-        print(
-            "\nDRY RUN — nothing written. Re-run with --apply to patch coverImage."
-        )
-        print(
-            "NOTE: --apply generates images (real money) and changes what the "
-            "public site shows; review the table first."
-        )
-        return 0
-
-    print("\nApplying cover-image backfill...")
+    print(f"\nApplying cover-image backfill [{target.name}]...")
     ok = 0
     for g in groups:
         try:
@@ -320,12 +414,52 @@ async def _run(client: SanityClient, apply: bool) -> int:
         print(f"  OK   [{g.key}] {outcome}")
 
     print(f"\nRepaired {ok}/{len(groups)} topic(s).")
-    return 0 if ok == len(groups) else 1
+    return ok, len(groups)
+
+
+def _resolve_targets(name: str) -> list[Target]:
+    if name == "all":
+        # Published first: the site is the visible damage, and a cover it
+        # gains becomes a free donor for the drafts pass that follows.
+        return [TARGETS["published"], TARGETS["drafts"]]
+    return [TARGETS[name]]
+
+
+async def _run(
+    client: SanityClient, apply: bool, target: str = "published"
+) -> int:
+    ok = total = 0
+    for t in _resolve_targets(target):
+        t_ok, t_total = await _run_target(client, t, apply)
+        ok += t_ok
+        total += t_total
+
+    if total == 0:
+        return 0
+    if not apply:
+        print(
+            "\nDRY RUN — nothing written. Re-run with --apply to patch coverImage."
+        )
+        print(
+            "NOTE: --apply generates images (real money) and changes what the "
+            "public site shows; review the table first."
+        )
+        return 0
+    return 0 if ok == total else 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--brand-slug", default="icon")
+    parser.add_argument(
+        "--target",
+        choices=TARGET_CHOICES,
+        default="published",
+        help=(
+            "which documents to repair: published articles (default), pending "
+            "drafts blocked by the publish guard, or both"
+        ),
+    )
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -333,7 +467,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     client = _build_sanity_client(args.brand_slug)
-    return asyncio.run(_run(client, apply=args.apply))
+    return asyncio.run(_run(client, apply=args.apply, target=args.target))
 
 
 if __name__ == "__main__":
