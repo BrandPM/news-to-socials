@@ -12,6 +12,11 @@ from sqlalchemy.orm import Session
 
 from pipeline.admin import jobs
 from pipeline.admin.db import session_scope
+from pipeline.admin.draft_validation import (
+    COMPLETENESS_PROJECTION,
+    fetch_draft_for_validation,
+    validate_draft_complete,
+)
 from pipeline.admin.models import Brand, CostRecord, DraftApproval, DraftScore, Topic
 from pipeline.admin.schemas import (
     BatchApprovalOut,
@@ -308,6 +313,11 @@ def _selection_for_status(status: str) -> str:
     base = (
         "{_id, title, language, topicId, _createdAt, displayDate, publishedAt, "
         '"coverImageUrl": coverImage.asset->url, '
+        # NTS_090 — completeness inputs. Counted by Sanity so a 50-row page
+        # costs two integers per row instead of 50 article bodies.
+        '"coverImageRef": coverImage.asset._ref, '
+        '"bodyBlockCount": count(body), '
+        '"bodyH2Count": count(body[style == "h2"]), '
         '"slug": slug.current'
     )
     if status == "rejected":
@@ -542,6 +552,7 @@ async def list_drafts(
                 rejection_reason=rejection_reason,
                 live_url=live_url,
                 siblings=sibs,
+                missing=validate_draft_complete(raw),
             )
         )
 
@@ -707,6 +718,7 @@ def _build_draft_detail_out(
         ai_tells_score=ai_tells_score,
         ai_tells=ai_tells,
         display_date=doc.get("displayDate"),
+        missing=validate_draft_complete(doc),
     )
 
 
@@ -749,6 +761,12 @@ async def get_draft(
         '"draft": *[_id == $draft_id][0]{title, body, keyTakeaway, '
         'generatedBy, language, topicId, _createdAt, status, '
         'rejectedAt, rejectionReason, rejectedBy, displayDate, '
+        # NTS_090 — completeness inputs for the "why can't I publish" banner.
+        # ``body`` is already selected above, so the validator counts blocks
+        # locally; the cover needs the raw ref (the resolved URL is null both
+        # when there is no cover AND when the asset itself is missing).
+        '"slug": slug.current, '
+        '"coverImageRef": coverImage.asset._ref, '
         '"coverImageUrl": coverImage.asset->url},'
         '"published": *[_id == $pub_id][0]{_id, title, language, '
         '_createdAt, _updatedAt, generatedBy, '
@@ -961,6 +979,42 @@ async def _publish_one_draft(
 
     publisher = SanityPublisher(client=sanity_client)
 
+    # 0. NTS_090 — completeness guard. Authoritative and server-side: it sits
+    #    on the only code path that promotes a draft, so a direct API call, a
+    #    double-click or a stale UI cannot get around it. Runs BEFORE the
+    #    approval row is written and before any Sanity write, so a blocked
+    #    draft is left exactly as it was. A doc that Sanity cannot resolve at
+    #    all is not reported here — ``promote_draft_to_published`` raises its
+    #    own "draft not found", which is the more accurate error.
+    try:
+        guard_doc = await fetch_draft_for_validation(sanity_client, sanity_draft_id)
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed: an unverifiable draft is not a publishable draft.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not verify draft completeness: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            ),
+        ) from exc
+    if guard_doc is not None:
+        missing = validate_draft_complete(guard_doc)
+        if missing:
+            log.warning(
+                "approve.blocked_incomplete",
+                draft_id=sanity_draft_id,
+                missing=missing,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "draft_incomplete",
+                    "sanity_id": sanity_draft_id,
+                    "language": guard_doc.get("language"),
+                    "missing": missing,
+                },
+            )
+
     # 1. Record approval. Done first so an interrupted publish still
     #    leaves an audit trail.
     _upsert_approval(sanity_draft_id, brand_id, "approved", note)
@@ -1060,10 +1114,13 @@ async def approve_all_siblings(
     # Find every pending draft sharing topic_id (skip already-published
     # — those need no work, marked as 'skipped' in the response so the
     # UI can count "X already published, Y now published").
+    # The projection doubles as the completeness input (NTS_090) so the batch
+    # guard costs no extra round-trip — ``COMPLETENESS_PROJECTION`` already
+    # carries _id / language / displayDate.
     drafts_groq = (
         '*[_type == "post" && _id in path("drafts.**") && topicId == $tid && '
         '(generatedBy.brandSlug == $slug || !defined(generatedBy.brandSlug))]'
-        "{_id, language, displayDate}"
+        f"{COMPLETENESS_PROJECTION}"
     )
     try:
         rows = await sanity_client.query(  # type: ignore[attr-defined]
@@ -1077,6 +1134,34 @@ async def approve_all_siblings(
 
     if not isinstance(rows, list):
         rows = []
+
+    # NTS_090 — validate EVERY sibling before promoting ANY of them. The
+    # siblings ship as one unit (they share a cover and one publishedAt), so
+    # a half-published topic with one language missing its cover is exactly
+    # the state this guard exists to prevent. All-or-nothing, before the
+    # first Sanity write.
+    missing_by_language: dict[str, list[str]] = {}
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("_id"):
+            continue
+        sibling_missing = validate_draft_complete(r)
+        if sibling_missing:
+            lang = str(r.get("language") or r.get("_id"))
+            missing_by_language[lang] = sibling_missing
+    if missing_by_language:
+        log.warning(
+            "approve_all.blocked_incomplete",
+            topic_id=topic_id,
+            missing_by_language=missing_by_language,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "topic_incomplete",
+                "topic_id": topic_id,
+                "missing_by_language": missing_by_language,
+            },
+        )
 
     # NTS_089 — one shared publishedAt for every sibling of the topic, so all
     # languages publish under the identical date (same intent as the shared

@@ -752,6 +752,12 @@ class DraftDetailOut(BaseModel):
     # Editable in the Content Hub before publish; becomes publishedAt on
     # approve. None on legacy drafts created before this feature.
     display_date: str | None = None
+    # NTS_090 — structural components this draft is missing; empty means it
+    # is publishable. Derived from the Sanity doc on every read (nothing is
+    # stored), by the same validator the publish endpoint enforces, so the
+    # UI's disabled Approve button and the server's 422 can never disagree.
+    # Codes: coverImage | title | slug | body | body_h2 | displayDate.
+    missing: list[str] = []
 
 
 class PublishedDocOut(BaseModel):
@@ -895,6 +901,9 @@ class DraftListItem(BaseModel):
     rejection_reason: str | None = None
     live_url: str | None = None
     siblings: list[DraftListSibling] = []
+    # NTS_090 — missing structural components (same codes as
+    # ``DraftDetailOut.missing``); powers the ⚠️ badge on incomplete cards.
+    missing: list[str] = []
 
 
 class DraftListOut(BaseModel):

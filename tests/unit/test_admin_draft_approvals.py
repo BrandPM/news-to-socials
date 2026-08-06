@@ -49,6 +49,25 @@ def client(tmp_path, monkeypatch):
     admin_jobs.reset_text_jobs_for_tests()
 
 
+def _complete_row(sanity_id: str, language: str = "en") -> dict:
+    """A row shaped like ``COMPLETENESS_PROJECTION`` with nothing missing.
+
+    NTS_090 — the publish path validates every draft before promoting it,
+    so any test that expects a publish to succeed has to hand it a
+    complete document.
+    """
+    return {
+        "_id": sanity_id,
+        "language": language,
+        "title": "T",
+        "displayDate": "2026-08-05",
+        "slug": "a-slug",
+        "coverImageRef": "image-abc123-1792x1008-png",
+        "bodyBlockCount": 6,
+        "bodyH2Count": 2,
+    }
+
+
 @pytest.fixture
 def mock_sanity_publish(monkeypatch):
     """Stub the Sanity side of approve/reject so unit tests don't try to
@@ -58,7 +77,12 @@ def mock_sanity_publish(monkeypatch):
     Sanity. Tests that exercise *only* the DB-write side need the
     publish step to no-op cleanly. Tests that assert on Sanity behaviour
     re-monkeypatch on top of this fixture.
+
+    NTS_090 adds a completeness fetch to the publish path; it is stubbed to
+    "complete" here so the guard stays out of the way of tests about other
+    things. The guard's own tests override it.
     """
+    from pipeline.admin.routes import drafts as drafts_routes
     from pipeline.publisher import sanity as sanity_mod
 
     async def fake_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
@@ -67,10 +91,16 @@ def mock_sanity_publish(monkeypatch):
     async def fake_delete(self, draft_id):  # noqa: ANN001
         return None
 
+    async def fake_fetch_for_validation(client, sanity_id):  # noqa: ANN001
+        return _complete_row(sanity_id)
+
     monkeypatch.setattr(
         sanity_mod.SanityPublisher, "promote_draft_to_published", fake_promote
     )
     monkeypatch.setattr(sanity_mod.SanityPublisher, "delete_draft", fake_delete)
+    monkeypatch.setattr(
+        drafts_routes, "fetch_draft_for_validation", fake_fetch_for_validation
+    )
 
 
 @pytest.fixture
@@ -843,10 +873,8 @@ def test_approve_all_siblings_publishes_each_and_reports_per_language(
     # Sanity returns 4 sibling drafts for topic-001. The published-mirror
     # query returns None for each (so all are "fresh").
     drafts_rows = [
-        {"_id": "drafts.post-en-001", "language": "en"},
-        {"_id": "drafts.post-ru-001", "language": "ru"},
-        {"_id": "drafts.post-uk-001", "language": "uk"},
-        {"_id": "drafts.post-pl-001", "language": "pl"},
+        _complete_row(f"drafts.post-{lang}-001", lang)
+        for lang in ("en", "ru", "uk", "pl")
     ]
     publish_calls: list[str] = []
 
@@ -897,8 +925,7 @@ def test_approve_all_siblings_skips_already_published(
     from pipeline.publisher import sanity as sanity_mod
 
     drafts_rows = [
-        {"_id": "drafts.post-en-002", "language": "en"},
-        {"_id": "drafts.post-ru-002", "language": "ru"},
+        _complete_row(f"drafts.post-{lang}-002", lang) for lang in ("en", "ru")
     ]
     promote_calls: list[str] = []
 
@@ -946,10 +973,8 @@ def test_approve_all_siblings_partial_failure_does_not_rollback(
     from pipeline.publisher import sanity as sanity_mod
 
     drafts_rows = [
-        {"_id": "drafts.post-en-003", "language": "en"},
-        {"_id": "drafts.post-ru-003", "language": "ru"},
-        {"_id": "drafts.post-uk-003", "language": "uk"},
-        {"_id": "drafts.post-pl-003", "language": "pl"},
+        _complete_row(f"drafts.post-{lang}-003", lang)
+        for lang in ("en", "ru", "uk", "pl")
     ]
 
     async def query(self, groq, params=None):  # noqa: ANN001

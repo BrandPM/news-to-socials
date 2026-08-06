@@ -651,6 +651,7 @@ def test_list_drafts_merges_approval_status(
             "coverImageUrl": None,
         }
     ]
+    from pipeline.admin.routes import drafts as drafts_routes
     from pipeline.publisher import sanity as sanity_mod
 
     monkeypatch.setattr(
@@ -662,10 +663,27 @@ def test_list_drafts_merges_approval_status(
     async def fake_promote(self, draft_id, *, published_at=None):  # noqa: ANN001
         return draft_id.replace("drafts.", "")
 
+    # NTS_090: /approve also validates completeness first — stub it complete
+    # so the guard doesn't consume one of the mocked query side-effects.
+    async def fake_fetch_for_validation(client, sanity_id):  # noqa: ANN001
+        return {
+            "_id": sanity_id,
+            "language": "pl",
+            "title": "Polski",
+            "displayDate": "2026-05-24",
+            "slug": "polski",
+            "coverImageRef": "image-abc",
+            "bodyBlockCount": 4,
+            "bodyH2Count": 1,
+        }
+
     monkeypatch.setattr(
         sanity_mod.SanityPublisher,
         "promote_draft_to_published",
         fake_promote,
+    )
+    monkeypatch.setattr(
+        drafts_routes, "fetch_draft_for_validation", fake_fetch_for_validation
     )
     # Approve the draft first.
     client.post(
