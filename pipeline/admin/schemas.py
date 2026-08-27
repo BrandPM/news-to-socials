@@ -213,6 +213,8 @@ class PipelineConfigOut(BaseModel):
     # NTS_091 — LLM-judge eval tunables.
     eval_enabled: bool
     eval_threshold: float
+    # NTS_094 — skip cover generation during the run; manager generates on demand.
+    images_on_demand: bool
     updated_at: datetime
 
     @field_validator("banned_phrases", mode="before")
@@ -238,6 +240,8 @@ class PipelineConfigUpdate(BaseModel):
     # NTS_091 — LLM-judge eval tunables.
     eval_enabled: bool | None = None
     eval_threshold: float | None = Field(default=None, ge=0.0, le=10.0)
+    # NTS_094 — cover generation on manager demand instead of every topic.
+    images_on_demand: bool | None = None
 
 
 # --- Runs ---------------------------------------------------------------

@@ -230,6 +230,16 @@ class PipelineConfig(Base):
     eval_threshold: Mapped[float] = mapped_column(
         Float, nullable=False, default=7.0, server_default="7.0"
     )
+    # NTS_094 — cover images on manager demand (editable from Settings).
+    # False (default) = the run generates a cover per topic, as it always
+    # has. True = the run skips image generation entirely and the draft is
+    # written with ``coverImage: null`` ON PURPOSE; the manager generates the
+    # cover for the draft they actually picked, from the publish-guard button.
+    # Default False so applying migration 017 changes nothing until the
+    # operator flips it — that flip is where the cost change starts.
+    images_on_demand: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
     banned_phrases: Mapped[str] = mapped_column(Text, nullable=False, default="[]")

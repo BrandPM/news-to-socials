@@ -215,6 +215,7 @@ def format_run_finished(
     drafted: int,
     finished_at: datetime,
     deduped: int = 0,
+    images_skipped: int = 0,
 ) -> str:
     """✅/🔴/⏹ pulse when a run reaches a terminal status.
 
@@ -222,6 +223,10 @@ def format_run_finished(
     relevance threshold (``score >= min_score``) — out of ``fetched``.
     ``deduped`` (NTS_090) is ``stats['deduped']`` — near-duplicate topics
     skipped before generation; shown only when > 0.
+    ``images_skipped`` (NTS_094) is ``stats['images_skipped']`` — covers the
+    run deliberately did not generate because the brand runs images on
+    demand. Reported so an on-demand run says something about images rather
+    than silently saying nothing.
     """
     emoji = _FINISHED_EMOJI.get(status, "✅")
     lines = [
@@ -230,6 +235,8 @@ def format_run_finished(
     ]
     if deduped > 0:
         lines.append(f"🔁 dedup: {deduped} skipped")
+    if images_skipped > 0:
+        lines.append(f"🖼 covers skipped: {images_skipped} (on demand)")
     lines.append(f"🕓 {_fmt_hm(finished_at)} UTC")
     return "\n".join(lines)
 
@@ -399,6 +406,7 @@ def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
                         relevant=int(stats.get("scored", 0) or 0),
                         drafted=int(stats.get("drafted", 0) or 0),
                         deduped=int(stats.get("deduped", 0) or 0),
+                        images_skipped=int(stats.get("images_skipped", 0) or 0),
                         finished_at=r.finished_at,
                     ),
                 )

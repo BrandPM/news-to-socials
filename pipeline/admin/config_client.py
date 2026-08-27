@@ -62,6 +62,10 @@ class ConfigRecord:
     # NTS_091 — LLM-judge eval tunables.
     eval_enabled: bool = True
     eval_threshold: float = 7.0
+    # NTS_094 — cover generation on manager demand. Defaults to False so a
+    # config row that predates the column (or the hardcoded fallback path)
+    # keeps generating covers during the run exactly as before.
+    images_on_demand: bool = False
 
 
 class BrandNotReadyError(RuntimeError):
@@ -315,6 +319,9 @@ class AdminConfigClient:
                     dedup_window_days=int(getattr(row, "dedup_window_days", 7)),
                     eval_enabled=bool(getattr(row, "eval_enabled", True)),
                     eval_threshold=float(getattr(row, "eval_threshold", 7.0)),
+                    images_on_demand=bool(
+                        getattr(row, "images_on_demand", False)
+                    ),
                 )
         from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
         from pipeline.run import icon_brand_config  # noqa: PLC0415

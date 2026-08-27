@@ -643,6 +643,7 @@ async def _process_source(
     dedup_window_days: int = 7,
     eval_enabled: bool = True,
     eval_threshold: float = 7.0,
+    images_on_demand: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int], set[str]]:
     """Process ONE source for ALL ``languages`` in a single pass.
 
@@ -662,7 +663,16 @@ async def _process_source(
     lets the orchestrator know which languages this source contributed
     to so ``runs.languages_completed`` can be aggregated centrally.
     """
-    stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0, "deduped": 0}
+    stats = {
+        "fetched": 0,
+        "scored": 0,
+        "drafted": 0,
+        "errors": 0,
+        "deduped": 0,
+        # NTS_094 — topics whose cover was deliberately NOT generated because
+        # the brand runs images on demand. Distinct from an image failure.
+        "images_skipped": 0,
+    }
     topics, fetched_count = await _build_topics_for_source(
         source_record=source_record,
         brand=brand,
@@ -702,16 +712,31 @@ async def _process_source(
     languages_attempted: set[str] = set()
 
     for topic in topics:
-        # ---- IMAGE: once per topic (the whole point of this refactor)
-        try:
-            asset_id = await generate_image_for_topic(
-                topic, brand, sanity_publisher
+        # ---- IMAGE: once per topic (the whole point of this refactor).
+        # NTS_094: with ``images_on_demand`` the run generates NOTHING here —
+        # no scene prompt, no Flux call, no asset upload. The draft is written
+        # with ``coverImage: null`` on purpose and the manager generates the
+        # cover for the one draft they pick (publish-guard button, NTS_091).
+        # The event gets its OWN name: a deliberate skip and a broken
+        # generation must stay distinguishable in the log and in alerting.
+        if images_on_demand:
+            log.info(
+                "image.skipped_on_demand",
+                topic=topic.id,
+                brand=brand.slug,
             )
-        except Exception:  # noqa: BLE001
-            # generate_image_for_topic already swallows + logs internally,
-            # so this is a paranoia net for unexpected explosions.
-            log.exception("image.unexpected_failure", topic=topic.id)
+            stats["images_skipped"] += 1
             asset_id = None
+        else:
+            try:
+                asset_id = await generate_image_for_topic(
+                    topic, brand, sanity_publisher
+                )
+            except Exception:  # noqa: BLE001
+                # generate_image_for_topic already swallows + logs internally,
+                # so this is a paranoia net for unexpected explosions.
+                log.exception("image.unexpected_failure", topic=topic.id)
+                asset_id = None
 
         # ---- CATEGORY: language-agnostic; once per topic.
         try:
@@ -1128,7 +1153,14 @@ async def run_pipeline(
     sanity_token = None  # noqa: F841
 
     aggregate_results: list[dict[str, Any]] = []
-    aggregate_stats = {"fetched": 0, "scored": 0, "drafted": 0, "errors": 0, "deduped": 0}
+    aggregate_stats = {
+        "fetched": 0,
+        "scored": 0,
+        "drafted": 0,
+        "errors": 0,
+        "deduped": 0,
+        "images_skipped": 0,
+    }
     log_lines: list[str] = []
 
     # Cost-recording context spans the whole run; topic_id / draft_id
@@ -1151,6 +1183,12 @@ async def run_pipeline(
     # NTS_091 — LLM-judge eval config (fail-open defaults if row predates cols).
     eval_enabled = getattr(config, "eval_enabled", True)
     eval_threshold = getattr(config, "eval_threshold", 7.0)
+    # NTS_094 — cover-on-demand. Fail-safe default False: an unknown/legacy
+    # config keeps generating covers, so the flag can only ever REMOVE spend
+    # deliberately, never silently.
+    images_on_demand = bool(getattr(config, "images_on_demand", False))
+    if images_on_demand:
+        log.info("image.on_demand_mode", brand=brand_row.slug)
     # Cleanup old embeddings on pipeline start (best-effort, brand-scoped).
     if dedup_enabled:
         cleanup_old_embeddings(brand_id_fk, dedup_window_days)
@@ -1174,6 +1212,7 @@ async def run_pipeline(
                     dedup_window_days=dedup_window_days,
                     eval_enabled=eval_enabled,
                     eval_threshold=eval_threshold,
+                    images_on_demand=images_on_demand,
                 )
                 aggregate_results.extend(results)
                 for k, v in stats.items():
@@ -1183,6 +1222,7 @@ async def run_pipeline(
                     f"source {src.name}: fetched={stats['fetched']} "
                     f"scored={stats['scored']} drafted={stats['drafted']} "
                     f"errors={stats['errors']} "
+                    f"covers_skipped={stats['images_skipped']} "
                     f"langs={sorted(langs_attempted)}"
                 )
             except Exception as exc:  # noqa: BLE001
