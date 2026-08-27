@@ -112,16 +112,18 @@ ICON_SEED_SOURCES: tuple[SeedSource, ...] = (
 # hard import dependency in modules that don't need it (e.g. tests).
 def get_active_polish_prompt() -> tuple[str, str]:
     """Return ``(version_name, content)`` for the currently-shipping
-    writer_polish prompt — i.e. the IT_PROJ_NTS_013 v1.1 version."""
+    writer_polish prompt. Bumped with every prompt change that a resync
+    migration also applies to live rows (009/011/019) so the DB row and the
+    code constant never disagree about which version they are."""
     from pipeline.generator.comment_writer import _POLISH_PROMPT  # noqa: PLC0415
 
-    return ("v1.3 — manager quality merge (NTS_070)", _POLISH_PROMPT)
+    return ("v1.4 — research fact pack + 600-800 words (NTS_092)", _POLISH_PROMPT)
 
 
 def get_active_draft_prompt() -> tuple[str, str]:
     from pipeline.generator.comment_writer import _DRAFT_PROMPT  # noqa: PLC0415
 
-    return ("v1.3 — manager quality merge (NTS_070)", _DRAFT_PROMPT)
+    return ("v1.4 — research fact pack + 600-800 words (NTS_092)", _DRAFT_PROMPT)
 
 
 def get_active_translate_prompt() -> tuple[str, str]:
