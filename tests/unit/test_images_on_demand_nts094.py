@@ -423,6 +423,39 @@ def test_config_put_leaves_other_tunables_alone(
         assert updated[key] == original[key], key
 
 
+def test_settings_form_payload_shape_is_accepted(
+    fresh_admin_db_with_source, admin_client
+) -> None:
+    """The Settings form PUTs its WHOLE value set, not just the changed field.
+
+    ``PipelineConfigUpdate`` is ``extra="forbid"``, so a key the form sends
+    that the model does not know is a 422 on save — the realistic way this
+    toggle would ship broken. Mirrors the zod schema in
+    ``app/(admin)/settings/settings-client.tsx``; add a field there, add it
+    here.
+    """
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    payload = {
+        "scoring_threshold": 7,
+        "topics_per_run": 3,
+        "stale_draft_days": 3,
+        "dedup_enabled": True,
+        "dedup_threshold": 0.85,
+        "dedup_window_days": 7,
+        "eval_enabled": True,
+        "eval_threshold": 7.0,
+        "images_on_demand": True,
+        "voice_profile": "mission: edited via settings\n",
+    }
+    resp = admin_client.put(
+        f"/api/v1/config?brand_id={icon_id}", json=payload, headers=AUTH
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["images_on_demand"] is True
+    # …and the pipeline reads back exactly what the form wrote.
+    assert AdminConfigClient(brand_slug="icon").get_config().images_on_demand is True
+
+
 # --- Telegram run summary -------------------------------------------------
 
 
