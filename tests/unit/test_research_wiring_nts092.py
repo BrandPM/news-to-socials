@@ -568,3 +568,56 @@ def test_summary_reports_thin_articles_when_there_are_some():
     )
     assert "thin" in text
     assert "3" in text
+
+
+# --- the judge has to see the pack too ------------------------------------
+
+
+def test_the_judge_scores_factuality_against_the_fact_pack_not_just_the_headline(
+    fresh_admin_db_with_source, monkeypatch
+) -> None:
+    """The EN factuality axis scores "every claim is present in or supported by
+    the SOURCE" at weight 0.30. If the pack is withheld, every researched
+    figure reads as invented and NTS_092 would flag every article
+    needs_attention for doing exactly what it was asked to do."""
+    from pipeline import run as pipe
+
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    _set_brand_languages(icon_id, ["en"])
+    _mock_externals(monkeypatch)
+
+    captured: list[dict] = []
+
+    async def spy_score(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(pipe, "score_draft", spy_score)
+    asyncio.run(pipe.run_pipeline(brand_slug="icon", limit=1, dry_run=False))
+
+    assert captured, "score_draft was never called"
+    source_text = captured[0]["source_text"]
+    assert "Acme raised $5m." in source_text
+    assert "https://reuters.com/acme" in source_text
+
+
+def test_a_thin_article_is_judged_against_the_headline_alone(
+    fresh_admin_db_with_source, monkeypatch
+) -> None:
+    """No pack, no extra section — the judge's source is what it always was."""
+    from pipeline import run as pipe
+
+    icon_id = fresh_admin_db_with_source["icon_id"]
+    _set_brand_languages(icon_id, ["en"])
+    _mock_externals(monkeypatch)
+    _break_research(monkeypatch)
+
+    captured: list[dict] = []
+
+    async def spy_score(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(pipe, "score_draft", spy_score)
+    asyncio.run(pipe.run_pipeline(brand_slug="icon", limit=1, dry_run=False))
+
+    assert captured
+    assert "WEB RESEARCH FACT PACK" not in captured[0]["source_text"]

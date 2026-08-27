@@ -958,7 +958,19 @@ async def _process_source(
                     # OPEN — score_draft never raises, so a dead judge cannot
                     # block creation/publishing.
                     if language == Language.en:
+                        # NTS_092 — the fact pack is part of the source of
+                        # truth now, not an extra. The factuality axis scores
+                        # "every claim is present in or supported by the
+                        # SOURCE"; withholding the pack would make every
+                        # researched figure read as invented and flag every
+                        # article needs_attention for doing exactly what this
+                        # task asked of it.
                         _src = f"{topic.raw.title}\n{topic.raw.summary or ''}"
+                        if fact_pack is not None and not fact_pack.is_empty():
+                            _src = (
+                                f"{_src}\n\n--- WEB RESEARCH FACT PACK "
+                                f"(also authoritative) ---\n{fact_pack.render()}"
+                            )
                         _en_text = ""
                     else:
                         _src = ""
