@@ -240,6 +240,26 @@ class PipelineConfig(Base):
     images_on_demand: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("0")
     )
+    # NTS_092 — web-research fact pack before the draft (editable from
+    # Settings, no deploy).
+    #   research_enabled          master switch; research fails OPEN either way
+    #                             (a failed pack = a thin article, never a
+    #                             dropped topic).
+    #   research_max_sources      distinct outlets allowed in ``context``.
+    #   research_max_tokens       output ceiling on the research call.
+    #   research_timeout_seconds  hard ceiling on the whole call.
+    research_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("1")
+    )
+    research_max_sources: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default="5"
+    )
+    research_max_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2000, server_default="2000"
+    )
+    research_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60, server_default="60"
+    )
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
     banned_phrases: Mapped[str] = mapped_column(Text, nullable=False, default="[]")

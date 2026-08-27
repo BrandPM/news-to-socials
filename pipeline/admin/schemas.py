@@ -215,6 +215,11 @@ class PipelineConfigOut(BaseModel):
     eval_threshold: float
     # NTS_094 — skip cover generation during the run; manager generates on demand.
     images_on_demand: bool
+    # NTS_092 — research-stage switch + budgets.
+    research_enabled: bool
+    research_max_sources: int
+    research_max_tokens: int
+    research_timeout_seconds: int
     updated_at: datetime
 
     @field_validator("banned_phrases", mode="before")
@@ -242,6 +247,11 @@ class PipelineConfigUpdate(BaseModel):
     eval_threshold: float | None = Field(default=None, ge=0.0, le=10.0)
     # NTS_094 — cover generation on manager demand instead of every topic.
     images_on_demand: bool | None = None
+    # NTS_092 — research-stage switch + budgets (editable from Settings).
+    research_enabled: bool | None = None
+    research_max_sources: int | None = Field(default=None, ge=1, le=20)
+    research_max_tokens: int | None = Field(default=None, ge=500, le=8000)
+    research_timeout_seconds: int | None = Field(default=None, ge=10, le=300)
 
 
 # --- Runs ---------------------------------------------------------------

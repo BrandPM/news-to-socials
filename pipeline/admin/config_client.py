@@ -66,6 +66,13 @@ class ConfigRecord:
     # config row that predates the column (or the hardcoded fallback path)
     # keeps generating covers during the run exactly as before.
     images_on_demand: bool = False
+    # NTS_092 — research-stage switch + budgets. Defaults match the migration
+    # server_defaults so a config row predating the columns (or the hardcoded
+    # fallback path) still researches under sane limits.
+    research_enabled: bool = True
+    research_max_sources: int = 5
+    research_max_tokens: int = 2000
+    research_timeout_seconds: int = 60
 
 
 class BrandNotReadyError(RuntimeError):
@@ -321,6 +328,16 @@ class AdminConfigClient:
                     eval_threshold=float(getattr(row, "eval_threshold", 7.0)),
                     images_on_demand=bool(
                         getattr(row, "images_on_demand", False)
+                    ),
+                    research_enabled=bool(getattr(row, "research_enabled", True)),
+                    research_max_sources=int(
+                        getattr(row, "research_max_sources", 5) or 5
+                    ),
+                    research_max_tokens=int(
+                        getattr(row, "research_max_tokens", 2000) or 2000
+                    ),
+                    research_timeout_seconds=int(
+                        getattr(row, "research_timeout_seconds", 60) or 60
                     ),
                 )
         from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
