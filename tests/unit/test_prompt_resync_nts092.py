@@ -197,6 +197,17 @@ def test_019_is_idempotent_and_does_not_flip_active(alembic_db):
     assert all(row[4] == 1 for row in second)
 
 
+def _head_revision() -> str:
+    """The current head, read from the migration scripts themselves."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "pipeline/admin/migrations"))
+    return ScriptDirectory.from_config(cfg).get_current_head()
+
+
 def test_019_downgrade_is_a_clean_no_op_and_re_upgrade_works(alembic_db):
     """The content re-sync is not reversible by design; what matters is that
     stepping back and forward neither errors nor loses the schema."""
@@ -216,7 +227,10 @@ def test_019_downgrade_is_a_clean_no_op_and_re_upgrade_works(alembic_db):
     alembic("upgrade", "head")
     with sqlite3.connect(db_path) as conn:
         version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-    assert version == "019_resync_nts092"
+    # Whatever head is today — this assertion is about landing back ON head,
+    # not about which revision that happens to be. Pinning the literal here
+    # made every later migration fail this test for the wrong reason.
+    assert version == _head_revision()
 
 
 def test_a_fresh_seed_needs_no_resync(alembic_db):

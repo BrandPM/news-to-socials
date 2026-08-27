@@ -43,7 +43,29 @@ gunzip -c "$SRC" > "$OUT"
 echo "== integrity_check =="
 sqlite3 "$OUT" "PRAGMA integrity_check;"
 echo "== row counts (restored dump) =="
-sqlite3 "$OUT" "SELECT 'runs', count(*) FROM runs;"
+# NTS_098 DoD 9 — a restore that only proves ``runs`` came back proves very
+# little. These are the tables whose loss is unrecoverable: admin.db is the
+# only copy of the portfolio, the editor's decision history and the brand's
+# service taxonomy (Sanity holds the articles, nothing holds these).
+# A table absent from the dump prints "-" rather than aborting, so a dump
+# taken before migration 020 still verifies the tables it does have.
+for t in brands sources prompts pipeline_config runs topics draft_approvals \
+         candidates review_decisions brand_taxonomy cost_records; do
+    n=$(sqlite3 "$OUT" "SELECT count(*) FROM $t;" 2>/dev/null || echo "-")
+    printf '%-20s %s\n' "$t" "$n"
+done
+
+# The v3 registry fields on ``sources`` are columns, not tables — a rebuild
+# that silently dropped them would still pass a row count.
+echo "== sources v3 columns =="
+for c in source_role source_class license_class doc_language fetch_method \
+         reliability cache_ttl_days; do
+    if sqlite3 "$OUT" "PRAGMA table_info(sources);" | cut -d'|' -f2 | grep -qx "$c"; then
+        printf '%-20s present\n' "$c"
+    else
+        printf '%-20s MISSING\n' "$c"
+    fi
+done
 
 if [ "$MODE" != "--apply" ]; then
     echo "Verify-only. Restored copy left at $OUT (not applied to live)."

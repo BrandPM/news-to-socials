@@ -16,9 +16,11 @@ Invariant B (NTS_014). This back-compat path is removed in Step 4.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import select
@@ -36,6 +38,9 @@ from pipeline.admin.models import (
     Topic,
 )
 from pipeline.common.config import get_settings
+from pipeline.common.logging import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,223 @@ class ConfigRecord:
     research_max_sources: int = 5
     research_max_tokens: int = 2000
     research_timeout_seconds: int = 60
+    # === v3 contour-1 keys (NTS_098 §4, NTS_099 §1) — migration 020 =======
+    # Defaults mirror the migration server_defaults so the hardcoded-fallback
+    # path (admin.db missing / brand absent) still answers every read with the
+    # spec's Icon starting values instead of None.
+    #
+    # The five JSON-as-TEXT columns are parsed HERE, once, into real Python
+    # objects. The pipeline must never see the raw string: a caller that has
+    # to json.loads a config value is a caller that will eventually forget.
+    publication_slots: tuple[dict[str, Any], ...] = (
+        {"day": "mon", "capacity": 2},
+        {"day": "thu", "capacity": 2},
+    )
+    weekly_draft_budget: int = 6
+    portfolio_daily_cap_document: int = 2
+    portfolio_daily_cap_news: int = 1
+    candidate_ttl_days: Mapping[str, int] = MappingProxyType(
+        {
+            "deal_announced": 7,
+            "deal_closed": 7,
+            "consultation": 21,
+            "default": 14,
+        }
+    )
+    production_timeout_min: int = 60
+    max_attempts: int = 2
+    brand_timezone: str = "Europe/Madrid"
+    retention_days_rejected: int = 30
+    dedup_threshold_live: float = 0.90
+    dedup_threshold_rejected: float = 0.92
+    dedup_window_rejected_days: int = 14
+    dedup_threshold_published: float = 0.88
+    dedup_window_published_days: int = 60
+    jurisdiction_tiers: Mapping[str, tuple[str, ...]] = MappingProxyType(
+        {
+            "tier1": ("CH", "CY", "MT", "AE", "UK", "PL", "UA", "LI", "EU"),
+            "tier2": (
+                "US", "SG", "HK", "LU", "MC", "PT", "ES", "IT",
+                "DE", "AT", "IL", "KZ", "TR",
+            ),
+        }
+    )
+    depth_article_min_facts: int = 4
+    depth_deep_min_facts: int = 10
+    monthly_spend_cap_usd: float = 150.0
+    max_cost_per_candidate_usd: float = 5.0
+    prefilter_deny_title_patterns: tuple[str, ...] = (
+        "appoints", "hires", "joins", "named as", "wins award", "ranked",
+        "opens office", "rebrand", "outlook", "forecast", "analysts expect",
+    )
+    prefilter_require_summary: bool = True
+    prefilter_max_age_hours_news: int = 72
+    prefilter_max_age_hours_primary: int = 240
+    prefilter_languages: tuple[str, ...] = (
+        "en", "de", "fr", "it", "pl", "uk", "ru", "el",
+    )
+    prefilter_min_summary_chars: int = 80
+
+
+# --- v3 contour-1 config (NTS_098 §4, NTS_099 §1) -------------------------
+
+# A throwaway instance used only to read the dataclass field defaults; the
+# four required fields are irrelevant to the v3 keys and get dummy values.
+_V3_DEFAULTS = ConfigRecord(
+    scoring_threshold=0, topics_per_run=0, banned_phrases=[], voice_profile=""
+)
+
+
+def _json_or_default(raw: Any, default: Any) -> Any:
+    """Parse a JSON-as-TEXT config column, falling back to the documented
+    default. A malformed value must never take the pipeline down: the config
+    surface is hand-editable, and a stray comma is an operator typo, not an
+    outage. The default is the same one the migration wrote.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        log.warning("config_client.bad_json_config_value", raw=str(raw)[:120])
+        return default
+    return parsed
+
+
+def _int_or(raw: Any, default: int) -> int:
+    """Coerce a config column to int, falling back on NULL/blank.
+
+    ``0`` and ``False`` are legitimate values here (a zero daily cap means
+    "accept nothing today"), so the test is against None, not truthiness.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or(raw: Any, default: float) -> float:
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_or(raw: Any, default: str) -> str:
+    if raw is None or raw == "":
+        return default
+    return str(raw)
+
+
+def _v3_keys(row: Any) -> dict[str, Any]:
+    """Map the 25 v3 columns off a ``pipeline_config`` row.
+
+    ``getattr`` with a default throughout, so a row written before migration
+    020 (or the hardcoded fallback path) still yields a complete record
+    instead of raising — same contract the NTS_090/091/092 keys use above.
+    """
+    d = _V3_DEFAULTS
+    slots = _json_or_default(
+        getattr(row, "publication_slots", None), list(d.publication_slots)
+    )
+    ttl = _json_or_default(
+        getattr(row, "candidate_ttl_days", None), dict(d.candidate_ttl_days)
+    )
+    tiers = _json_or_default(
+        getattr(row, "jurisdiction_tiers", None),
+        {k: list(v) for k, v in d.jurisdiction_tiers.items()},
+    )
+    deny = _json_or_default(
+        getattr(row, "prefilter_deny_title_patterns", None),
+        list(d.prefilter_deny_title_patterns),
+    )
+    langs = _json_or_default(
+        getattr(row, "prefilter_languages", None), list(d.prefilter_languages)
+    )
+    return {
+        "publication_slots": tuple(slots),
+        "weekly_draft_budget": _int_or(
+            getattr(row, "weekly_draft_budget", None), d.weekly_draft_budget
+        ),
+        "portfolio_daily_cap_document": _int_or(
+            getattr(row, "portfolio_daily_cap_document", None),
+            d.portfolio_daily_cap_document,
+        ),
+        "portfolio_daily_cap_news": _int_or(
+            getattr(row, "portfolio_daily_cap_news", None),
+            d.portfolio_daily_cap_news,
+        ),
+        "candidate_ttl_days": MappingProxyType(
+            {str(k): int(v) for k, v in dict(ttl).items()}
+        ),
+        "production_timeout_min": _int_or(
+            getattr(row, "production_timeout_min", None), d.production_timeout_min
+        ),
+        "max_attempts": _int_or(
+            getattr(row, "max_attempts", None), d.max_attempts
+        ),
+        "brand_timezone": _str_or(
+            getattr(row, "brand_timezone", None), d.brand_timezone
+        ),
+        "retention_days_rejected": _int_or(
+            getattr(row, "retention_days_rejected", None), d.retention_days_rejected
+        ),
+        "dedup_threshold_live": _float_or(
+            getattr(row, "dedup_threshold_live", None), d.dedup_threshold_live
+        ),
+        "dedup_threshold_rejected": _float_or(
+            getattr(row, "dedup_threshold_rejected", None), d.dedup_threshold_rejected
+        ),
+        "dedup_window_rejected_days": _int_or(
+            getattr(row, "dedup_window_rejected_days", None),
+            d.dedup_window_rejected_days,
+        ),
+        "dedup_threshold_published": _float_or(
+            getattr(row, "dedup_threshold_published", None),
+            d.dedup_threshold_published,
+        ),
+        "dedup_window_published_days": _int_or(
+            getattr(row, "dedup_window_published_days", None),
+            d.dedup_window_published_days,
+        ),
+        "jurisdiction_tiers": MappingProxyType(
+            {str(k): tuple(v) for k, v in dict(tiers).items()}
+        ),
+        "depth_article_min_facts": _int_or(
+            getattr(row, "depth_article_min_facts", None), d.depth_article_min_facts
+        ),
+        "depth_deep_min_facts": _int_or(
+            getattr(row, "depth_deep_min_facts", None), d.depth_deep_min_facts
+        ),
+        "monthly_spend_cap_usd": _float_or(
+            getattr(row, "monthly_spend_cap_usd", None), d.monthly_spend_cap_usd
+        ),
+        "max_cost_per_candidate_usd": _float_or(
+            getattr(row, "max_cost_per_candidate_usd", None),
+            d.max_cost_per_candidate_usd,
+        ),
+        "prefilter_deny_title_patterns": tuple(deny),
+        "prefilter_require_summary": bool(
+            getattr(row, "prefilter_require_summary", d.prefilter_require_summary)
+        ),
+        "prefilter_max_age_hours_news": _int_or(
+            getattr(row, "prefilter_max_age_hours_news", None),
+            d.prefilter_max_age_hours_news,
+        ),
+        "prefilter_max_age_hours_primary": _int_or(
+            getattr(row, "prefilter_max_age_hours_primary", None),
+            d.prefilter_max_age_hours_primary,
+        ),
+        "prefilter_languages": tuple(langs),
+        "prefilter_min_summary_chars": _int_or(
+            getattr(row, "prefilter_min_summary_chars", None),
+            d.prefilter_min_summary_chars,
+        ),
+    }
 
 
 class BrandNotReadyError(RuntimeError):
@@ -339,6 +561,7 @@ class AdminConfigClient:
                     research_timeout_seconds=int(
                         getattr(row, "research_timeout_seconds", 60) or 60
                     ),
+                    **_v3_keys(row),
                 )
         from pipeline.generator.comment_writer import parse_voice_guardrails  # noqa: PLC0415
         from pipeline.run import icon_brand_config  # noqa: PLC0415

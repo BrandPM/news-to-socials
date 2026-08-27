@@ -13,6 +13,20 @@ from pipeline.admin.schemas import PipelineConfigOut, PipelineConfigUpdate
 
 router = APIRouter()
 
+# Config columns stored as JSON-as-TEXT. The API speaks real lists/dicts; the
+# column holds a string. Missing one here is the classic way a config surface
+# ends up storing "['a', 'b']" (Python repr) or a stringified object that the
+# reader then fails to parse — so the set is named once and applied in a loop.
+_JSON_COLUMNS = (
+    "banned_phrases",
+    # NTS_098 §4 / NTS_099 §1 — v3 keys, migration 020.
+    "publication_slots",
+    "candidate_ttl_days",
+    "jurisdiction_tiers",
+    "prefilter_deny_title_patterns",
+    "prefilter_languages",
+)
+
 
 @router.get("", response_model=PipelineConfigOut)
 def get_config(brand_id: int) -> PipelineConfigOut:
@@ -38,10 +52,9 @@ def update_config(
                 detail=f"no config row for brand_id={brand_id}",
             )
         data = payload.model_dump(exclude_unset=True)
-        if "banned_phrases" in data and data["banned_phrases"] is not None:
-            data["banned_phrases"] = json.dumps(
-                data["banned_phrases"], ensure_ascii=False
-            )
+        for key in _JSON_COLUMNS:
+            if data.get(key) is not None:
+                data[key] = json.dumps(data[key], ensure_ascii=False)
         for k, v in data.items():
             setattr(cfg, k, v)
         cfg.updated_at = datetime.now(tz=timezone.utc)

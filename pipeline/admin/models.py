@@ -24,11 +24,12 @@ Cascade rules:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -144,10 +145,53 @@ class Source(Base):
         back_populates="source", cascade="save-update"
     )
 
+    # --- NTS_101 §1 — the primary-feed registry lives in ``sources``, not in
+    # a second table. ``source_role`` splits the 28 legacy news feeds from the
+    # regulator/legislation feeds v3 reads documents out of.
+    source_role: Mapped[str] = mapped_column(
+        String, nullable=False, default="news", server_default="news"
+    )
+    source_class: Mapped[str] = mapped_column(
+        String, nullable=False, default="news", server_default="news"
+    )
+    # NTS_108 §1 — what composition may legally do with the text. Starts at the
+    # most restrictive class for every pre-v3 feed (headline as a lead, nothing
+    # more) and is reclassified upward from the Sources screen.
+    license_class: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="news_paywalled",
+        server_default="news_paywalled",
+    )
+    doc_language: Mapped[str | None] = mapped_column(String, nullable=True)
+    fetch_method: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Rolling share of successful extractions, maintained by the fetcher.
+    reliability: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cache_ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     __table_args__ = (
         CheckConstraint(
             "source_type IN ('rss', 'web', 'telegram')",
             name="ck_sources_source_type",
+        ),
+        CheckConstraint(
+            "source_role IN ('news', 'primary_feed', 'primary_site')",
+            name="ck_sources_source_role",
+        ),
+        CheckConstraint(
+            "source_class IN ('regulator', 'tax_authority', 'legislation', "
+            "'jurisdiction_list', 'filings', 'court', 'professional_alert', "
+            "'corporate_pr', 'news')",
+            name="ck_sources_source_class",
+        ),
+        CheckConstraint(
+            "license_class IN ('public_official', 'public_domain', "
+            "'corporate_pr', 'professional_commentary', 'news_paywalled')",
+            name="ck_sources_license_class",
+        ),
+        CheckConstraint(
+            "fetch_method IN ('rss', 'atom', 'html_list', 'edgar_fts')",
+            name="ck_sources_fetch_method",
         ),
         Index("ix_sources_brand_active", "brand_id_fk", "active"),
     )
@@ -177,7 +221,11 @@ class Prompt(Base):
     __table_args__ = (
         CheckConstraint(
             "prompt_type IN ('writer_polish', 'writer_draft', "
-            "'topic_picker', 'image_prompt', 'writer_translate')",
+            "'topic_picker', 'image_prompt', 'writer_translate', "
+            # NTS_099 §6 — the guard rubric is a prompt like any other, so it
+            # is edited from Editorial Policy instead of deployed. Migration
+            # 021 rebuilt the table to admit it.
+            "'editorial_guard')",
             name="ck_prompts_prompt_type",
         ),
         # Spec § "prompts" partial UNIQUE: at most one active prompt per
@@ -260,6 +308,136 @@ class PipelineConfig(Base):
     research_timeout_seconds: Mapped[int] = mapped_column(
         Integer, nullable=False, default=60, server_default="60"
     )
+    # === v3 contour-1 keys (NTS_098 §4, NTS_099 §1) — migration 020 ========
+    # All 25 are editable from Settings without a deploy, and all 25 are
+    # sentinel-tested end to end. NOT NULL with the spec's Icon starting
+    # values, so a config row that predates them still answers every read.
+
+    # --- Rhythm (NTS_098 §4/§5). Slots are a JSON array of
+    # {"day": "<mon..sun>", "capacity": <int>}; publication stays manual.
+    publication_slots: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='[{"day": "mon", "capacity": 2}, {"day": "thu", "capacity": 2}]',
+        server_default='[{"day": "mon", "capacity": 2}, {"day": "thu", "capacity": 2}]',
+    )
+    # Ceiling on candidates entering in_production per ISO week.
+    weekly_draft_budget: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=6, server_default="6"
+    )
+    # NTS_099 §5 — the daily accept cap is counted per input_kind.
+    portfolio_daily_cap_document: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, server_default="2"
+    )
+    portfolio_daily_cap_news: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    # TTL by event_stage as JSON; "default" covers stages not listed.
+    candidate_ttl_days: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='{"deal_announced": 7, "deal_closed": 7, '
+        '"consultation": 21, "default": 14}',
+        server_default='{"deal_announced": 7, "deal_closed": 7, '
+        '"consultation": 21, "default": 14}',
+    )
+    production_timeout_min: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60, server_default="60"
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, server_default="2"
+    )
+    # Overlaps ``brands.timezone`` by design — NTS_098 §4 puts the slot
+    # timezone on the config surface. Migration 020 copies brands.timezone in
+    # so the two start identical; from S4 on THIS key is the authority for
+    # slot arithmetic and displayDate.
+    brand_timezone: Mapped[str] = mapped_column(
+        Text, nullable=False, default="Europe/Madrid", server_default="Europe/Madrid"
+    )
+    retention_days_rejected: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default="30"
+    )
+
+    # --- Dedup windows (NTS_098 §3). Distinct from the NTS_090 keys above:
+    # those govern v2 draft dedup and keep working until v2 is switched off.
+    dedup_threshold_live: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.90, server_default="0.90"
+    )
+    dedup_threshold_rejected: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.92, server_default="0.92"
+    )
+    dedup_window_rejected_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=14, server_default="14"
+    )
+    dedup_threshold_published: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.88, server_default="0.88"
+    )
+    dedup_window_published_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60, server_default="60"
+    )
+
+    # --- Guard axes (NTS_099 §2). JSON {"tier1": [...], "tier2": [...]};
+    # anything unlisted is tier3. Values from NTS_115 artefact 4.
+    jurisdiction_tiers: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='{"tier1": ["CH", "CY", "MT", "AE", "UK", "PL", "UA", "LI", "EU"], '
+        '"tier2": ["US", "SG", "HK", "LU", "MC", "PT", "ES", "IT", "DE", "AT", '
+        '"IL", "KZ", "TR"]}',
+        server_default='{"tier1": ["CH", "CY", "MT", "AE", "UK", "PL", "UA", "LI", "EU"], '
+        '"tier2": ["US", "SG", "HK", "LU", "MC", "PT", "ES", "IT", "DE", "AT", '
+        '"IL", "KZ", "TR"]}',
+    )
+
+    # --- Depth thresholds (NTS_102 v2) — fact count decides depth_final.
+    depth_article_min_facts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=4, server_default="4"
+    )
+    depth_deep_min_facts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10, server_default="10"
+    )
+
+    # --- Spend kill-switch (NTS_106 §3). At 80% of the monthly cap an alert
+    # fires; at 100% production stops and intake keeps running.
+    monthly_spend_cap_usd: Mapped[float] = mapped_column(
+        Float, nullable=False, default=150.0, server_default="150"
+    )
+    max_cost_per_candidate_usd: Mapped[float] = mapped_column(
+        Float, nullable=False, default=5.0, server_default="5"
+    )
+
+    # --- Prefilter (NTS_099 §1) — free, in code, configured here. Deny
+    # patterns are NOT applied to primary_feed items: a regulator may
+    # "appoint" a board, which is not a personnel story.
+    prefilter_deny_title_patterns: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='["appoints", "hires", "joins", "named as", "wins award", '
+        '"ranked", "opens office", "rebrand", "outlook", "forecast", '
+        '"analysts expect"]',
+        server_default='["appoints", "hires", "joins", "named as", "wins award", '
+        '"ranked", "opens office", "rebrand", "outlook", "forecast", '
+        '"analysts expect"]',
+    )
+    prefilter_require_summary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("1")
+    )
+    prefilter_max_age_hours_news: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=72, server_default="72"
+    )
+    prefilter_max_age_hours_primary: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=240, server_default="240"
+    )
+    prefilter_languages: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='["en", "de", "fr", "it", "pl", "uk", "ru", "el"]',
+        server_default='["en", "de", "fr", "it", "pl", "uk", "ru", "el"]',
+    )
+    prefilter_min_summary_chars: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=80, server_default="80"
+    )
+
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
     banned_phrases: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -310,12 +488,22 @@ class Run(Base):
         passive_deletes=True,
     )
 
+    # NTS_106 §5 — which v3 contour this run belongs to. NULL means a pre-v3
+    # run: the ~72 historical rows are none of these four, and NULL passes a
+    # SQLite CHECK, so no value had to be invented for them.
+    run_type: Mapped[str | None] = mapped_column(String, nullable=True)
+
     __table_args__ = (
         CheckConstraint(
             "status IN ('running', 'success', 'failed', 'dry_run', 'cancelled')",
             name="ck_runs_status",
         ),
+        CheckConstraint(
+            "run_type IN ('intake', 'production', 'publish', 'ttl')",
+            name="ck_runs_run_type",
+        ),
         Index("ix_runs_started_at", "started_at"),
+        Index("ix_runs_run_type", "run_type"),
     )
 
 
@@ -454,6 +642,14 @@ class DraftApproval(Base):
         String(128), nullable=True
     )
 
+    # NTS_098 §1 — the candidate this draft came from. Nullable: every v2 row
+    # predates the portfolio and will never have one.
+    candidate_id_fk: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     __table_args__ = (
         CheckConstraint(
             "status IN ('draft', 'approved', 'rejected')",
@@ -466,6 +662,7 @@ class DraftApproval(Base):
         ),
         Index("ix_draft_approvals_sanity_id", "sanity_draft_id"),
         Index("ix_draft_approvals_brand_status", "brand_id_fk", "status"),
+        Index("ix_draft_approvals_candidate", "candidate_id_fk"),
     )
 
 
@@ -634,4 +831,305 @@ class DraftScore(Base):
     __table_args__ = (
         Index("ix_draft_scores_brand_created", "brand_id_fk", "created_at"),
         Index("ix_draft_scores_version", "judge_prompt_version"),
+    )
+
+
+# =========================================================================
+# v3 contour 1 — portfolio (NTS_098 / NTS_099 / NTS_101 / NTS_107 / NTS_109)
+# Created by migration 020. Nothing reads these yet: S2 fills ``candidates``
+# from the intake run, S3 renders them, S4 selects out of them.
+# =========================================================================
+
+
+# Guard verdict vocabulary (NTS_099 §3) — kept as module constants so the
+# guard, the API schemas and the UI filters all spell them the same way.
+CANDIDATE_INPUT_KINDS = ("document", "news")
+CANDIDATE_VERDICTS = ("accept", "reject")
+CANDIDATE_REASON_CODES = (
+    "ok",
+    "personnel",
+    "forecast",
+    "award_pr",
+    "no_document",
+    "no_consequence",
+    "out_of_jurisdiction",
+    "out_of_scope",
+    "duplicate_stage",
+    "retail_crypto",
+    "daily_cap",
+    "guard_error",
+)
+CANDIDATE_EVENT_STAGES = (
+    "consultation",
+    "adopted",
+    "in_force",
+    "ruling",
+    "deal_announced",
+    "deal_closed",
+    "list_update",
+    "other",
+)
+CANDIDATE_DEPTHS = ("note", "article", "deep")
+# NTS_098 §2. Terminal: published, expired, failed, superseded, rejected.
+CANDIDATE_STATUSES = (
+    "pending",
+    "selected",
+    "in_production",
+    "drafted",
+    "returned",
+    "ready",
+    "published",
+    "doc_missing",
+    "expired",
+    "failed",
+    "superseded",
+    "rejected",
+)
+# The subset a candidate is "alive" in — the live dedup window (NTS_098 §3).
+CANDIDATE_LIVE_STATUSES = (
+    "pending",
+    "doc_missing",
+    "selected",
+    "in_production",
+    "drafted",
+    "returned",
+    "ready",
+)
+CANDIDATE_MANUAL_ACTIONS = ("promoted", "held", "rejected")
+REVIEW_ACTIONS = ("approve", "return", "reject", "hold", "promote", "disagree_guard")
+SOURCE_ROLES = ("news", "primary_feed", "primary_site")
+SOURCE_CLASSES = (
+    "regulator",
+    "tax_authority",
+    "legislation",
+    "jurisdiction_list",
+    "filings",
+    "court",
+    "professional_alert",
+    "corporate_pr",
+    "news",
+)
+LICENSE_CLASSES = (
+    "public_official",
+    "public_domain",
+    "corporate_pr",
+    "professional_commentary",
+    "news_paywalled",
+)
+FETCH_METHODS = ("rss", "atom", "html_list", "edgar_fts")
+RUN_TYPES = ("intake", "production", "publish", "ttl")
+
+
+def _check_in(column: str, values: tuple[str, ...]) -> str:
+    joined = ", ".join(f"'{v}'" for v in values)
+    return f"{column} IN ({joined})"
+
+
+class Candidate(Base):
+    """Where a topic lives between "spotted" and "published" (NTS_098 §1).
+
+    **Self-contained by design.** The feed item is *copied* into the
+    ``source_*`` columns rather than joined, because an RSS item routinely
+    falls off the end of a feed within hours while a candidate can sit in the
+    portfolio for two weeks. ``source_id_fk`` is a provenance pointer, not a
+    read path.
+
+    The status machine (NTS_098 §2) is enforced in code, not here: SQLite
+    cannot express "pending → selected only", and a CHECK per transition
+    would be unmaintainable. The CHECK on ``status`` bounds the vocabulary;
+    the transition rules and their tests live with the selector (S4).
+    """
+
+    __tablename__ = "candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("brands.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    input_kind: Mapped[str] = mapped_column(String, nullable=False)
+
+    # --- source snapshot (copied, see docstring)
+    source_id_fk: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("sources.id", ondelete="RESTRICT"), nullable=True
+    )
+    source_title: Mapped[str] = mapped_column(Text, nullable=False)
+    source_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    source_language: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_class: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # --- dedup (NTS_079)
+    topic_embedding_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # --- guard verdict (NTS_099 §3). ``reason`` is required even on accept:
+    # it is the sentence Andriy reads when proofreading the rubric.
+    verdict: Mapped[str] = mapped_column(String, nullable=False)
+    reason_code: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(String(200), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    service_category: Mapped[str | None] = mapped_column(String, nullable=True)
+    jurisdictions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_stage: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Ranking only — length is decided by depth_final after research.
+    depth_prior: Mapped[str | None] = mapped_column(String, nullable=True)
+    depth_final: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # --- primary document (NTS_101 v2)
+    primary_doc_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    primary_doc_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    doc_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    doc_match: Mapped[str | None] = mapped_column(String, nullable=True)
+    doc_language_expected: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # --- lifecycle (NTS_098 §2)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manual_action: Mapped[str | None] = mapped_column(String, nullable=True)
+    manual_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    manual_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Rejected by the daily cap rather than by the rubric — kept visible so a
+    # manager can promote it the same day (NTS_099 §5).
+    cap_overflow: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # Required from ``drafted`` onward — the link to the Sanity draft.
+    sanity_draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    publication_slot: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # EN canon was edited after translation (NTS_107 §4).
+    canon_dirty: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    selected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    drafted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Set on the NEW candidate when a later stage of the same event arrives.
+    supersedes_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("candidates.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            _check_in("input_kind", CANDIDATE_INPUT_KINDS),
+            name="ck_candidates_input_kind",
+        ),
+        CheckConstraint(
+            _check_in("verdict", CANDIDATE_VERDICTS), name="ck_candidates_verdict"
+        ),
+        CheckConstraint(
+            _check_in("reason_code", CANDIDATE_REASON_CODES),
+            name="ck_candidates_reason_code",
+        ),
+        CheckConstraint(
+            _check_in("event_stage", CANDIDATE_EVENT_STAGES),
+            name="ck_candidates_event_stage",
+        ),
+        CheckConstraint(
+            _check_in("depth_prior", CANDIDATE_DEPTHS),
+            name="ck_candidates_depth_prior",
+        ),
+        CheckConstraint(
+            _check_in("depth_final", CANDIDATE_DEPTHS),
+            name="ck_candidates_depth_final",
+        ),
+        CheckConstraint(
+            _check_in("status", CANDIDATE_STATUSES), name="ck_candidates_status"
+        ),
+        CheckConstraint(
+            _check_in("manual_action", CANDIDATE_MANUAL_ACTIONS),
+            name="ck_candidates_manual_action",
+        ),
+        CheckConstraint(
+            _check_in("source_class", SOURCE_CLASSES),
+            name="ck_candidates_source_class",
+        ),
+        Index("ix_candidates_brand_status", "brand_id_fk", "status"),
+        Index("ix_candidates_brand_created", "brand_id_fk", "created_at"),
+        Index("ix_candidates_sanity_draft", "sanity_draft_id"),
+        Index("ix_candidates_status_expires", "status", "expires_at"),
+        Index("ix_candidates_primary_doc", "primary_doc_url"),
+    )
+
+
+class ReviewDecision(Base):
+    """One row per editor action, with the review timer (NTS_107 §5).
+
+    The only free signal for tuning the guard rubric and the rank weights
+    (NTS_113), which is why the candidate FK is RESTRICT: a candidate cannot
+    be deleted out from under its own decision history.
+    """
+
+    __tablename__ = "review_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=False
+    )
+    candidate_id_fk: Mapped[int] = mapped_column(
+        Integer, ForeignKey("candidates.id", ondelete="RESTRICT"), nullable=False
+    )
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    # Which part the editor sent back — free text, e.g. "attribution", "lead".
+    scope: Mapped[str | None] = mapped_column(String, nullable=True)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewer: Mapped[str] = mapped_column(
+        String, nullable=False, default="admin", server_default="admin"
+    )
+    # Card timer, seconds. Feeds the "review time per article" acceptance
+    # metric in NTS_114 (target ≤ 25 min).
+    time_spent_s: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            _check_in("action", REVIEW_ACTIONS), name="ck_review_decisions_action"
+        ),
+        Index("ix_review_decisions_brand_at", "brand_id_fk", "at"),
+        Index("ix_review_decisions_candidate", "candidate_id_fk"),
+    )
+
+
+class BrandTaxonomy(Base):
+    """A brand's services, per-brand instead of a hardcoded enum (NTS_109).
+
+    ``description_for_guard`` is what the rubric's ``{services}`` placeholder
+    renders; ``service_url_path`` is what NTS_093 internal linking resolves
+    against. Onboarding a second brand becomes rows here, not a code change.
+    """
+
+    __tablename__ = "brand_taxonomy"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=False
+    )
+    key: Mapped[str] = mapped_column(String, nullable=False)
+    label: Mapped[str] = mapped_column(String, nullable=False)
+    description_for_guard: Mapped[str] = mapped_column(Text, nullable=False)
+    service_url_path: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("brand_id_fk", "key", name="uq_brand_taxonomy_brand_key"),
     )

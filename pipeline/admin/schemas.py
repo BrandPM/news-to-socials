@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
@@ -196,6 +197,20 @@ class PromptAnalysisOut(BaseModel):
 # --- Pipeline config ----------------------------------------------------
 
 
+class PublicationSlot(BaseModel):
+    """One weekly publication slot (NTS_098 §4).
+
+    ``capacity`` is how many articles that weekday can absorb. Typed rather
+    than left as a free dict so a malformed slot is rejected at save time,
+    not when the publish run tries to fill it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    day: Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    capacity: int = Field(ge=0, le=20)
+
+
 class PipelineConfigOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -220,6 +235,38 @@ class PipelineConfigOut(BaseModel):
     research_max_sources: int
     research_max_tokens: int
     research_timeout_seconds: int
+    # === v3 contour-1 keys (NTS_098 §4, NTS_099 §1) — migration 020 =======
+    # Rhythm
+    publication_slots: list[dict[str, Any]]
+    weekly_draft_budget: int
+    portfolio_daily_cap_document: int
+    portfolio_daily_cap_news: int
+    candidate_ttl_days: dict[str, int]
+    production_timeout_min: int
+    max_attempts: int
+    brand_timezone: str
+    retention_days_rejected: int
+    # Dedup windows
+    dedup_threshold_live: float
+    dedup_threshold_rejected: float
+    dedup_window_rejected_days: int
+    dedup_threshold_published: float
+    dedup_window_published_days: int
+    # Guard axes
+    jurisdiction_tiers: dict[str, list[str]]
+    # Depth
+    depth_article_min_facts: int
+    depth_deep_min_facts: int
+    # Spend kill-switch
+    monthly_spend_cap_usd: float
+    max_cost_per_candidate_usd: float
+    # Prefilter
+    prefilter_deny_title_patterns: list[str]
+    prefilter_require_summary: bool
+    prefilter_max_age_hours_news: int
+    prefilter_max_age_hours_primary: int
+    prefilter_languages: list[str]
+    prefilter_min_summary_chars: int
     updated_at: datetime
 
     @field_validator("banned_phrases", mode="before")
@@ -228,6 +275,25 @@ class PipelineConfigOut(BaseModel):
         if isinstance(v, str):
             return json.loads(v) if v else []
         return v
+
+    @field_validator(
+        "publication_slots",
+        "prefilter_deny_title_patterns",
+        "prefilter_languages",
+        mode="before",
+    )
+    @classmethod
+    def _parse_json_list(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return json.loads(v) if v else []
+        return list(v) if isinstance(v, tuple) else v
+
+    @field_validator("candidate_ttl_days", "jurisdiction_tiers", mode="before")
+    @classmethod
+    def _parse_json_obj(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return json.loads(v) if v else {}
+        return dict(v) if v is not None else v
 
 
 class PipelineConfigUpdate(BaseModel):
@@ -252,6 +318,70 @@ class PipelineConfigUpdate(BaseModel):
     research_max_sources: int | None = Field(default=None, ge=1, le=20)
     research_max_tokens: int | None = Field(default=None, ge=500, le=8000)
     research_timeout_seconds: int | None = Field(default=None, ge=10, le=300)
+    # === v3 contour-1 keys (NTS_098 §4, NTS_099 §1) — migration 020 =======
+    # Bounds are guard rails against a typo, not policy: the spec's starting
+    # values sit comfortably inside each range. The five JSON keys are typed
+    # structurally so a malformed slot list is a 422, not a broken run.
+    publication_slots: list[PublicationSlot] | None = None
+    weekly_draft_budget: int | None = Field(default=None, ge=0, le=50)
+    portfolio_daily_cap_document: int | None = Field(default=None, ge=0, le=50)
+    portfolio_daily_cap_news: int | None = Field(default=None, ge=0, le=50)
+    candidate_ttl_days: dict[str, int] | None = None
+    production_timeout_min: int | None = Field(default=None, ge=5, le=1440)
+    max_attempts: int | None = Field(default=None, ge=1, le=10)
+    brand_timezone: str | None = None
+    retention_days_rejected: int | None = Field(default=None, ge=1, le=3650)
+    dedup_threshold_live: float | None = Field(default=None, ge=0.5, le=0.99)
+    dedup_threshold_rejected: float | None = Field(default=None, ge=0.5, le=0.99)
+    dedup_window_rejected_days: int | None = Field(default=None, ge=1, le=365)
+    dedup_threshold_published: float | None = Field(default=None, ge=0.5, le=0.99)
+    dedup_window_published_days: int | None = Field(default=None, ge=1, le=365)
+    jurisdiction_tiers: dict[str, list[str]] | None = None
+    depth_article_min_facts: int | None = Field(default=None, ge=1, le=100)
+    depth_deep_min_facts: int | None = Field(default=None, ge=1, le=200)
+    monthly_spend_cap_usd: float | None = Field(default=None, ge=0.0, le=100000.0)
+    max_cost_per_candidate_usd: float | None = Field(default=None, ge=0.0, le=1000.0)
+    prefilter_deny_title_patterns: list[str] | None = None
+    prefilter_require_summary: bool | None = None
+    prefilter_max_age_hours_news: int | None = Field(default=None, ge=1, le=8760)
+    prefilter_max_age_hours_primary: int | None = Field(default=None, ge=1, le=8760)
+    prefilter_languages: list[str] | None = None
+    prefilter_min_summary_chars: int | None = Field(default=None, ge=0, le=5000)
+
+    @field_validator("brand_timezone")
+    @classmethod
+    def _known_timezone(cls, v: str | None) -> str | None:
+        """Reject an unknown zone at the API edge.
+
+        Slot dates and displayDate are the only timezone-dependent arithmetic
+        in the system (NTS_098 §5). A typo saved here would not fail until the
+        next publish run tried to resolve it.
+        """
+        if v is None:
+            return v
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown timezone: {v!r}") from exc
+        return v
+
+    @field_validator("jurisdiction_tiers")
+    @classmethod
+    def _known_tiers(
+        cls, v: dict[str, list[str]] | None
+    ) -> dict[str, list[str]] | None:
+        """Only tier1/tier2 are stored; everything unlisted is tier3 by
+        definition (NTS_115 artefact 4), so a "tier3" key would be a silently
+        ignored edit."""
+        if v is None:
+            return v
+        unknown = set(v) - {"tier1", "tier2"}
+        if unknown:
+            raise ValueError(
+                f"unknown tier key(s): {sorted(unknown)} — only tier1/tier2 "
+                "are stored, anything unlisted is tier3"
+            )
+        return v
 
 
 # --- Runs ---------------------------------------------------------------
