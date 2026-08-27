@@ -11,6 +11,11 @@ Sources (verify when prices change — provider URLs):
   - gpt-4o          : $2.50 / 1M input, $10.00 / 1M output
   - gpt-4o-mini     : $0.15 / 1M input, $0.60 / 1M output
   - text-embedding-3-small : $0.02 / 1M input
+  - web_search tool : $10.00 / 1,000 tool calls, billed per CALL and NOT
+                       included in the token usage payload — so the research
+                       call site adds it explicitly (NTS_092). The search
+                       result tokens that land in context are billed at the
+                       model's normal input rate on top.
 
 * Replicate: https://replicate.com/black-forest-labs/flux-1.1-pro
   - flux-1.1-pro    : approx $0.04 per image (billed per-second under
@@ -18,7 +23,7 @@ Sources (verify when prices change — provider URLs):
     per-image dollar so the trend graph is comparable across runs even
     if Replicate's per-second rate drifts.
 
-Last verified: 2026-06-18.
+Last verified: 2026-06-18 (web_search rate added 2026-08-27, NTS_092).
 """
 
 from __future__ import annotations
@@ -39,6 +44,12 @@ OPENAI_PRICING_PER_1M: dict[str, dict[str, float]] = {
     "text-embedding-3-small": {"input": 0.02, "output": 0.0},
     "text-embedding-3-large": {"input": 0.13, "output": 0.0},
 }
+
+
+# OpenAI built-in web-search tool: USD per tool call. Charged separately from
+# tokens, so ``openai_cost`` cannot see it — the research call site counts the
+# ``web_search_call`` items in the response and adds this per call (NTS_092).
+OPENAI_WEB_SEARCH_PER_CALL_USD: float = 0.01
 
 
 # Replicate: estimated per-image cost for Flux 1.1 Pro. Replicate bills
@@ -72,6 +83,17 @@ def openai_cost(
     out_rate = rates.get("output", 0.0) / 1_000_000.0
     cost = (prompt_tokens or 0) * in_rate + (completion_tokens or 0) * out_rate
     return round(cost, 6)
+
+
+def web_search_cost(calls: int | None) -> float:
+    """USD for ``calls`` built-in web-search tool calls (NTS_092).
+
+    Zero for ``None`` / non-positive, so a response we could not introspect
+    still records its token cost rather than nothing.
+    """
+    if not calls or calls <= 0:
+        return 0.0
+    return round(calls * OPENAI_WEB_SEARCH_PER_CALL_USD, 6)
 
 
 def replicate_image_cost(model: str) -> float:
