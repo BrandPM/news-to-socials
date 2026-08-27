@@ -1539,8 +1539,31 @@ def regenerate_image(
     already-has-a-cover precondition — creating the first cover and
     replacing an existing one are the same operation here (pinned by
     ``test_regenerate_generates_the_first_cover_when_there_is_none``).
+
+    NTS_094: concurrent identical requests are COALESCED onto one job. One
+    cover per article means one Flux charge per article, and a disabled
+    button cannot enforce that across a double click, a second tab, or an
+    impatient retry — so the guard lives here, next to the spend. The dedup
+    key spans the document and the custom prompt: asking for a different
+    image is a different request.
     """
-    job = jobs.register_image_job()
+    normalised = (
+        sanity_draft_id[len("drafts.") :]
+        if sanity_draft_id.startswith("drafts.")
+        else sanity_draft_id
+    )
+    job, is_new = jobs.register_image_job_for(
+        f"{normalised}|{payload.custom_prompt or ''}"
+    )
+    if not is_new:
+        # Same article, same prompt, already generating. Hand back the job
+        # already running — the client polls it and sees the same asset.
+        log.info(
+            "image.regenerate_coalesced",
+            draft_id=normalised,
+            job_id=job.job_id,
+        )
+        return JobAcceptedOut(job_id=job.job_id)
     background.add_task(
         jobs.execute_image_regenerate,
         job.job_id,

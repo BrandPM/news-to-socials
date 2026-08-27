@@ -367,9 +367,16 @@ class ImageJob:
     state: str = "pending"  # 'pending' | 'done' | 'error'
     asset_id: str | None = None
     error: str | None = None
+    # NTS_094 — what this job is generating, for in-flight coalescing. See
+    # ``register_image_job_for``.
+    dedup_key: str | None = None
 
 
 _IMAGE_JOBS: dict[str, ImageJob] = {}
+# dedup_key -> job_id, for PENDING jobs only. Entries are dropped the moment a
+# job reaches a terminal state so a retry after a failure is never coalesced
+# into the corpse of the attempt that failed.
+_IMAGE_JOBS_BY_KEY: dict[str, str] = {}
 _IMAGE_JOBS_LOCK = threading.Lock()
 
 
@@ -378,6 +385,31 @@ def register_image_job() -> ImageJob:
     with _IMAGE_JOBS_LOCK:
         _IMAGE_JOBS[job.job_id] = job
     return job
+
+
+def register_image_job_for(dedup_key: str) -> tuple[ImageJob, bool]:
+    """Get-or-create the in-flight image job for ``dedup_key``.
+
+    Returns ``(job, is_new)``; the caller schedules the actual work only when
+    ``is_new``. NTS_094: one cover per article means one Flux charge per
+    article. A double click (or a second browser tab, or a retry the operator
+    fires because the first felt slow) must not buy the same image twice —
+    the UI's disabled state cannot cover any of those, so the coalescing lives
+    here, where the money is actually spent.
+
+    ``dedup_key`` carries the custom prompt as well as the document id: asking
+    for a DIFFERENT image is a different request and must not be swallowed by
+    one already running.
+    """
+    with _IMAGE_JOBS_LOCK:
+        existing_id = _IMAGE_JOBS_BY_KEY.get(dedup_key)
+        existing = _IMAGE_JOBS.get(existing_id) if existing_id else None
+        if existing is not None and existing.state == "pending":
+            return existing, False
+        job = ImageJob(job_id=uuid.uuid4().hex, dedup_key=dedup_key)
+        _IMAGE_JOBS[job.job_id] = job
+        _IMAGE_JOBS_BY_KEY[dedup_key] = job.job_id
+        return job, True
 
 
 def get_image_job(job_id: str) -> ImageJob | None:
@@ -392,6 +424,10 @@ def _set_image_job(job_id: str, **fields: Any) -> None:
             return
         for k, v in fields.items():
             setattr(job, k, v)
+        # Terminal → stop coalescing onto it, so the next click starts fresh.
+        if job.state in ("done", "error") and job.dedup_key is not None:
+            if _IMAGE_JOBS_BY_KEY.get(job.dedup_key) == job.job_id:
+                _IMAGE_JOBS_BY_KEY.pop(job.dedup_key, None)
 
 
 async def execute_image_regenerate(
@@ -416,6 +452,7 @@ async def execute_image_regenerate(
 def reset_image_jobs_for_tests() -> None:
     with _IMAGE_JOBS_LOCK:
         _IMAGE_JOBS.clear()
+        _IMAGE_JOBS_BY_KEY.clear()
 
 
 # --- Text-regenerate jobs (S5 Step 7) -------------------------------------

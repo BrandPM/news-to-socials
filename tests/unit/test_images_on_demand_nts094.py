@@ -44,6 +44,8 @@ from pipeline.admin.config_client import AdminConfigClient
 from pipeline.admin.models import PipelineConfig, Run
 from pipeline.common import config as config_module
 from pipeline.monitoring.alerts import format_run_finished
+from tests.unit.test_admin_drafts import ADMIN_TOKEN as DRAFTS_TOKEN
+from tests.unit.test_admin_drafts import client as drafts_client  # noqa: F401
 from tests.unit.test_run_pipeline_fanout import (  # noqa: F401 — fixture import
     _mock_externals,
     _set_brand_languages,
@@ -454,6 +456,109 @@ def test_settings_form_payload_shape_is_accepted(
     assert resp.json()["images_on_demand"] is True
     # …and the pipeline reads back exactly what the form wrote.
     assert AdminConfigClient(brand_slug="icon").get_config().images_on_demand is True
+
+
+# --- one click, one charge (Task C) ---------------------------------------
+#
+# The button's disabled state is necessary but not sufficient: it cannot cover
+# a second browser tab or an impatient retry, and it only takes effect on the
+# next render. The guarantee that one article buys one image lives in the job
+# registry, next to the spend.
+
+
+def test_identical_requests_coalesce_onto_one_job() -> None:
+    from pipeline.admin import jobs as admin_jobs
+
+    admin_jobs.reset_image_jobs_for_tests()
+    first, first_is_new = admin_jobs.register_image_job_for("post-a|")
+    second, second_is_new = admin_jobs.register_image_job_for("post-a|")
+
+    assert first_is_new is True
+    assert second_is_new is False, "a second click must not schedule a 2nd Flux call"
+    assert second.job_id == first.job_id
+    admin_jobs.reset_image_jobs_for_tests()
+
+
+def test_a_different_prompt_is_a_different_request() -> None:
+    """Coalescing must not swallow a Regenerate the operator re-prompted."""
+    from pipeline.admin import jobs as admin_jobs
+
+    admin_jobs.reset_image_jobs_for_tests()
+    plain, _ = admin_jobs.register_image_job_for("post-a|")
+    custom, custom_is_new = admin_jobs.register_image_job_for("post-a|warm marble")
+
+    assert custom_is_new is True
+    assert custom.job_id != plain.job_id
+    admin_jobs.reset_image_jobs_for_tests()
+
+
+@pytest.mark.parametrize(
+    "terminal", [{"state": "done", "asset_id": "img-1"}, {"state": "error", "error": "boom"}]
+)
+def test_a_finished_job_stops_absorbing_clicks(terminal: dict) -> None:
+    """Retry after failure, and re-generate after success, both still work.
+
+    The dedup index is only ever allowed to hold a PENDING job — otherwise a
+    failed attempt would strand the button forever.
+    """
+    from pipeline.admin import jobs as admin_jobs
+
+    admin_jobs.reset_image_jobs_for_tests()
+    first, _ = admin_jobs.register_image_job_for("post-a|")
+    admin_jobs._set_image_job(first.job_id, **terminal)
+
+    second, second_is_new = admin_jobs.register_image_job_for("post-a|")
+    assert second_is_new is True
+    assert second.job_id != first.job_id
+    admin_jobs.reset_image_jobs_for_tests()
+
+
+def test_double_post_generates_once(monkeypatch, drafts_client) -> None:
+    """Route level: a second POST while one is in flight buys nothing.
+
+    Driven through the registry rather than real concurrency — TestClient
+    drains background tasks before returning, so a genuine overlap cannot be
+    staged in-process. Pre-seeding the in-flight job reproduces exactly the
+    state a double click creates.
+    """
+    from pipeline.admin import image_regenerate
+    from pipeline.admin import jobs as admin_jobs
+
+    calls: list[str] = []
+
+    async def fake_regenerate(draft_id: str, custom_prompt):  # noqa: ANN001
+        calls.append(draft_id)
+        return "image-asset-1"
+
+    monkeypatch.setattr(image_regenerate, "regenerate_cover_image", fake_regenerate)
+    headers = {"X-Admin-Token": DRAFTS_TOKEN}
+
+    # Click one: schedules the work.
+    first = drafts_client.post(
+        "/api/v1/drafts/drafts.post-abc/regenerate-image", headers=headers, json={}
+    )
+    assert first.status_code == 202
+    assert calls == ["drafts.post-abc"]
+
+    # Stage the in-flight state a fast second click would land in.
+    in_flight, is_new = admin_jobs.register_image_job_for("post-abc|")
+    assert is_new is True
+
+    # Click two: same article, same prompt → same job, no new generation.
+    second = drafts_client.post(
+        "/api/v1/drafts/drafts.post-abc/regenerate-image", headers=headers, json={}
+    )
+    assert second.status_code == 202
+    assert second.json()["job_id"] == in_flight.job_id
+    assert calls == ["drafts.post-abc"], "second click paid for a second image"
+
+    # The published id form must land on the same key as the draft form —
+    # otherwise the coalescing has a trivial bypass.
+    third = drafts_client.post(
+        "/api/v1/drafts/post-abc/regenerate-image", headers=headers, json={}
+    )
+    assert third.json()["job_id"] == in_flight.job_id
+    assert calls == ["drafts.post-abc"]
 
 
 # --- Telegram run summary -------------------------------------------------
