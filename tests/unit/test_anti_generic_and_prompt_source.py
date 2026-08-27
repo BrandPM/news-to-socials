@@ -204,12 +204,17 @@ _DRAFT_KWARGS = {
     "language": "en",
     "language_name": "English",
     "banned_phrases": "  (none specified)",
+    # NTS_092 — the research fact pack is rendered for every draft call.
+    "fact_pack": "  (none)",
 }
 
 # A valid DB draft template: contains every required placeholder, no unknowns.
+# {fact_pack} is required as of NTS_092 — a DB row without it drafts from the
+# headline while the code constant researches, so the resolver rejects it.
 _VALID_DB_DRAFT = (
     "DB-SOURCED draft for {language_name}. Voice:{voice_profile_yaml} "
-    "Title:{title} Summary:{summary} Banned:{banned_phrases}"
+    "Title:{title} Summary:{summary} Banned:{banned_phrases} "
+    "Facts:{fact_pack}"
 )
 
 

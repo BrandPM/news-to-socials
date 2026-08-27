@@ -144,7 +144,27 @@ def _mock_externals(monkeypatch, fail_for_language: str | None = None):
 
     monkeypatch.setattr(pipe, "generate_image_for_topic", fake_generate_image)
 
-    async def fake_generate_draft(topic, brand, language):
+    # NTS_092: research is a paid per-topic call. Stub the seam so no test in
+    # this module can reach the network, and record the calls so "once per
+    # topic, not per language" is assertable the same way images are.
+    research_call_log: list[str] = []
+
+    async def fake_build_fact_pack(topic, *, research_enabled=True, budget=None):
+        research_call_log.append(topic.id)
+        if not research_enabled:
+            return None
+        from pipeline.generator.research import Fact, FactPack
+
+        return FactPack(
+            source_facts=[
+                Fact(text="Acme raised $5m.", url="https://reuters.com/acme")
+            ],
+            citations=["https://reuters.com/acme"],
+        )
+
+    monkeypatch.setattr(pipe, "build_fact_pack_for_topic", fake_build_fact_pack)
+
+    async def fake_generate_draft(topic, brand, language, fact_pack=None):
         if fail_for_language is not None and language.value == fail_for_language:
             raise RuntimeError(f"forced failure for {language.value}")
         return Draft(
@@ -195,6 +215,7 @@ def _mock_externals(monkeypatch, fail_for_language: str | None = None):
     # Attach the image call log on the fake_sanity object so tests can
     # assert "image generated once per topic, not 4× per language".
     fake_sanity.image_call_log = image_call_log  # type: ignore[attr-defined]
+    fake_sanity.research_call_log = research_call_log  # type: ignore[attr-defined]
     return fake_sanity
 
 

@@ -114,7 +114,13 @@ def _mock_externals(monkeypatch):
 
     monkeypatch.setattr(pipe, "generate_image_for_topic", fake_generate_image)
 
-    async def fake_generate_draft(topic, brand, language):  # noqa: ANN001
+    async def fake_build_fact_pack(topic, *, research_enabled=True, budget=None):  # noqa: ANN001
+        # NTS_092 — research is a paid per-topic call; never reach the network.
+        return None
+
+    monkeypatch.setattr(pipe, "build_fact_pack_for_topic", fake_build_fact_pack)
+
+    async def fake_generate_draft(topic, brand, language, fact_pack=None):  # noqa: ANN001
         return Draft(
             topic_id=topic.id,
             brand_id="icon",

@@ -51,7 +51,13 @@ def test_selected_blocks_present(prompt):
     assert "NO REPETITION & DENSITY" in prompt
     assert "AUDIENCE LINK" in prompt
     assert "topics_relevant" in prompt
-    assert "NO INVENTION" in prompt
+    # NTS_092 renamed the NO INVENTION block to GROUNDING and widened it
+    # (extrapolation, "sensible" rounding, unit conversion, misattribution)
+    # and promoted it above SPECIFICITY. The NTS_070 rule it superseded is
+    # still enforced, so assert the invariant rather than the old label.
+    assert "GROUNDING" in prompt
+    assert "Never invent" in prompt
+    assert "Your own knowledge is NOT a source." in prompt
     assert "So what does this mean specifically?" in _flat(prompt)
     # tighten-not-gut (softened "remove removable") — not the absolute form.
     assert "tighten, do not gut" in prompt

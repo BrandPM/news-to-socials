@@ -216,6 +216,7 @@ def format_run_finished(
     finished_at: datetime,
     deduped: int = 0,
     images_skipped: int = 0,
+    thin: int = 0,
 ) -> str:
     """✅/🔴/⏹ pulse when a run reaches a terminal status.
 
@@ -227,6 +228,11 @@ def format_run_finished(
     run deliberately did not generate because the brand runs images on
     demand. Reported so an on-demand run says something about images rather
     than silently saying nothing.
+    ``thin`` (NTS_092) is ``stats['thin']`` — articles written WITHOUT a
+    research fact pack, from the headline alone. Shown only when > 0, and
+    deliberately loud: those articles came out at the pre-NTS_092 quality
+    floor, and a run where every article is thin means research is broken,
+    not that the news was quiet.
     """
     emoji = _FINISHED_EMOJI.get(status, "✅")
     lines = [
@@ -237,6 +243,8 @@ def format_run_finished(
         lines.append(f"🔁 dedup: {deduped} skipped")
     if images_skipped > 0:
         lines.append(f"🖼 covers skipped: {images_skipped} (on demand)")
+    if thin > 0:
+        lines.append(f"⚠️ без ресёрча (thin): {thin}")
     lines.append(f"🕓 {_fmt_hm(finished_at)} UTC")
     return "\n".join(lines)
 
@@ -407,6 +415,7 @@ def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
                         drafted=int(stats.get("drafted", 0) or 0),
                         deduped=int(stats.get("deduped", 0) or 0),
                         images_skipped=int(stats.get("images_skipped", 0) or 0),
+                        thin=int(stats.get("thin", 0) or 0),
                         finished_at=r.finished_at,
                     ),
                 )

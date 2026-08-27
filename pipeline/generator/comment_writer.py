@@ -10,9 +10,17 @@ Why two stages: gpt-4o-mini gives us speed and cost (~$0.001/post in our
 volumes), but tends to fall into patterns. gpt-4o costs ~17x more but only
 runs once per accepted topic, so the bill stays bounded.
 
+Stage 0 (NTS_092) -- ``pipeline.generator.research.build_fact_pack`` runs
+once per topic, upstream of this module, and hands the draft stage a
+web-researched fact pack. It is the reason the target length could go from
+250-400 to 600-800 words: the drafter used to see an RSS headline and a
+two-line summary, and padded the gap. The pack arrives as the ``fact_pack``
+argument to :meth:`CommentWriter.write`; ``None`` is a first-class case and
+renders an explicit "write shorter" block rather than a licence to pad.
+
 Pattern reference: fin-thread composes news in a single OpenAI call
 (/research/fin-thread/composer/composer.go). We deliberately split into two
-because their output (1-2 sentence headline) and ours (200-400 word original
+because their output (1-2 sentence headline) and ours (600-800 word original
 commentary) have very different quality requirements.
 
 When to revisit: if gpt-4o output starts feeling generic, swap polish_model
@@ -35,6 +43,7 @@ from ..common.logging import get_logger
 from ..common.models import Draft, Language, Topic
 from ..common.retry import with_retry
 from .anti_ai_check import close_lacks_anchor, find_banned_phrase_hits, score_ai_tells
+from .research import FactPack, render_fact_pack
 
 log = get_logger(__name__)
 
@@ -123,11 +132,33 @@ News peg:
   Source URL: {url}
   Summary: {summary}
 
+RESEARCH FACT PACK — assembled by web search for THIS story. Every fact below
+carries the URL it was read on. This is the material you are allowed to be
+specific about:
+{fact_pack}
+
 Language: {language}
 Audience: people in the brand's target segment, NOT general public.
-Length: 250-400 words.
+Length: 600-800 words when the fact pack supports it — read GROUNDING first.
 
-SPECIFICITY (mandatory — highest priority):
+GROUNDING (mandatory — outranks EVERY other rule below, including length):
+* Every number, percentage, currency amount, date, effective date, threshold,
+  named person, named company, named regulator and named jurisdiction you
+  write MUST already appear in the RESEARCH FACT PACK or in the news peg
+  above. There is no third source. Your own knowledge is NOT a source.
+* Never invent one. Never extrapolate one ("if X rose 10%, then Y…"). Never
+  "sensibly round" one to a tidier number, and never convert one into a unit
+  or currency the source did not use. Copy the figure as it is given.
+* Never attribute a claim to an outlet, regulator, court or person that the
+  fact pack does not attribute to them.
+* If the fact pack is thin — or says NO RESEARCH AVAILABLE — write a SHORTER
+  article, well under the target length. A short, fully grounded piece is
+  CORRECT output. A padded 700-word piece is a failure, and an invented
+  figure is the worst outcome available to you: worse than publishing nothing.
+* The length is a target, never an instruction to keep writing. Stop when the
+  grounded material runs out.
+
+SPECIFICITY (mandatory — second only to GROUNDING):
 * Every claim must be specific to THIS story — tied to a concrete fact,
   number, named entity, or mechanism from the news peg above.
 * BAN any sentence that could be pasted into an article on a completely
@@ -149,16 +180,24 @@ AUDIENCE LINK (mandatory):
   in the body. Do NOT decline the topic or truncate the piece — topic
   selection happens upstream.
 
-NO INVENTION (mandatory):
-* Numbers, dates, and names may come ONLY from the source. Never invent
-  them. If the source lacks a figure, write the piece without it — do not
-  fabricate a statistic, date, or name to fill a gap.
+USING THE FACT PACK (mandatory):
+* Spend the pack. A fact sitting unused in the pack is a paragraph of filler
+  you wrote instead. Work the concrete ones — amounts, dates, thresholds,
+  mechanisms — into the body rather than gesturing at them.
+* Do NOT print the URLs, and do NOT add a sources/references section. The
+  citations exist so an editor can trace every figure; the reader sees prose.
+* Attribute where it earns credibility ("the regulator's 26 August notice",
+  "Reuters put the figure at…") — using the attribution the pack gives.
+* ``angle_hints`` are leads for YOUR analysis, not facts. Nothing in them may
+  become a number, a date or a name.
 
 STRUCTURE REQUIREMENTS (mandatory — markdown headings, not bold):
 * Open with a 1-2 sentence lede paragraph that names the specific
   consequence, NOT a general framing. No heading on the lede.
-* Then 2-3 H2 sections (`## Heading`). Heading names must be
-  substantive and describe the actual content
+* Then 3-5 H2 sections (`## Heading`) — one per distinct idea, each carrying
+  its own facts from the pack. Never pad a section to reach that count: if
+  the grounded material only supports two sections, write two and a shorter
+  piece. Heading names must be substantive and describe the actual content
   (e.g. "## The repricing of mezzanine credit", NOT
   "## What this means" or "## Key takeaways").
 * End with a forward-looking close that is ANCHORED to the article: it must
@@ -220,17 +259,31 @@ AUDIENCE LINK (mandatory):
   If the link isn't obvious in the draft, make it explicit in the body. Do
   NOT decline or truncate — topic selection happens upstream.
 
-NO INVENTION (mandatory):
-* Numbers, dates, and names may come ONLY from the source draft. Never
-  invent them; if a figure isn't present, write without it — do not
-  fabricate one to fill a gap.
+GROUNDING (mandatory — outranks EVERY other rule here, including length):
+* The draft below is your ONLY source. Every number, percentage, currency
+  amount, date, threshold, named person, company, regulator and jurisdiction
+  in your output must already be in it. Your own knowledge is NOT a source.
+* Never invent a figure, never extrapolate one, never "sensibly round" one
+  to a tidier number, never convert it into another unit or currency, and
+  never move a number from one entity to another. Copy them as given.
+* Never add an attribution the draft does not make.
+* You may cut, merge, sharpen and reorder prose. You may not ADD facts.
 
 STRUCTURE REQUIREMENTS (preserve / enforce — markdown, not bold):
 * The piece must open with a 1-2 sentence lede paragraph (no heading).
-* Then 2-3 H2 sections (`## Heading`). Substantive heading names that
+* Then 3-5 H2 sections (`## Heading`). Substantive heading names that
   describe the section content, e.g. "## The repricing of mezzanine
   credit" — NEVER "## What this means", "## Conclusion", "## Key
   takeaways", "## Overview", or other content-free labels.
+* LENGTH — the target is 600-800 words:
+  - A draft already in that range keeps its length. Do NOT compress it.
+    Tighten sentence by sentence; do not delete sections to hit a shorter
+    number.
+  - A draft SHORTER than 600 words STAYS short. It is short because the
+    research behind it was thin, and that is the correct outcome. Padding it
+    with generic sentences, or with a figure/date/name that is not already in
+    the draft, is the exact failure this pass exists to prevent.
+  - Never add a section, a fact or a sentence in order to reach a word count.
 * End with a forward-looking close ANCHORED to the article: it must
   reference a specific named entity, number, or mechanism already in the
   body and state the concrete shift for the reader's next decision ON THIS
@@ -266,7 +319,7 @@ The previous polish still uses the following banned phrases:
 {hit_phrases}
 
 Rewrite the draft to remove ALL of these phrases. Preserve meaning,
-structure (lede + 2-3 H2 sections + forward-looking close), and the
+structure (lede + its H2 sections + forward-looking close), and the
 voice. Use specific concrete language instead of these clichés.
 
 VOICE GUARDRAILS (still apply):
@@ -345,7 +398,9 @@ it would fit any article. Rewrite the piece so the CLOSING paragraph is
 anchored to THIS story: it must name a specific entity / number / mechanism
 already present in the body and state the concrete shift it creates for the
 reader's next decision. Do NOT introduce new facts, and do NOT change the
-meaning or structure of the rest of the piece (lede + 2-3 H2 sections + close).
+meaning, the length, or the structure of the rest of the piece (lede + its
+H2 sections + close). Do NOT introduce a number, date or name that is not
+already in the draft.
 
 Draft:
 {draft_json}
@@ -355,6 +410,19 @@ Return ONLY a JSON object in the same shape: {{"title": "...", "body": "...", "k
 
 
 _BANNED_PHRASE_RETRY_THRESHOLD = 2
+
+# Output ceilings, raised with the 250-400 → 600-800 word target (NTS_092).
+# 800 English words is ~1,200 tokens of prose before the JSON wrapper, so 1,500
+# — the old ceiling, sized for a 400-word piece — would now truncate the reply
+# mid-body and land in ``_parse``'s "(parse failed)" path.
+#
+# Translation gets more headroom than either: Slavic targets run 10-15% longer
+# than the English canon in words, and Cyrillic costs more tokens per word than
+# Latin, so an in-range EN piece is comfortably the largest reply in the flow
+# once translated.
+_DRAFT_MAX_TOKENS = 2600
+_POLISH_MAX_TOKENS = 2600
+_TRANSLATE_MAX_TOKENS = 4000
 
 # Placeholders a DB-stored prompt MUST contain (``required``) for the
 # generation path to trust it, and the full set it MAY reference
@@ -370,6 +438,12 @@ _REQUIRED_PLACEHOLDERS: dict[str, set[str]] = {
         "summary",
         "language_name",
         "banned_phrases",
+        # NTS_092 — the research fact pack. Required, not optional: a DB row
+        # without it would draft from the headline alone while the code
+        # constant researched, and the two would silently disagree. Migration
+        # 019 reseeds the live rows so this addition does not knock every
+        # brand onto the fallback constant.
+        "fact_pack",
     },
     "writer_polish": {
         "ai_tells",
@@ -678,7 +752,17 @@ class CommentWriter:
         topic: Topic,
         voice_profile_yaml: str,
         language: Language,
+        fact_pack: FactPack | None = None,
     ) -> Draft:
+        """Produce the canonical draft for ``topic``.
+
+        ``fact_pack`` (NTS_092) is the web-research pack built once per topic
+        by :func:`pipeline.generator.research.build_fact_pack`. ``None`` is a
+        first-class case, not an error: the draft prompt is then rendered with
+        an explicit "no research available, write shorter" block and the
+        caller counts the article thin. The pack is never built here — it is
+        one call per topic, and ``write`` runs per language.
+        """
         banned_phrases, good_examples = parse_voice_guardrails(
             voice_profile_yaml, language
         )
@@ -686,7 +770,9 @@ class CommentWriter:
         topics_relevant = parse_topics_relevant(voice_profile_yaml, language)
 
         # --- Stage 1: draft (banned phrases injected here too — NTS_067) ---
-        draft = await self._draft(topic, voice_profile_yaml, language, banned_phrases)
+        draft = await self._draft(
+            topic, voice_profile_yaml, language, banned_phrases, fact_pack
+        )
 
         # --- Anti-AI check ---
         score, tells = score_ai_tells(draft.body)
@@ -818,7 +904,7 @@ class CommentWriter:
         prompt = template.format(**kwargs)
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
-            max_tokens=2000,
+            max_tokens=_TRANSLATE_MAX_TOKENS,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
@@ -832,6 +918,7 @@ class CommentWriter:
         voice_profile_yaml: str,
         language: Language,
         banned_phrases: list[str] | None = None,
+        fact_pack: FactPack | None = None,
     ) -> _DraftJSON:
         kwargs = {
             "voice_profile_yaml": voice_profile_yaml,
@@ -841,12 +928,16 @@ class CommentWriter:
             "language": language.value,
             "language_name": _language_name(language),
             "banned_phrases": _bullet_list(banned_phrases or []) or "  (none specified)",
+            # Always rendered — a missing pack becomes the explicit
+            # "NO RESEARCH AVAILABLE, write shorter" block, never an empty
+            # string that reads as "nothing to see here" (NTS_092).
+            "fact_pack": render_fact_pack(fact_pack),
         }
         template = self._resolve_template("writer_draft", _DRAFT_PROMPT, kwargs)
         prompt = template.format(**kwargs)
         resp = await self.client.chat.completions.create(
             model=self.draft_model,
-            max_tokens=1500,
+            max_tokens=_DRAFT_MAX_TOKENS,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
@@ -879,7 +970,7 @@ class CommentWriter:
         prompt = template.format(**kwargs)
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
-            max_tokens=1500,
+            max_tokens=_POLISH_MAX_TOKENS,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
@@ -900,7 +991,7 @@ class CommentWriter:
         )
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
-            max_tokens=1500,
+            max_tokens=_POLISH_MAX_TOKENS,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
@@ -927,7 +1018,7 @@ class CommentWriter:
         )
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
-            max_tokens=1500,
+            max_tokens=_POLISH_MAX_TOKENS,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )

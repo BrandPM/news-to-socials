@@ -62,6 +62,7 @@ from pipeline.generator.image import (
     ImageGenerator,
 )
 from pipeline.generator.image_prompt import build_scene_prompt
+from pipeline.generator.research import FactPack, ResearchBudget
 from pipeline.generator.image_resizer import fetch_master, resize_for_channel
 from pipeline.publisher.sanity import (
     SanityCategoryMapping,
@@ -403,10 +404,33 @@ async def generate_image_for_topic(
         return None  # Continue without image; Andriy can add manually.
 
 
+async def build_fact_pack_for_topic(
+    topic: Topic,
+    *,
+    research_enabled: bool = True,
+    budget: ResearchBudget | None = None,
+) -> FactPack | None:
+    """Research ``topic`` on the web, ONCE per topic (NTS_092).
+
+    Hoisted above the language loop for the same reason image generation is:
+    the pack is language-agnostic and the English draft is the canon every
+    translation is made from. Returns ``None`` when research is switched off
+    or when it failed for any reason — the caller then drafts from
+    title+summary as before and counts the article thin. Separate seam from
+    :func:`generate_draft_for_language` so tests can stub it independently.
+    """
+    if not research_enabled:
+        return None
+    from pipeline.generator.research import build_fact_pack  # noqa: PLC0415
+
+    return await build_fact_pack(topic, budget=budget)
+
+
 async def generate_draft_for_language(
     topic: Topic,
     brand: BrandConfig,
     language: Language,
+    fact_pack: FactPack | None = None,
 ) -> Draft:
     """Generate the CANONICAL draft for ``language`` natively from the topic.
 
@@ -414,9 +438,13 @@ async def generate_draft_for_language(
     :func:`translate_draft_for_language` for the non-EN path. Kept on this
     name + signature because it's the seam the fanout tests monkeypatch.
     No image work — that's hoisted above this call in the orchestrator
-    (see :func:`generate_image_for_topic`)."""
+    (see :func:`generate_image_for_topic`), and neither is the research
+    fact pack (see :func:`build_fact_pack_for_topic`); both are once per
+    topic, this is once per language."""
     writer = CommentWriter(brand_id_fk=brand.id_fk)
-    return await writer.write(topic, brand.voice_profile_yaml, language)
+    return await writer.write(
+        topic, brand.voice_profile_yaml, language, fact_pack=fact_pack
+    )
 
 
 async def translate_draft_for_language(
@@ -644,6 +672,8 @@ async def _process_source(
     eval_enabled: bool = True,
     eval_threshold: float = 7.0,
     images_on_demand: bool = False,
+    research_enabled: bool = True,
+    research_budget: ResearchBudget | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], set[str]]:
     """Process ONE source for ALL ``languages`` in a single pass.
 
@@ -672,6 +702,11 @@ async def _process_source(
         # NTS_094 — topics whose cover was deliberately NOT generated because
         # the brand runs images on demand. Distinct from an image failure.
         "images_skipped": 0,
+        # NTS_092 — topics drafted WITHOUT a research fact pack, from the
+        # headline + summary alone. Not an error (the article still ships)
+        # but the quality floor is the pre-NTS_092 one, so a run where
+        # research is broken must be loudly visible rather than quietly worse.
+        "thin": 0,
     }
     topics, fetched_count = await _build_topics_for_source(
         source_record=source_record,
@@ -738,6 +773,47 @@ async def _process_source(
                 log.exception("image.unexpected_failure", topic=topic.id)
                 asset_id = None
 
+        # ---- RESEARCH (NTS_092): once per topic, language-agnostic, before
+        # any drafting. HARD RULE — research NEVER drops a topic. Anything
+        # that goes wrong (switched off, timeout, empty/garbled JSON, every
+        # fact dropped for want of a resolvable URL) yields ``None``, the
+        # draft falls back to the title+summary path exactly as it worked
+        # before this stage existed, and the article is counted thin.
+        fact_pack: FactPack | None = None
+        try:
+            fact_pack = await build_fact_pack_for_topic(
+                topic,
+                research_enabled=research_enabled,
+                budget=research_budget,
+            )
+        except Exception as exc:  # noqa: BLE001 — paranoia net; build_fact_pack
+            # swallows its own failures, so reaching here means something
+            # unexpected exploded. Still not a reason to lose the topic.
+            log.warning(
+                "research.failed",
+                topic=topic.id,
+                reason="unexpected_error",
+                err=str(exc),
+            )
+            fact_pack = None
+        if fact_pack is None:
+            # ``build_fact_pack`` already logged the specific reason; this is
+            # the pipeline-level record that THIS article is going out thin.
+            log.warning(
+                "research.failed",
+                topic=topic.id,
+                reason="disabled" if not research_enabled else "no_fact_pack",
+                brand=brand.slug,
+            )
+            stats["thin"] += 1
+        else:
+            log.info(
+                "research.fact_pack",
+                topic=topic.id,
+                facts=fact_pack.fact_count,
+                citations=len(fact_pack.citations),
+            )
+
         # ---- CATEGORY: language-agnostic; once per topic.
         try:
             category = await assign_category(topic.raw, brand)
@@ -790,7 +866,7 @@ async def _process_source(
 
                 if language == Language.en:
                     draft = await generate_draft_for_language(
-                        topic, brand, Language.en
+                        topic, brand, Language.en, fact_pack=fact_pack
                     )
                     en_draft = draft
                 else:
@@ -801,7 +877,7 @@ async def _process_source(
                     # published, it only feeds the translation.
                     if en_draft is None:
                         en_draft = await generate_draft_for_language(
-                            topic, brand, Language.en
+                            topic, brand, Language.en, fact_pack=fact_pack
                         )
                     draft = await translate_draft_for_language(
                         topic, brand, language, en_draft
@@ -1160,6 +1236,7 @@ async def run_pipeline(
         "errors": 0,
         "deduped": 0,
         "images_skipped": 0,
+        "thin": 0,
     }
     log_lines: list[str] = []
 
@@ -1189,6 +1266,21 @@ async def run_pipeline(
     images_on_demand = bool(getattr(config, "images_on_demand", False))
     if images_on_demand:
         log.info("image.on_demand_mode", brand=brand_row.slug)
+    # NTS_092 — web-research fact pack before the draft. Defaults ON (the
+    # 600-800 word prompt assumes a pack exists); budgets come off the same
+    # config row so they are tunable from Settings without a deploy. Research
+    # fails OPEN regardless of the switch — a failed pack is a thin article,
+    # never a dropped topic.
+    research_enabled = bool(getattr(config, "research_enabled", True))
+    research_budget = ResearchBudget.from_config(config)
+    log.info(
+        "research.config",
+        brand=brand_row.slug,
+        enabled=research_enabled,
+        max_sources=research_budget.max_sources,
+        max_tokens=research_budget.max_tokens,
+        timeout_s=research_budget.timeout_seconds,
+    )
     # Cleanup old embeddings on pipeline start (best-effort, brand-scoped).
     if dedup_enabled:
         cleanup_old_embeddings(brand_id_fk, dedup_window_days)
@@ -1213,6 +1305,8 @@ async def run_pipeline(
                     eval_enabled=eval_enabled,
                     eval_threshold=eval_threshold,
                     images_on_demand=images_on_demand,
+                    research_enabled=research_enabled,
+                    research_budget=research_budget,
                 )
                 aggregate_results.extend(results)
                 for k, v in stats.items():
@@ -1223,6 +1317,7 @@ async def run_pipeline(
                     f"scored={stats['scored']} drafted={stats['drafted']} "
                     f"errors={stats['errors']} "
                     f"covers_skipped={stats['images_skipped']} "
+                    f"thin={stats['thin']} "
                     f"langs={sorted(langs_attempted)}"
                 )
             except Exception as exc:  # noqa: BLE001
