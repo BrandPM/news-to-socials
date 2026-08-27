@@ -315,19 +315,52 @@ def test_budget_from_config_falls_back_for_a_row_predating_the_columns():
 
 
 async def test_empty_response_returns_none():
-    client = _client(_resp(""))
+    client = _client(_resp(""), _resp(""))
     assert await build_fact_pack(_topic(), client=client) is None
 
 
 async def test_malformed_json_returns_none():
-    client = _client(_resp("here you go: {oops"))
+    client = _client(_resp("here you go: {oops"), _resp("still broken {"))
     assert await build_fact_pack(_topic(), client=client) is None
 
 
 async def test_all_facts_dropped_returns_none():
     payload = {"source_facts": [{"text": "X.", "url": "made up"}], "context": []}
-    client = _client(_resp(json.dumps(payload)))
+    client = _client(_resp(json.dumps(payload)), _resp(json.dumps(payload)))
     assert await build_fact_pack(_topic(), client=client) is None
+
+
+async def test_an_unusable_payload_is_retried_once_with_a_nudge():
+    """Seen live during NTS_092 acceptance: the model returns a well-formed
+    object with EMPTY arrays on a topic that researches fine on the retry.
+    The first call is paid either way, so a second attempt buys most of that
+    loss back."""
+    empty = {"source_facts": [], "context": [], "angle_hints": [], "citations": []}
+    client = _client(_resp(json.dumps(empty)), _resp(json.dumps(_GOOD_PAYLOAD)))
+
+    pack = await build_fact_pack(_topic(), client=client)
+
+    assert pack is not None and pack.fact_count == 3
+    assert client.responses.create.await_count == 2
+    first, second = client.responses.create.await_args_list
+    assert "Your previous attempt returned nothing usable" not in first.kwargs["input"]
+    assert "Your previous attempt returned nothing usable" in second.kwargs["input"]
+    # The nudge must not license invention to escape the empty answer.
+    assert "worse than an empty pack" in second.kwargs["input"]
+
+
+async def test_the_retry_gives_up_after_two_attempts():
+    empty = {"source_facts": [], "context": []}
+    client = _client(_resp(json.dumps(empty)), _resp(json.dumps(empty)))
+    assert await build_fact_pack(_topic(), client=client) is None
+    assert client.responses.create.await_count == 2
+
+
+async def test_a_good_first_answer_is_not_retried():
+    client = _client(_resp(json.dumps(_GOOD_PAYLOAD)))
+    pack = await build_fact_pack(_topic(), client=client)
+    assert pack is not None
+    assert client.responses.create.await_count == 1
 
 
 async def test_timeout_returns_none_and_does_not_raise():
@@ -343,10 +376,30 @@ async def test_timeout_returns_none_and_does_not_raise():
     assert pack is None
 
 
-async def test_api_error_returns_none_and_does_not_raise():
+async def test_api_error_returns_none_and_is_not_retried():
+    """An API error is already retried inside the SDK; retrying here would
+    only multiply the bill on an outage."""
     client = AsyncMock()
     client.responses.create = AsyncMock(side_effect=RuntimeError("upstream is down"))
     assert await build_fact_pack(_topic(), client=client) is None
+    assert client.responses.create.await_count == 1
+
+
+async def test_a_timeout_is_not_retried():
+    """Retrying a timeout would blow the very budget the timeout enforces."""
+    calls: list[int] = []
+
+    async def _never(**_kwargs):
+        calls.append(1)
+        await asyncio.sleep(5)
+
+    client = AsyncMock()
+    client.responses.create = _never
+    pack = await build_fact_pack(
+        _topic(), budget=ResearchBudget(timeout_seconds=0), client=client
+    )
+    assert pack is None
+    assert len(calls) <= 1
 
 
 async def test_missing_api_key_returns_none_without_calling_openai(monkeypatch):
@@ -442,13 +495,19 @@ async def test_research_records_no_cost_row_when_the_call_fails(fresh_admin_db):
     assert _cost_rows() == []
 
 
-async def test_research_still_records_cost_when_the_payload_is_unusable(
+async def test_research_records_a_cost_row_per_attempt_when_unusable(
     fresh_admin_db,
 ):
     """A call that came back and billed us is recorded even though nothing
-    survived the parse — otherwise a run of thin articles reads as free."""
-    client = _client(_resp("{broken", searches=1, tokens=(800, 20)))
+    survived the parse — otherwise a run of thin articles reads as free, and
+    the retry would be spend nobody could see."""
+    client = _client(
+        _resp("{broken", searches=1, tokens=(800, 20)),
+        _resp("{still broken", searches=1, tokens=(800, 20)),
+    )
     with cost_context(CostContext(brand_id_fk=fresh_admin_db)):
         assert await build_fact_pack(_topic(), client=client) is None
     rows = _cost_rows()
-    assert len(rows) == 1 and rows[0].operation == "research"
+    assert len(rows) == 2
+    assert all(r.operation == "research" for r in rows)
+    assert all(r.cost_usd > 0 for r in rows)

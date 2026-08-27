@@ -63,6 +63,17 @@ log = get_logger(__name__)
 # the judge's yellow-band escalation. One constant, one line to change.
 RESEARCH_MODEL = "gpt-4o"
 
+# How many times to ask for the pack before giving up and going thin. The
+# model intermittently returns a well-formed object with EMPTY arrays — seen
+# once in three live calls during NTS_092 acceptance, on a topic that
+# researched fine on the retry. Since the first call is paid either way, a
+# second attempt buys back most of that loss for a bounded 2x on the minority
+# path; a topic that genuinely has nothing to find comes back empty twice and
+# goes thin, which is the correct outcome. This does NOT retry API errors or
+# timeouts — those are already handled, and retrying a timeout would blow the
+# budget the timeout exists to enforce.
+_RESEARCH_ATTEMPTS = 2
+
 # Built-in web-search tool variants, in preference order. Older model
 # snapshots only accept ``web_search_preview``; a 400 that names the tool
 # retries once with the next variant instead of burning the topic's research.
@@ -363,8 +374,15 @@ def parse_fact_pack(
     )
 
     if not source_facts and not context:
+        # ``dropped`` separates the two very different causes: >0 means WE
+        # rejected everything (no resolvable URL), 0 means the model returned
+        # empty arrays. The raw snippet settles it either way without a second
+        # paid call to reproduce.
         log.warning(
-            "research.parse_failed", reason="all_facts_dropped", dropped=dropped
+            "research.parse_failed",
+            reason="all_facts_dropped",
+            dropped=dropped,
+            raw=stripped[:200],
         )
         return None
 
@@ -458,6 +476,18 @@ Source URL: {url}
 Summary: {summary}
 """
 
+# Appended on the second attempt only. The first attempt sometimes returns a
+# well-formed object with empty arrays; this says plainly that empty is not an
+# acceptable shortcut, WITHOUT licensing invention to avoid it.
+_RETRY_NUDGE = (
+    "Your previous attempt returned nothing usable. Search again and return at "
+    "least one source_fact with a real URL you actually read it on. Returning "
+    "empty arrays is NOT an acceptable answer while any concrete, sourced fact "
+    "about this story exists. If — and only if — you genuinely cannot find one, "
+    "return empty arrays rather than inventing anything: a fabricated fact is "
+    "worse than an empty pack."
+)
+
 
 def _count_searches(resp: Any) -> int:
     """How many web_search calls the model actually made (for cost + logs)."""
@@ -542,10 +572,13 @@ async def build_fact_pack(
 ) -> FactPack | None:
     """Research ``topic`` on the web and return a grounded fact pack.
 
-    ONE call per topic (EN canon), placed between dedup and ``writer_draft``.
-    Returns ``None`` on ANY failure — timeout, empty response, malformed JSON,
-    or every fact dropped for want of a resolvable URL. Never raises: the
-    caller drafts from title+summary and counts the article thin.
+    Placed between dedup and ``writer_draft``, once per topic (EN canon).
+    Up to ``_RESEARCH_ATTEMPTS`` calls: an unusable payload — malformed JSON,
+    or a well-formed one with nothing that survives the URL rule — is retried
+    once with a nudge. A timeout or an API error is NOT retried.
+
+    Returns ``None`` when every attempt failed. Never raises: the caller
+    drafts from title+summary and counts the article thin.
     """
     budget = budget or ResearchBudget()
     if client is None:
@@ -566,42 +599,64 @@ async def build_fact_pack(
         summary=(topic.raw.summary or "")[:1000],
     )
 
-    try:
-        resp = await asyncio.wait_for(
-            _create_response(
-                client,
-                model=model,
-                instructions=instructions,
-                payload=payload,
-                budget=budget,
-            ),
-            timeout=float(budget.timeout_seconds),
+    for attempt in range(1, _RESEARCH_ATTEMPTS + 1):
+        attempt_payload = payload if attempt == 1 else f"{payload}\n{_RETRY_NUDGE}"
+        try:
+            resp = await asyncio.wait_for(
+                _create_response(
+                    client,
+                    model=model,
+                    instructions=instructions,
+                    payload=attempt_payload,
+                    budget=budget,
+                ),
+                timeout=float(budget.timeout_seconds),
+            )
+        except TimeoutError:
+            log.warning(
+                "research.failed",
+                topic=topic.id,
+                reason="timeout",
+                timeout_s=budget.timeout_seconds,
+                attempt=attempt,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — research NEVER drops a topic
+            log.warning(
+                "research.failed",
+                topic=topic.id,
+                reason="api_error",
+                err=str(exc)[:300],
+                attempt=attempt,
+            )
+            return None
+
+        searches = _count_searches(resp)
+        # Recorded per attempt: a retry is a real charge, and a run whose
+        # research keeps coming back empty must show up on the cost line.
+        _record_research_cost(resp, model=model, searches=searches)
+
+        pack = parse_fact_pack(
+            getattr(resp, "output_text", "") or "",
+            budget=budget,
+            model=model,
+            searches=searches,
         )
-    except TimeoutError:
+        if pack is not None:
+            break
+        log.warning(
+            "research.unusable_payload",
+            topic=topic.id,
+            attempt=attempt,
+            retrying=attempt < _RESEARCH_ATTEMPTS,
+        )
+    if pack is None:
         log.warning(
             "research.failed",
             topic=topic.id,
-            reason="timeout",
-            timeout_s=budget.timeout_seconds,
+            reason="unusable_payload",
+            attempts=_RESEARCH_ATTEMPTS,
         )
-        return None
-    except Exception as exc:  # noqa: BLE001 — research NEVER drops a topic
-        log.warning(
-            "research.failed", topic=topic.id, reason="api_error", err=str(exc)[:300]
-        )
-        return None
-
-    searches = _count_searches(resp)
-    _record_research_cost(resp, model=model, searches=searches)
-
-    pack = parse_fact_pack(
-        getattr(resp, "output_text", "") or "",
-        budget=budget,
-        model=model,
-        searches=searches,
-    )
-    if pack is None:
-        log.warning("research.failed", topic=topic.id, reason="unusable_payload")
         return None
     log.info(
         "research.ok",
