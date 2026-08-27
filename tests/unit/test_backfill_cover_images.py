@@ -406,3 +406,144 @@ def test_sweep_never_approves_or_publishes_a_draft(monkeypatch) -> None:
         for m in tx:
             assert set(m["patch"]) == {"id", "set"}
             assert set(m["patch"]["set"]) == {"coverImage"}
+
+
+# --- NTS_094 guard rail ---------------------------------------------------
+#
+# `--target drafts` is exactly the command that would mass-generate the covers
+# cover-on-demand decided not to buy. The published pass is untouched: a live
+# article with no cover is damage whatever the pipeline does.
+
+
+def _cover_less_draft_pair() -> FakeClient:
+    return FakeClient([_draft_row("en", topic="topic-a"), _draft_row("ru", topic="topic-a")])
+
+
+def test_drafts_dry_run_warns_loudly_under_images_on_demand(capsys) -> None:
+    client = _cover_less_draft_pair()
+    rc = asyncio.run(
+        bf._run(client, apply=False, target="drafts", images_on_demand=True)
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "images_on_demand ON" in out
+    assert "decided not to buy" in out
+    # Still lists the candidates — seeing what WOULD be generated is the point.
+    assert "[drafts]" in out
+    assert client.mutations == []
+
+
+def test_drafts_apply_is_refused_without_the_override(capsys) -> None:
+    client = _cover_less_draft_pair()
+    rc = asyncio.run(
+        bf._run(client, apply=True, target="drafts", images_on_demand=True)
+    )
+
+    assert client.mutations == [], "not one cover may be written"
+    out = capsys.readouterr().out
+    assert "REFUSING to --apply" in out
+    assert "--override-images-on-demand" in out
+    # Non-zero so a scripted caller cannot read the refusal as "nothing to do".
+    assert rc == 2
+
+
+def test_the_override_lets_a_deliberate_sweep_through(monkeypatch, capsys) -> None:
+    """The legitimate case: drafts stranded from before the flag went on."""
+    client = _cover_less_draft_pair()
+
+    async def fake_generate(**kwargs):
+        return "image-NEW"
+
+    from pipeline.admin import image_regenerate as ir
+
+    monkeypatch.setattr(ir, "generate_and_apply_cover", fake_generate)
+    monkeypatch.setattr(bf, "SanityPublisher", lambda **kw: object())
+
+    rc = asyncio.run(
+        bf._run(
+            client,
+            apply=True,
+            target="drafts",
+            images_on_demand=True,
+            override_on_demand=True,
+        )
+    )
+
+    assert rc == 0
+    # The warning is still printed — the override permits, it does not silence.
+    assert "images_on_demand ON" in capsys.readouterr().out
+
+
+def test_published_backfill_is_unaffected_by_the_flag(monkeypatch, capsys) -> None:
+    """A live article with no cover is damage regardless of how covers are
+    made now, so the published pass neither warns nor refuses."""
+    client = FakeClient([_row("post-en", "en", topic="topic-a")])
+
+    async def fake_generate(**kwargs):
+        return "image-NEW"
+
+    from pipeline.admin import image_regenerate as ir
+
+    monkeypatch.setattr(ir, "generate_and_apply_cover", fake_generate)
+    monkeypatch.setattr(bf, "SanityPublisher", lambda **kw: object())
+
+    rc = asyncio.run(
+        bf._run(client, apply=True, target="published", images_on_demand=True)
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "images_on_demand ON" not in out
+    assert "REFUSING" not in out
+
+
+def test_target_all_repairs_published_and_still_refuses_drafts(
+    monkeypatch, capsys
+) -> None:
+    """``--target all --apply`` must not be an all-or-nothing choice: the live
+    site still gets repaired, only the drafts half is held back."""
+    client = FakeClient(
+        [_row("post-en", "en", topic="topic-a"), _draft_row("ru", topic="topic-b")]
+    )
+    generated: list[str] = []
+
+    async def fake_generate(**kwargs):
+        generated.append(kwargs["cost_doc_id"])
+        return "image-NEW"
+
+    from pipeline.admin import image_regenerate as ir
+
+    monkeypatch.setattr(ir, "generate_and_apply_cover", fake_generate)
+    monkeypatch.setattr(bf, "SanityPublisher", lambda **kw: object())
+
+    rc = asyncio.run(
+        bf._run(client, apply=True, target="all", images_on_demand=True)
+    )
+
+    assert rc == 2
+    assert generated == ["post-en"], "only the published article was repaired"
+    assert "REFUSING to --apply" in capsys.readouterr().out
+
+
+def test_flag_off_leaves_the_drafts_sweep_exactly_as_it_was(capsys) -> None:
+    client = _cover_less_draft_pair()
+    rc = asyncio.run(bf._run(client, apply=False, target="drafts"))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "images_on_demand ON" not in out
+    assert "DRY RUN" in out
+
+
+def test_flag_read_is_fail_safe_when_the_db_is_unreadable(monkeypatch) -> None:
+    """A broken admin.db must not block a published repair — and must never
+    be read as 'on demand is off, go generate more'. It returns False, which
+    only removes the guard rail; nothing downstream generates because of it."""
+    from pipeline.admin import db as admin_db_mod
+
+    def boom():
+        raise RuntimeError("no admin.db here")
+
+    monkeypatch.setattr(admin_db_mod, "get_session_factory", boom)
+    assert bf._images_on_demand("icon") is False

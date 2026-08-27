@@ -33,6 +33,13 @@ Only ``coverImage`` is written. ``publishedAt`` is NTS_089's separate
 backfill and ``_updatedAt`` / ``dateModified`` belong to Sanity. Nothing here
 approves or publishes anything.
 
+NTS_094 guard rail: when the brand has ``images_on_demand`` ON, the
+``drafts`` pass would mass-generate precisely the covers the pipeline just
+decided NOT to generate — one command undoing the whole cost change, at
+~$0.04 a topic. That pass warns loudly in dry-run and refuses ``--apply``
+without ``--override-images-on-demand``. The ``published`` pass is unaffected:
+a live article with no cover is damage regardless of how covers are made.
+
 Default mode is **DRY RUN**: it prints the candidate table and writes
 nothing. ``--apply`` executes. A single topic's failure is isolated — the
 rest still run, and the summary names what failed.
@@ -171,6 +178,50 @@ def _build_sanity_client(brand_slug: str) -> SanityClient:
             dataset=brand.sanity_dataset or "production",
             api_version=brand.sanity_api_version or "2024-01-01",
             token=token,
+        )
+
+
+def _images_on_demand(brand_slug: str) -> bool:
+    """Is this brand's pipeline leaving covers to the manager (NTS_094)?
+
+    Read defensively: a DB shape that predates the column, or an unreadable
+    admin.db, must not stop a legitimate ``published`` repair. False here only
+    ever means "do not add the guard rail", never "generate more images".
+    """
+    from pipeline.admin.models import PipelineConfig  # noqa: PLC0415
+
+    try:
+        factory = admin_db.get_session_factory()
+        with factory() as session:
+            brand = (
+                session.query(Brand).filter(Brand.slug == brand_slug).one_or_none()
+            )
+            if brand is None:
+                return False
+            cfg = session.get(PipelineConfig, brand.id)
+            return bool(getattr(cfg, "images_on_demand", False)) if cfg else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _warn_on_demand(brand_slug: str, *, apply: bool, override: bool) -> None:
+    """Print the guard-rail banner for a drafts pass under cover-on-demand."""
+    print(
+        f"\n{'!' * 72}\n"
+        f"!! {brand_slug!r} has images_on_demand ON — the pipeline is deliberately\n"
+        "!! NOT generating covers, and the manager makes one for the draft they\n"
+        "!! actually pick. Every 'generate' row below is a cover this change\n"
+        "!! decided not to buy. Sweeping them all is the cost change undone.\n"
+        "!!\n"
+        "!! Legitimate use: a batch of drafts stranded from BEFORE the flag was\n"
+        "!! turned on. If that is not what you are looking at, stop.\n"
+        f"{'!' * 72}"
+    )
+    if apply and not override:
+        print(
+            "\nREFUSING to --apply the drafts pass while images_on_demand is ON.\n"
+            "Re-run with --override-images-on-demand if you mean it.\n"
+            "(The published pass is unaffected and still runs.)"
         )
 
 
@@ -390,11 +441,21 @@ async def _apply_group(client: SanityClient, group: TopicGroup) -> str:
     return f"generated {asset_id} for {len(targets)} doc(s)"
 
 
-async def _run_target(client: SanityClient, target: Target, apply: bool) -> tuple[int, int]:
-    """One pass over one target. Returns ``(repaired, total)`` topic counts."""
+async def _run_target(
+    client: SanityClient,
+    target: Target,
+    apply: bool,
+    *,
+    blocked: bool = False,
+) -> tuple[int, int]:
+    """One pass over one target. Returns ``(repaired, total)`` topic counts.
+
+    ``blocked`` (NTS_094) still lists the candidates — seeing what WOULD be
+    generated is the point of the warning — but writes nothing.
+    """
     groups = await find_candidates(client, target)
     print_table(groups, target)
-    if not groups or not apply:
+    if not groups or not apply or blocked:
         return 0, len(groups)
 
     print(f"\nApplying cover-image backfill [{target.name}]...")
@@ -426,14 +487,32 @@ def _resolve_targets(name: str) -> list[Target]:
 
 
 async def _run(
-    client: SanityClient, apply: bool, target: str = "published"
+    client: SanityClient,
+    apply: bool,
+    target: str = "published",
+    *,
+    brand_slug: str = "icon",
+    images_on_demand: bool = False,
+    override_on_demand: bool = False,
 ) -> int:
     ok = total = 0
+    refused = False
     for t in _resolve_targets(target):
-        t_ok, t_total = await _run_target(client, t, apply)
+        # NTS_094 — only the drafts pass is guarded. A PUBLISHED article with
+        # no cover is damage on the live site whatever the pipeline does.
+        guarded = images_on_demand and t.name == "drafts"
+        if guarded:
+            _warn_on_demand(brand_slug, apply=apply, override=override_on_demand)
+        blocked = guarded and apply and not override_on_demand
+        refused = refused or blocked
+        t_ok, t_total = await _run_target(client, t, apply, blocked=blocked)
         ok += t_ok
         total += t_total
 
+    if refused:
+        # Non-zero: a scheduled/scripted caller must not read "refused" as
+        # "nothing needed doing".
+        return 2
     if total == 0:
         return 0
     if not apply:
@@ -465,9 +544,27 @@ def main() -> int:
         action="store_true",
         help="actually generate + patch coverImage (default is dry-run)",
     )
+    parser.add_argument(
+        "--override-images-on-demand",
+        action="store_true",
+        help=(
+            "NTS_094: allow --apply on the drafts pass even though the brand "
+            "generates covers on demand. Only for drafts stranded from before "
+            "the flag was turned on — otherwise this undoes the cost change"
+        ),
+    )
     args = parser.parse_args()
     client = _build_sanity_client(args.brand_slug)
-    return asyncio.run(_run(client, apply=args.apply, target=args.target))
+    return asyncio.run(
+        _run(
+            client,
+            apply=args.apply,
+            target=args.target,
+            brand_slug=args.brand_slug,
+            images_on_demand=_images_on_demand(args.brand_slug),
+            override_on_demand=args.override_images_on_demand,
+        )
+    )
 
 
 if __name__ == "__main__":
