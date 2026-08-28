@@ -271,7 +271,12 @@ async def run_intake(
         BrandNotReadyError,
         get_brand,
     )
-    from pipeline.admin.cost_recorder import CostContext, cost_context
+    from pipeline.admin.cost_recorder import (
+        CostContext,
+        attach_candidate,
+        collect_cost_rows,
+        cost_context,
+    )
 
     configure_logging()
 
@@ -412,27 +417,35 @@ async def run_intake(
             stats.bump(input_kind, "fetched", len(items))
 
             for item in items:
-                await _process_item(
-                    item=item,
-                    input_kind=input_kind,
-                    source_record=source_record,
-                    brand_id_fk=brand_id_fk,
-                    stats=stats,
-                    seen=seen,
-                    rules=rules,
-                    dedup_config=dedup_config,
-                    caps=caps,
-                    template=template,
-                    services_block=services_block,
-                    tiers_block=tiers_block,
-                    allowed_service_keys=allowed_service_keys,
-                    recent_titles=recent_titles,
-                    guard_model=guard_model,
-                    ttl_config=ttl_config,
-                    brand_timezone=brand_timezone,
-                    now=now,
-                    embed=embed,
-                )
+                # NTS_106 §3 — the guard completion and the embedding are paid
+                # for while deciding *whether* this candidate should exist, so
+                # neither call can name it. Collect the rows, then charge them
+                # to the row that came out. Without this the per-candidate
+                # ceiling is not merely unenforced, it is not computable.
+                with collect_cost_rows() as cost_rows:
+                    candidate_id = await _process_item(
+                        item=item,
+                        input_kind=input_kind,
+                        source_record=source_record,
+                        brand_id_fk=brand_id_fk,
+                        stats=stats,
+                        seen=seen,
+                        rules=rules,
+                        dedup_config=dedup_config,
+                        caps=caps,
+                        template=template,
+                        services_block=services_block,
+                        tiers_block=tiers_block,
+                        allowed_service_keys=allowed_service_keys,
+                        recent_titles=recent_titles,
+                        guard_model=guard_model,
+                        ttl_config=ttl_config,
+                        brand_timezone=brand_timezone,
+                        now=now,
+                        embed=embed,
+                    )
+                if candidate_id is not None:
+                    attach_candidate(cost_rows, candidate_id)
 
             log_lines.append(
                 f"source {source_record.name} [{input_kind}]: "
@@ -479,7 +492,13 @@ async def _process_item(
     brand_timezone: str | None,
     now: datetime,
     embed,
-) -> None:
+) -> int | None:
+    """Judge and store one feed item. Returns the candidate id it wrote.
+
+    ``None`` means no row was written — the item was dropped by dedup or the
+    prefilter, or the guard deferred. The caller uses the id to charge this
+    item's cost rows to the candidate (NTS_106 §3).
+    """
     """One feed item through the funnel. Never raises — one bad item is one
     item, and an exception here would take the rest of the feed with it."""
     url = str(item.url) if item.url else None
@@ -497,7 +516,7 @@ async def _process_item(
             stats.dedup_windows["run_title"] = (
                 stats.dedup_windows.get("run_title", 0) + 1
             )
-            return
+            return None
 
     try:
         embedding = np.asarray(
@@ -511,7 +530,7 @@ async def _process_item(
         # why this one did not.
         stats.embed_failures += 1
         log.warning("intake.embed_failed", topic=topic_id, err=str(exc))
-        return
+        return None
 
     pre = check_pre_guard(
         brand_id_fk=brand_id_fk,
@@ -533,7 +552,7 @@ async def _process_item(
             matched=pre.matched_candidate_id,
             sim=round(pre.similarity, 3),
         )
-        return
+        return None
     stats.bump(input_kind, "after_dedup")
     seen.append(_SeenItem(topic_id, title_norm, embedding))
 
@@ -556,7 +575,7 @@ async def _process_item(
             reason=reason,
             detail=decision.detail,
         )
-        return
+        return None
     stats.bump(input_kind, "after_prefilter")
 
     # --- guard (NTS_099 §2-§3)
@@ -584,12 +603,12 @@ async def _process_item(
             stats.reason_codes.get("guard_error", 0) + 1
         )
         log.warning("intake.guard_error", topic=topic_id, err=str(exc))
-        return
+        return None
     except GuardDeferred as exc:
         # NTS_106 §1: not judged, replayed by the next intake.
         stats.bump(input_kind, "deferred")
         log.warning("intake.guard_deferred", topic=topic_id, err=str(exc))
-        return
+        return None
 
     stats.bump(input_kind, "guarded")
     stats.reason_codes[verdict.reason_code] = (
@@ -616,7 +635,7 @@ async def _process_item(
                 matched=post.matched_candidate_id,
                 sim=round(post.similarity, 3),
             )
-            return
+            return None
         if post.action == "supersede":
             supersedes_id = post.matched_candidate_id
 
@@ -707,6 +726,7 @@ async def _process_item(
         cap_overflow=cap_overflow,
         supersedes=supersedes_id,
     )
+    return candidate_id
 
 
 # --- CLI ------------------------------------------------------------------

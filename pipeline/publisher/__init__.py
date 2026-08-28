@@ -1,15 +1,21 @@
 """Publishers: write content to the right downstream system.
 
-* ``sanity``       — primary publisher (Wave 1+; ADR-018). Writes drafts
-                     to the existing Sanity CMS at www.iconfinance.io.
-* ``telegram_bot`` — Telegram Bot API client. Used by the monitoring
-                     alerter (NTS_073); also the Wave 3 channel publisher.
-* ``meta_graph``   — Facebook pages + Instagram Business (Wave 2).
+* ``sanity``       — the publisher. Writes drafts to the Sanity CMS behind
+                     www.iconfinance.io (ADR-018).
+* ``telegram_bot`` — Telegram Bot API client. **Live, but as monitoring**: the
+                     alerter (NTS_073) is its only caller.
 
-The Directus writer + channel dispatcher were removed in NTS_076 (dead
-since the ADR-018 Sanity pivot).
+Removed rather than kept as "Wave 2/3 groundwork" (NTS_121 §7): ``meta_graph``
+(Facebook Pages + Instagram Business), the whole ``pipeline.adapter`` package
+of per-channel post formatters, and ``pipeline.queue`` (publish queue, publish
+windows, rate limit). None of them had a caller after the ADR-018 pivot to
+Sanity — only their own tests — and code that nothing calls does not stay warm,
+it stays wrong: the socials waves, if they return, return against a schema and
+an API that will have moved.
+
+The Directus writer + channel dispatcher were removed earlier, in NTS_076.
 """
 
-from .sanity import SanityClient, SanityPublisher, SanityPostInput
+from .sanity import SanityClient, SanityPostInput, SanityPublisher
 
-__all__ = ["SanityClient", "SanityPublisher", "SanityPostInput"]
+__all__ = ["SanityClient", "SanityPostInput", "SanityPublisher"]

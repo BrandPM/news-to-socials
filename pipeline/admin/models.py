@@ -248,6 +248,18 @@ class PipelineConfig(Base):
         ForeignKey("brands.id", ondelete="RESTRICT"),
         primary_key=True,
     )
+    # --- v2 legacy, read-only (NTS_099: scoring was demoted to the free
+    # prefilter, so neither key steers anything in the v3 contour).
+    #
+    # ``scoring_threshold`` is still read by ``pipeline.run`` (v2 ``min_score``)
+    # and by ``POST /topics/simulate``, so it is legacy, not dead.
+    #
+    # ``topics_per_run`` has **no consumer at all**: the v2 per-source limit
+    # comes from the CLI ``--limit``, and nothing in the pipeline reads this
+    # column. It survives only because the deployed Settings form posts it, and
+    # dropping the column mid-shadow-week would break the one screen Andriy
+    # needs in order to flip ``intake_enabled``. Orphan column, drop after v2
+    # off (NTS_121 §2).
     scoring_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
     topics_per_run: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     # NTS_089 — a pending draft whose display_date is older than this many
@@ -565,6 +577,17 @@ class CostRecord(Base):
         ForeignKey("topics.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # NTS_106 §3 — the candidate this money was spent on. Without it
+    # ``max_cost_per_candidate_usd`` is not a limit but a number in a form:
+    # ``topic_id`` only ever exists on the v2 path, so on the v3 path every
+    # paid row was brand-and-run-scoped and nothing more. Migration 025.
+    # ON DELETE SET NULL for the same reason as ``run_id``: deleting the
+    # candidate must not lose the historical spend, only detach it.
+    candidate_id_fk: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
     provider: Mapped[str] = mapped_column(String, nullable=False)
     operation: Mapped[str] = mapped_column(String, nullable=False)
@@ -582,10 +605,28 @@ class CostRecord(Base):
         Index("ix_cost_records_run_id", "run_id"),
         Index("ix_cost_records_topic_id", "topic_id"),
         Index("ix_cost_records_draft_id", "draft_id"),
+        Index("ix_cost_records_candidate", "candidate_id_fk"),
     )
 
 
 class Topic(Base):
+    """**v2 legacy, read-only.** Per-topic outcomes of a v2 generation run.
+
+    The only writer is ``AdminConfigClient.record_topic_result``, and the only
+    caller of that is ``pipeline.run`` — the v2 generation path, gated behind
+    ``v2_generation_enabled`` (OFF since 2026-08-28). While the flag is off no
+    new row appears here.
+
+    NTS_098 §6 settles its fate: the table stays until v2 is switched off, then
+    becomes a read-only archive. The v3 equivalent is ``candidates``, which is
+    not a duplicate of this — a Topic is one item of one run, a Candidate is a
+    self-contained portfolio entry that outlives its feed item.
+
+    Still read, so do NOT drop it: ``GET /runs/{id}`` (history),
+    ``POST /topics/simulate``, the delete guards in ``/sources`` and
+    ``/brands``, and ``purge_draft_local_refs``.
+    """
+
     __tablename__ = "topics"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -789,7 +830,15 @@ class TopicEmbedding(Base):
 
 
 class DedupLog(Base):
-    """Calibration dataset for dedup (NTS_090) — Telegram alone isn't enough.
+    """**v2 legacy, read-only.** Calibration dataset for v2 dedup (NTS_090).
+
+    Written only by ``dedup_service.DedupEngine`` on the v2 path. The v3
+    deduper (``selector.candidate_dedup``, three windows per NTS_098 §3) does
+    NOT write here: its calibration data is ``candidates.reason_code`` plus the
+    dedup history the Portfolio card renders. Read by nothing but
+    ``scripts/tune_dedup.py``.
+
+    Original rationale below.
 
     One row per dedup decision that mattered: a ``skipped`` duplicate or a
     ``yellow``-zone near-miss (0.75–threshold, NOT skipped). After a week of
@@ -822,7 +871,14 @@ class DedupLog(Base):
 
 
 class DraftScore(Base):
-    """LLM-as-judge score for one draft in one language (NTS_091).
+    """**v2 legacy, read-only.** LLM-as-judge score per draft+language (NTS_091).
+
+    Written by ``judge.score_draft``, whose only caller is ``pipeline.run`` —
+    so no new row appears while ``v2_generation_enabled`` is off. Still read by
+    ``GET /eval/summary`` and the drafts list. NTS_114 S10 puts the judge into
+    the real v3 cycle (NTS_080); until then this is history.
+
+    Original rationale below.
 
     Written automatically after EN generation + each translation. EN gets the
     FULL rubric (factuality, specificity, voice_match, structure,
@@ -1015,6 +1071,13 @@ class Candidate(Base):
     doc_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
     doc_match: Mapped[str | None] = mapped_column(String, nullable=True)
     doc_language_expected: Mapped[str | None] = mapped_column(String, nullable=True)
+    # NTS_101 §2-7 / NTS_114 S5 — JSON array of the section labels the
+    # extraction actually read ("art. 4", "annex II"). This is the last link of
+    # the traceability chain: from a published article, through the candidate,
+    # to the parts of the document the numbers came from. **Writer arrives in
+    # S5**; migration 025 puts the column in so the chain is complete in the
+    # schema before the fetcher exists (NTS_121 §3).
+    doc_sections_used: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # --- lifecycle (NTS_098 §2)
     status: Mapped[str] = mapped_column(
@@ -1161,4 +1224,68 @@ class BrandTaxonomy(Base):
 
     __table_args__ = (
         UniqueConstraint("brand_id_fk", "key", name="uq_brand_taxonomy_brand_key"),
+    )
+
+
+class FactPack(Base):
+    """The material an article was built on, kept (NTS_096 part A).
+
+    Before this table the research pack was parsed, used and thrown away. The
+    consequence, recorded in NTS_096: reconstructing the line-by-line
+    provenance of one published article required a **new paid research call**,
+    and it still came back with a different set of sources — so the question
+    "where did this number come from" had no answer at all.
+
+    One row per research call, **including calls for topics that never
+    publish**: a pack that only survives successful articles cannot explain why
+    the others came out thin.
+
+    ``candidate_id_fk`` is nullable on purpose and will stay NULL until the S4
+    production path hands a candidate to the generator — on the v2 path there
+    is no candidate to point at. ``sanity_draft_id`` is the article side of the
+    same chain, ``primary_doc_url`` + ``doc_sections_used`` the document side.
+    Together with ``candidates`` they are the through-line NTS_121 §6 asks for:
+    published article → draft → candidate → document → sections.
+
+    ``doc_text`` holds the **extracted** text, never the source PDF
+    (NTS_096 §Риски — storage volume).
+    """
+
+    __tablename__ = "fact_packs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=False
+    )
+    # RESTRICT would block the rejected-candidate prune (NTS_098 §2) on any
+    # candidate that ever got a pack; SET NULL keeps the pack and the audit.
+    candidate_id_fk: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("candidates.id", ondelete="SET NULL"), nullable=True
+    )
+    # The v2 identifier for the same thing, so packs written before S4 are not
+    # orphans: ``topics.topic_id``, not ``topics.id``.
+    topic_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    sanity_draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Parsed pack as JSON-as-TEXT — never the raw provider dump (NTS_096).
+    pack: Mapped[str] = mapped_column(Text, nullable=False)
+    sources: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
+    primary_doc_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    doc_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    doc_sections_used: Mapped[str | None] = mapped_column(Text, nullable=True)
+    doc_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(String, nullable=True)
+    cost_usd: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_fact_packs_candidate", "candidate_id_fk"),
+        Index("ix_fact_packs_draft", "sanity_draft_id"),
+        Index("ix_fact_packs_topic", "topic_id"),
+        Index("ix_fact_packs_brand_created", "brand_id_fk", "created_at"),
     )

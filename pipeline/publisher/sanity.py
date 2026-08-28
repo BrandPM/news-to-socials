@@ -43,7 +43,7 @@ import httpx
 from ..common.config import get_settings
 from ..common.display_date import compute_published_at
 from ..common.logging import get_logger
-from ..common.models import Channel, Draft, Language, Post
+from ..common.models import Draft, Language
 from ..common.retry import with_retry
 from ..common.slug import compute_slug
 
@@ -578,47 +578,3 @@ class SanityPublisher:
         """Upload an image, return its asset _id."""
         asset = await self.client.upload_image(image_bytes, filename)
         return str(asset["_id"])
-
-
-# --- Adapter to legacy publisher.Post object -------------------------------
-
-
-async def publish_post_object(post: Post, draft: Draft, source_url: str) -> str:
-    """Bridge between the legacy ``Post``/``Draft`` model (channel=blog)
-    and Sanity.
-
-    Currently used only for the blog channel; for Telegram / FB / IG the
-    existing publishers in ``pipeline/publisher/`` are unchanged.
-    """
-    if post.channel is not Channel.blog:
-        raise ValueError(f"SanityPublisher only supports blog, got {post.channel}")
-
-    sanity = SanityPublisher()
-
-    # If we already have an image_url it's from Replicate. Upload to Sanity.
-    cover_asset_id = None
-    if draft.image_url:
-        import httpx as _httpx
-
-        async with _httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(str(draft.image_url))
-            resp.raise_for_status()
-            cover_asset_id = await sanity.upload_cover_image(
-                resp.content, filename=f"{draft.topic_id}.png"
-            )
-
-    # For Icon, infer category from the topic if not supplied. Fallback "special".
-    category = "special"  # Will be overridden by run_pipeline once it loads brand config.
-
-    inp = SanityPostInput(
-        title=draft.title,
-        body_markdown=draft.body,
-        language=draft.language,
-        category=category,
-        source_url=source_url,
-        topic_id=draft.topic_id,
-        key_takeaway=draft.key_takeaway,
-        cover_image_asset_id=cover_asset_id,
-        cover_image_alt=draft.image_alt,
-    )
-    return await sanity.publish_draft(inp)

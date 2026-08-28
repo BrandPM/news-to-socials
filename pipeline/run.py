@@ -34,6 +34,7 @@ import asyncio
 import hashlib
 import json
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -69,6 +70,8 @@ from pipeline.publisher.sanity import (
     SanityPostInput,
     SanityPublisher,
 )
+from pipeline.generator.fact_pack_store import persist_fact_pack
+from pipeline.selector.candidate_lifecycle import link_candidate_to_draft
 from pipeline.selector.dedup import extract_entities
 from pipeline.admin.judge import score_draft
 from pipeline.selector.dedup_service import (
@@ -417,6 +420,68 @@ async def build_fact_pack_for_topic(
     from pipeline.generator.research import build_fact_pack  # noqa: PLC0415
 
     return await build_fact_pack(topic, budget=budget)
+
+
+def _fact_pack_as_dict(pack: FactPack | None) -> dict[str, object]:
+    """The pack as stored: parsed claims, not the provider's raw dump.
+
+    A failed or empty research call still produces a row — with
+    ``empty: true`` — because "the pack was empty" and "no research ran" are
+    different answers to "why is this article thin" (NTS_096).
+    """
+    if pack is None:
+        return {"empty": True, "reason": "no_fact_pack"}
+
+    def _facts(items: Sequence[Any]) -> list[dict[str, str]]:
+        return [
+            {
+                "text": f.text,
+                "url": f.url,
+                "publisher": f.publisher,
+                "date": f.date,
+            }
+            for f in items
+        ]
+
+    return {
+        "empty": pack.is_empty(),
+        "source_facts": _facts(pack.source_facts),
+        "context": _facts(pack.context),
+        "angle_hints": list(pack.angle_hints),
+        "citations": list(pack.citations),
+        "searches": pack.searches,
+        "fact_count": pack.fact_count,
+    }
+
+
+def _attach_fact_pack_to_draft(fact_pack_id: int, draft_id: str) -> None:
+    """Point a stored pack at the article it became.
+
+    Written after the draft exists rather than before, because the Sanity id is
+    only known then — the same ordering problem the intake has with cost rows.
+    Best-effort: a missing back-reference costs one row of traceability, and the
+    pack is still reachable by ``topic_id``.
+    """
+    try:
+        from sqlalchemy import update
+
+        from pipeline.admin.db import get_session_factory
+        from pipeline.admin.models import FactPack as FactPackRow
+
+        with get_session_factory()() as session:
+            session.execute(
+                update(FactPackRow)
+                .where(FactPackRow.id == fact_pack_id)
+                .values(sanity_draft_id=draft_id)
+            )
+            session.commit()
+    except Exception as exc:
+        log.warning(
+            "fact_pack.attach_draft_failed",
+            fact_pack_id=fact_pack_id,
+            draft_id=draft_id,
+            err=str(exc),
+        )
 
 
 async def generate_draft_for_language(
@@ -807,6 +872,22 @@ async def _process_source(
                 citations=len(fact_pack.citations),
             )
 
+        # ---- FACT PACK PERSISTENCE (NTS_096 part A). Written for every
+        # research call, including the ones that produced nothing and the ones
+        # whose topic never publishes: a store that only keeps packs behind
+        # published articles cannot answer why the rest came out thin. Before
+        # this the pack was parsed, used and dropped, and reconstructing the
+        # provenance of one article cost a new paid research call that came back
+        # with a different set of sources.
+        fact_pack_id = persist_fact_pack(
+            brand_id_fk=brand_id_fk,
+            candidate_id=topic.candidate_id,
+            topic_id=topic.id,
+            pack=_fact_pack_as_dict(fact_pack),
+            sources=tuple(fact_pack.citations) if fact_pack else (),
+            model=fact_pack.model if fact_pack else None,
+        )
+
         # ---- CATEGORY: language-agnostic; once per topic.
         try:
             category = await assign_category(topic.raw, brand)
@@ -918,6 +999,20 @@ async def _process_source(
                     )
                 else:
                     draft_id = await sanity_publisher.publish_draft(post)
+                    # NTS_098 §1 — the ONE moment both ids exist. Only the
+                    # canonical EN draft is linked: a candidate has one
+                    # ``sanity_draft_id``, and NTS_065 makes EN the canon the
+                    # translations hang off. ``candidate_id`` is None on the v2
+                    # path (no candidate exists), which is exactly the state
+                    # that left 337 production candidates with no draft link.
+                    if topic.candidate_id is not None and language == Language.en:
+                        link_candidate_to_draft(
+                            candidate_id=topic.candidate_id,
+                            sanity_draft_id=draft_id,
+                            brand_id_fk=brand_id_fk,
+                        )
+                    if fact_pack_id is not None and language == Language.en:
+                        _attach_fact_pack_to_draft(fact_pack_id, draft_id)
                     results.append(
                         {
                             "topic_id": topic.id,

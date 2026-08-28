@@ -214,6 +214,131 @@ def _upsert_approval(
         return row
 
 
+def _log_review_decision(
+    *,
+    brand_id: int,
+    candidate_id: int,
+    action: str,
+    comment: str | None,
+    reviewer: str = "admin",
+) -> None:
+    """One ``review_decisions`` row per editor action on a linked draft.
+
+    NTS_113 calls that table the only free signal for tuning the rubric and the
+    rank weights, and NTS_114's acceptance metric ("время ревью на статью
+    ≤ 25 мин") is computed from it. Before this, only the *candidate*
+    endpoints wrote it — approve and reject on a *draft*, which is where the
+    editor actually spends the time, wrote nothing.
+
+    Conditional on a candidate link by design: the 137 approval rows on
+    production predate the portfolio, and inventing a candidate for them would
+    poison the one dataset the rubric is tuned against. Never raises — an audit
+    row is not worth failing a publish over.
+    """
+    try:
+        from pipeline.admin.models import ReviewDecision
+
+        with session_scope() as session:
+            session.add(
+                ReviewDecision(
+                    brand_id_fk=brand_id,
+                    candidate_id_fk=candidate_id,
+                    action=action,
+                    scope="draft",
+                    comment=comment,
+                    reviewer=reviewer,
+                    at=datetime.now(tz=timezone.utc),
+                )
+            )
+            session.commit()
+    except Exception as exc:
+        log.warning(
+            "review_decision.write_failed",
+            candidate_id=candidate_id,
+            action=action,
+            err=f"{type(exc).__name__}: {exc!s}",
+        )
+
+
+def _advance_candidate_on_approve(
+    *, sanity_draft_id: str, brand_id: int, note: str | None
+) -> None:
+    """Walk the linked candidate ``drafted → ready → published`` (NTS_098 §2).
+
+    Two steps, in this order and not merged, because they answer different
+    questions: :func:`assign_publication_slot` decides *when* the article goes
+    out (slot arithmetic in the brand's timezone), and
+    :func:`mark_published_if_approved` only agrees that it *has* gone out once
+    ``draft_approvals.published_at`` says so. An approve whose Sanity promote
+    failed therefore stops at ``ready`` — visible in Публикации, waiting for
+    the retry — instead of claiming a publication that never happened.
+
+    No-op for an unlinked v2 draft.
+    """
+    from pipeline.selector import candidate_lifecycle as lifecycle
+
+    candidate_id = lifecycle.candidate_for_draft(sanity_draft_id, brand_id)
+    if candidate_id is None:
+        return
+    lifecycle.assign_publication_slot(
+        candidate_id=candidate_id, brand_id_fk=brand_id
+    )
+    lifecycle.mark_published_if_approved(
+        candidate_id=candidate_id, brand_id_fk=brand_id
+    )
+    _log_review_decision(
+        brand_id=brand_id,
+        candidate_id=candidate_id,
+        action="approve",
+        comment=note,
+    )
+
+
+def _reject_candidate_for_draft(
+    *, sanity_draft_id: str, brand_id: int, note: str | None
+) -> None:
+    """Mirror a draft rejection onto its candidate. No-op when unlinked."""
+    from pipeline.selector import candidate_lifecycle as lifecycle
+
+    candidate_id = lifecycle.candidate_for_draft(sanity_draft_id, brand_id)
+    if candidate_id is None:
+        return
+    lifecycle.mark_candidate_rejected(
+        candidate_id=candidate_id, brand_id_fk=brand_id, reason=note
+    )
+    _log_review_decision(
+        brand_id=brand_id,
+        candidate_id=candidate_id,
+        action="reject",
+        comment=note,
+    )
+
+
+def _return_candidate_for_draft(
+    *, sanity_draft_id: str, brand_id: int
+) -> None:
+    """Restore ("unreject") hands the article back to the editor.
+
+    NTS_098 §2's ``returned`` is exactly that state, and it releases the
+    publication slot: a slot held by something nobody approved makes the
+    calendar in Публикации wrong. No-op when unlinked.
+    """
+    from pipeline.selector import candidate_lifecycle as lifecycle
+
+    candidate_id = lifecycle.candidate_for_draft(sanity_draft_id, brand_id)
+    if candidate_id is None:
+        return
+    lifecycle.return_candidate_to_editor(
+        candidate_id=candidate_id, brand_id_fk=brand_id
+    )
+    _log_review_decision(
+        brand_id=brand_id,
+        candidate_id=candidate_id,
+        action="return",
+        comment="restored from rejected",
+    )
+
+
 def _ensure_brand_owns_draft(brand_id: int) -> Brand:
     """Returns the brand row or raises 404. Brand-scope guard for mutations."""
     with session_scope() as session:
@@ -1074,6 +1199,12 @@ async def approve_draft(
     row, _published_id, failure = await _publish_one_draft(
         normalised, brand_id, payload.note
     )
+    # Runs on both branches: a Sanity failure still leaves an approved local
+    # row, and the candidate must reach ``ready`` with a slot so the retry has
+    # somewhere to land (NTS_098 §2 — ``published`` waits for the stamp).
+    _advance_candidate_on_approve(
+        sanity_draft_id=normalised, brand_id=brand_id, note=payload.note
+    )
     if failure is not None:
         # Approval is recorded; surface the publish failure as 502 so
         # the UI can show "approved, publish pending" with detail.
@@ -1214,6 +1345,14 @@ async def approve_all_siblings(
 
         _row, published_id, failure = await _publish_one_draft(
             draft_id, brand_id, None, published_at=shared_published_at
+        )
+        # Only the EN canon carries the candidate link (NTS_065: a candidate
+        # has one ``sanity_draft_id``), so this is a no-op on the siblings —
+        # but it has to be here rather than only on the single-draft path, or a
+        # batch approve would publish the article and leave the candidate at
+        # ``drafted`` with no slot.
+        _advance_candidate_on_approve(
+            sanity_draft_id=draft_id, brand_id=brand_id, note=None
         )
         if failure is not None:
             fail += 1
@@ -1359,6 +1498,9 @@ async def reject_draft(
     _ensure_brand_owns_draft(brand_id)
     normalised = _normalise_draft_id(sanity_draft_id)
     row = _upsert_approval(normalised, brand_id, "rejected", payload.note)
+    _reject_candidate_for_draft(
+        sanity_draft_id=normalised, brand_id=brand_id, note=payload.note
+    )
 
     settings = get_settings()
     sanity_client, _ = _build_sanity_client_for_brand(brand_id)
@@ -1418,6 +1560,7 @@ async def unreject_draft(
     # Reset the DB row to ``draft`` so audit history is preserved (the
     # row stays, ``decided_at`` updates) but the tab logic flips.
     row = _upsert_approval(normalised, brand_id, "draft", None)
+    _return_candidate_for_draft(sanity_draft_id=normalised, brand_id=brand_id)
 
     sanity_client, _ = _build_sanity_client_for_brand(brand_id)
     try:

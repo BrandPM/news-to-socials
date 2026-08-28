@@ -8,7 +8,11 @@ Naming aligns with our Master Documentation §3 and §12 glossary:
 * RawItem — what a Source returns
 * Topic   — a RawItem that passed the relevance + dedup gate
 * Draft   — LLM output (title + body + key takeaway), pre-format
-* Post    — formatted under a specific channel
+
+``Post``/``PostStatus`` used to sit here as "formatted for one channel". Both
+were removed in NTS_121 §7 together with the per-channel adapters and the
+publish queue: after the ADR-018 pivot, a draft goes to Sanity and the manager
+publishes it — nothing formats a Post.
 """
 
 from __future__ import annotations
@@ -33,20 +37,19 @@ class Language(StrEnum):
 
 
 class Channel(StrEnum):
+    """Output surface. Only ``blog`` is reachable today.
+
+    The other three are kept because ``image_resizer.TARGETS`` still carries
+    their aspect ratios and a cover is generated once at master size — the
+    ratios are cheap, correct and referenced. The publishers behind them are
+    not: ``meta_graph``, ``pipeline.adapter`` and ``pipeline.queue`` were
+    removed in NTS_121 §7 as dead since the ADR-018 pivot to Sanity.
+    """
+
     blog = "blog"
     telegram = "telegram"
     facebook = "facebook"
     instagram = "instagram"
-
-
-class PostStatus(StrEnum):
-    draft = "draft"
-    pending_approval = "pending_approval"
-    approved = "approved"
-    scheduled = "scheduled"
-    published = "published"
-    failed = "failed"
-    rejected = "rejected"
 
 
 class RawItem(BaseModel):
@@ -72,6 +75,13 @@ class Topic(BaseModel):
     relevance_score: float = Field(ge=0.0, le=10.0)
     embedding: list[float] | None = None
     entities: list[str] = Field(default_factory=list)
+    # NTS_098 §1 — the portfolio row this topic is being produced for. The seam
+    # between contour 1 and generation: when the S4 production path selects a
+    # candidate it puts the id here, and the generator links the Sanity draft
+    # back to it the moment the draft exists (``candidate_lifecycle``). ``None``
+    # on the v2 path, where topics come straight off a feed and no candidate
+    # exists — which is why 337 candidates had zero draft links.
+    candidate_id: int | None = None
 
 
 class Draft(BaseModel):
@@ -87,17 +97,3 @@ class Draft(BaseModel):
     # populated after image generation
     image_url: HttpUrl | None = None
     image_alt: str = ""
-
-
-class Post(BaseModel):
-    """Channel-ready post. One Draft → many Posts (one per channel)."""
-
-    draft_id: str
-    brand_id: str
-    language: Language
-    channel: Channel
-    content: str
-    image_url: HttpUrl | None = None
-    status: PostStatus = PostStatus.draft
-    external_post_id: str | None = None
-    scheduled_at: datetime | None = None
