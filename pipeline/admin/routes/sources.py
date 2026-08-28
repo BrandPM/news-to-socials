@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Header, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from pipeline.admin import jobs
@@ -18,6 +18,8 @@ from pipeline.admin.schemas import (
     SourceHealthOut,
     SourceIn,
     SourceOut,
+    SourceRegistryOut,
+    SourceRegistryUpdate,
     SourceTestOut,
     SourceUpdate,
 )
@@ -83,6 +85,129 @@ def create_source(payload: SourceIn) -> SourceOut:
         return SourceOut.model_validate(src)
 
 
+# --- v3 registry view (NTS_111 §Источники, NTS_101 §1) --------------------
+
+
+@router.get("/registry", response_model=list[SourceRegistryOut])
+def sources_registry(brand_id: int, days: int = 7) -> list[SourceRegistryOut]:
+    """One row per source with everything the Sources screen shows.
+
+    Assembled server-side because the screen's columns are four different
+    queries per source (health series, candidate counts, accepted counts,
+    document-find share) and doing that from the browser would be N+1 over the
+    wire for a table the operator opens to answer "what is broken".
+
+    ``health`` is one entry per day, newest last: ``True`` all fetches
+    succeeded, ``False`` at least one failed, ``None`` no fetch that day. The
+    three-state answer matters — a gap is not a success, and rendering it as
+    one is how a source that stopped being polled looks healthy.
+
+    ``doc_find_share`` stays ``None`` until S5 writes ``primary_doc_url`` for
+    ``news`` items (NTS_101 §2-7). A hard 0.0 would read as "this source never
+    finds documents" rather than "not measured yet".
+    """
+    from datetime import timedelta
+
+    from pipeline.admin.models import Candidate
+
+    days = max(1, min(90, days))
+    now = datetime.now(tz=UTC)
+    cutoff = now - timedelta(days=days)
+    month_cutoff = now - timedelta(days=30)
+
+    with session_scope() as session:
+        rows = list(
+            session.scalars(
+                select(Source)
+                .where(Source.brand_id_fk == brand_id)
+                .order_by(Source.source_role.desc(), Source.name)
+            )
+        )
+        out: list[SourceRegistryOut] = []
+        for src in rows:
+            health_rows = list(
+                session.scalars(
+                    select(SourceHealthRecord)
+                    .where(
+                        SourceHealthRecord.source_id == src.id,
+                        SourceHealthRecord.fetched_at >= cutoff,
+                    )
+                    .order_by(SourceHealthRecord.fetched_at.asc())
+                )
+            )
+            per_day: dict[str, list[bool]] = {}
+            for record in health_rows:
+                per_day.setdefault(
+                    record.fetched_at.date().isoformat(), []
+                ).append(bool(record.success))
+            health: list[bool | None] = []
+            for offset in range(days):
+                key = (now - timedelta(days=days - 1 - offset)).date().isoformat()
+                results = per_day.get(key)
+                health.append(all(results) if results else None)
+
+            total = len(health_rows)
+            succeeded = sum(1 for r in health_rows if r.success)
+            last_error: str | None = None
+            for record in reversed(health_rows):
+                if not record.success and record.error_msg:
+                    last_error = record.error_msg
+                    break
+
+            candidates_30d = int(
+                session.execute(
+                    select(func.count(Candidate.id)).where(
+                        Candidate.source_id_fk == src.id,
+                        Candidate.created_at >= month_cutoff,
+                    )
+                ).scalar()
+                or 0
+            )
+            accepted_30d = int(
+                session.execute(
+                    select(func.count(Candidate.id)).where(
+                        Candidate.source_id_fk == src.id,
+                        Candidate.verdict == "accept",
+                        Candidate.created_at >= month_cutoff,
+                    )
+                ).scalar()
+                or 0
+            )
+            with_doc = int(
+                session.execute(
+                    select(func.count(Candidate.id)).where(
+                        Candidate.source_id_fk == src.id,
+                        Candidate.verdict == "accept",
+                        Candidate.primary_doc_url.is_not(None),
+                        Candidate.created_at >= month_cutoff,
+                    )
+                ).scalar()
+                or 0
+            )
+
+            record_out = SourceRegistryOut.model_validate(src)
+            record_out = record_out.model_copy(
+                update={
+                    "health": health,
+                    "success_rate_pct": (
+                        round(succeeded / total * 100.0, 1) if total else None
+                    ),
+                    "last_error": last_error,
+                    "candidates_30d": candidates_30d,
+                    "accepted_30d": accepted_30d,
+                    # Only meaningful for news: a primary_feed item IS the
+                    # document, so a share of 1.0 there would say nothing.
+                    "doc_find_share": (
+                        round(with_doc / accepted_30d, 3)
+                        if src.source_role == "news" and accepted_30d
+                        else None
+                    ),
+                }
+            )
+            out.append(record_out)
+        return out
+
+
 @router.get("/{source_id}", response_model=SourceOut)
 def get_source(source_id: int) -> SourceOut:
     with session_scope() as session:
@@ -103,7 +228,7 @@ def update_source(source_id: int, payload: SourceUpdate) -> SourceOut:
             data["url"] = str(data["url"])
         for k, v in data.items():
             setattr(src, k, v)
-        src.updated_at = datetime.now(tz=timezone.utc)
+        src.updated_at = datetime.now(tz=UTC)
         session.flush()
         return SourceOut.model_validate(src)
 
@@ -156,12 +281,12 @@ async def test_source(source_id: int, limit: int = 5) -> SourceTestOut:
             error=f"source_type={source_type!r} test-parse is only implemented for 'rss' in S1",
         )
 
-    from pipeline.sources.rss import RssSource  # noqa: PLC0415
+    from pipeline.sources.rss import RssSource
 
     try:
         rss = RssSource(source_id=str(source_id), name=source_name, url=url)
         items = list(await rss.fetch())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return SourceTestOut(
             parser_status="error", headlines=[], error=f"{type(exc).__name__}: {exc}"
         )
@@ -216,7 +341,7 @@ def run_all_sources(
     ``X-Triggered-By`` records run provenance (cron|manual|cli) for the
     audit trail — the cron systemd unit sets ``cron`` (NTS_056 Task 1).
     """
-    from pipeline.admin.models import Brand  # noqa: PLC0415
+    from pipeline.admin.models import Brand
 
     triggered_by = _resolve_triggered_by(x_triggered_by)
 
@@ -280,7 +405,7 @@ def source_health(
                 status_code=404, detail="source not found for that brand"
             )
 
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        cutoff = datetime.now(tz=UTC) - timedelta(days=days)
         rows = (
             session.query(SourceHealthRecord)
             .filter(
@@ -294,7 +419,7 @@ def source_health(
         # Bucket by UTC date.
         buckets: dict[str, dict[str, int]] = {}
         for i in range(days):
-            d = (datetime.now(tz=timezone.utc) - timedelta(days=days - 1 - i)).date()
+            d = (datetime.now(tz=UTC) - timedelta(days=days - 1 - i)).date()
             buckets[d.isoformat()] = {
                 "fetches": 0,
                 "success_count": 0,
@@ -342,3 +467,33 @@ def source_health(
             last_error=last_error,
             series=series,
         )
+
+
+@router.put("/{source_id}/registry", response_model=SourceRegistryOut)
+def update_source_registry(
+    source_id: int, brand_id: int, payload: SourceRegistryUpdate
+) -> SourceRegistryOut:
+    """Reclassify a source (role, class, licence, language, fetch method).
+
+    NTS_108's DoD wants a `license_class` on every source, and migration 020
+    started every pre-v3 feed at the most restrictive one. This is the endpoint
+    that moves them up — deliberately separate from the generic source PUT so
+    a licence change is a distinct, auditable action rather than a field in a
+    form that also renames the feed.
+    """
+    with session_scope() as session:
+        src = session.get(Source, source_id)
+        if src is None or src.brand_id_fk != brand_id:
+            raise HTTPException(status_code=404, detail="source not found")
+        for field, value in payload.model_dump(exclude_unset=True).items():
+            setattr(src, field, value)
+        src.updated_at = datetime.now(tz=UTC)
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            # The CHECK constraints from 020 are the real vocabulary; the
+            # schema Literals are the first line, this is the second.
+            raise HTTPException(
+                status_code=422, detail=f"invalid classification: {exc.orig}"
+            ) from exc
+        return SourceRegistryOut.model_validate(src)

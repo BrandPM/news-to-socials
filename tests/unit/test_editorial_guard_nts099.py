@@ -621,28 +621,88 @@ def test_sentinel_an_edit_saved_in_the_ui_is_what_the_next_run_renders(
     assert "- tier1: LI" in rendered
 
 
+def _activate_directly(brand_id: int, content: str) -> None:
+    """Put an active rubric row in place bypassing the API.
+
+    Since S3 the API refuses to *activate* an unrenderable body, so a broken
+    active row can now only arrive another way — a migration, a direct SQL
+    edit, an older client. The resolver still has to survive it, which is what
+    this helper sets up.
+    """
+    from sqlalchemy import update
+
+    from pipeline.admin.models import Prompt
+
+    with admin_db.get_session_factory()() as session:
+        session.execute(
+            update(Prompt)
+            .where(
+                Prompt.brand_id_fk == brand_id,
+                Prompt.prompt_type == "editorial_guard",
+            )
+            .values(is_active=False)
+        )
+        session.add(
+            Prompt(
+                brand_id_fk=brand_id,
+                prompt_type="editorial_guard",
+                version_name="broken, inserted directly",
+                content=content,
+                is_active=True,
+                created_by="test",
+            )
+        )
+        session.commit()
+
+
 def test_a_broken_placeholder_set_falls_back_to_the_constant(
     client_and_brand,
 ) -> None:
     """NTS_071 §2's failure, for the rubric: the operator's edit stops reaching
     production and the only evidence is a log line. So the fallback must be
     exercised — and must not raise mid-run."""
-    client, brand_id = client_and_brand
+    _client, brand_id = client_and_brand
 
     # (a) a required placeholder deleted
-    _create_and_activate(
-        client, brand_id, _GUARD_PROMPT.replace("{recent_accepted_titles}", "")
+    _activate_directly(
+        brand_id, _GUARD_PROMPT.replace("{recent_accepted_titles}", "")
     )
     template, source = resolve_guard_template(brand_id)
     assert source == "code"
     assert template == _GUARD_PROMPT
 
     # (b) an invented placeholder the pipeline cannot supply
-    _create_and_activate(
-        client, brand_id, _GUARD_PROMPT + "\nExtra: {my_new_field}\n"
-    )
+    _activate_directly(brand_id, _GUARD_PROMPT + "\nExtra: {my_new_field}\n")
     template, source = resolve_guard_template(brand_id)
     assert source == "code"
+
+
+def test_the_api_refuses_to_activate_a_rubric_that_would_not_apply(
+    client_and_brand,
+) -> None:
+    """Defence in depth for the same failure, one layer earlier: since S3 the
+    operator is told at activation time instead of discovering it from the next
+    run's output (NTS_063 pending, closed in S3)."""
+    client, brand_id = client_and_brand
+    created = client.post(
+        "/api/v1/prompts",
+        headers=AUTH,
+        json={
+            "brand_id": brand_id,
+            "prompt_type": "editorial_guard",
+            "version_name": "work in progress",
+            "content": _GUARD_PROMPT.replace("{services}", ""),
+        },
+    )
+    # Saving a draft is allowed — an unfinished edit is not an error.
+    assert created.status_code in (200, 201), created.text
+    refused = client.post(
+        f"/api/v1/prompts/{created.json()['id']}/activate", headers=AUTH
+    )
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["missing"] == ["services"]
+    # And nothing became active, so the run still resolves to the constant.
+    assert resolve_guard_template(brand_id) == (_GUARD_PROMPT, "code")
 
 
 def test_no_active_row_and_no_brand_both_resolve_to_the_constant(

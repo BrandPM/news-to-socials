@@ -463,6 +463,42 @@ _REQUIRED_PLACEHOLDERS: dict[str, set[str]] = {
 }
 
 
+# The full set each type renders with — i.e. what ``_resolve_template`` would
+# compute as ``allowed`` from its ``render_kwargs``. Stated here so the admin
+# API can validate an edit *before* saving it (NTS_063 pending, closed in S3)
+# instead of the operator finding out at run time that their prompt was
+# rejected. ``test_prompt_placeholder_validation_nts063`` asserts these match
+# the real kwargs at each call site — a drifted copy of this contract would be
+# invisible, because the symptom is a prompt that saves fine and never applies.
+_ALLOWED_PLACEHOLDERS: dict[str, set[str]] = {
+    "writer_draft": {
+        "voice_profile_yaml",
+        "title",
+        "url",
+        "summary",
+        "language",
+        "language_name",
+        "banned_phrases",
+        "fact_pack",
+    },
+    "writer_polish": {
+        "ai_tells",
+        "banned_phrases",
+        "good_examples",
+        "voice_principles",
+        "topics_relevant",
+        "draft_json",
+        "language_name",
+    },
+    "writer_translate": {
+        "draft_json",
+        "language_name",
+        "banned_phrases",
+        "good_examples",
+    },
+}
+
+
 def _bullet_list(items: list[str]) -> str:
     return "\n".join(f"  - {x}" for x in items)
 
@@ -473,8 +509,8 @@ def _record_openai_cost(resp: Any, *, model: str, operation: str) -> None:
     Safe to call with mocks: missing ``usage`` → cost is 0, row still
     written iff a brand context is active (otherwise no-op). NTS_025 C1.
     """
-    from pipeline.admin.cost_recorder import record_cost  # noqa: PLC0415
-    from pipeline.common.pricing import openai_cost  # noqa: PLC0415
+    from pipeline.admin.cost_recorder import record_cost
+    from pipeline.common.pricing import openai_cost
 
     usage = getattr(resp, "usage", None)
     tokens_in = getattr(usage, "prompt_tokens", None)
@@ -705,12 +741,12 @@ class CommentWriter:
         if self.brand_id_fk is None:
             return fallback
         try:
-            import string  # noqa: PLC0415
+            import string
 
-            from sqlalchemy import select  # noqa: PLC0415
+            from sqlalchemy import select
 
-            from pipeline.admin import db as admin_db  # noqa: PLC0415
-            from pipeline.admin.models import Prompt  # noqa: PLC0415
+            from pipeline.admin import db as admin_db
+            from pipeline.admin.models import Prompt
 
             factory = admin_db.get_session_factory()
             with factory() as session:
@@ -739,7 +775,7 @@ class CommentWriter:
                 )
                 return fallback
             return row.content
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.warning(
                 "comment_writer.db_prompt_resolve_failed",
                 prompt_type=prompt_type,
@@ -1041,6 +1077,6 @@ class CommentWriter:
             # title (leading ##, **bold**, backticks). Body keeps its markdown.
             obj.title = sanitize_title(obj.title)
             return obj
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.error("comment_writer.parse_failed", raw=text[:200], err=str(exc))
             return _DraftJSON(title="(parse failed)", body=text[:800], key_takeaway="")

@@ -46,12 +46,42 @@ def icon_brand_id(client_and_brand) -> int:
     return client_and_brand[1]
 
 
+# A body that ACTIVATES. Since S3, ``POST /prompts/{id}/activate`` refuses a
+# body whose placeholders the renderer cannot satisfy (NTS_063 pending, closed):
+# activating one would silently fall back to the in-code constant. Saving an
+# invalid draft is still allowed, so only the activating tests need this.
+_VALID_BODIES = {
+    "writer_polish": (
+        "Polish this draft so it sounds like Icon, in {language_name}. "
+        "Tells:{ai_tells} Banned:{banned_phrases} Good:{good_examples} "
+        "Principles:{voice_principles} Topics:{topics_relevant} "
+        "Draft:{draft_json}"
+    ),
+    "writer_draft": (
+        "Draft in {language_name} from {title} / {summary}. "
+        "Voice:{voice_profile_yaml} Banned:{banned_phrases} Facts:{fact_pack}"
+    ),
+    "writer_translate": (
+        "Translate {draft_json} into {language_name}. "
+        "Banned:{banned_phrases} Good:{good_examples}"
+    ),
+}
+
+
+def valid_body(prompt_type: str = "writer_polish", *, marker: str = "") -> str:
+    """A renderable body for ``prompt_type``, optionally tagged so a test can
+    tell two versions apart."""
+    body = _VALID_BODIES.get(prompt_type, "Anything goes for this type.")
+    return f"{marker}{body}" if marker else body
+
+
 def _payload(icon_brand_id: int, **overrides):
+    prompt_type = overrides.get("prompt_type", "writer_polish")
     base = {
         "brand_id": icon_brand_id,
-        "prompt_type": "writer_polish",
+        "prompt_type": prompt_type,
         "version_name": "v1",
-        "content": "Polish this draft so it sounds like Icon.",
+        "content": valid_body(prompt_type),
         "notes": "starter",
     }
     base.update(overrides)
@@ -161,7 +191,11 @@ def test_save_creates_new_active_version_and_old_survives(client, icon_brand_id)
     v1 = client.post(
         "/api/v1/prompts",
         headers=AUTH,
-        json=_payload(icon_brand_id, version_name="v1", content="Original."),
+        json=_payload(
+            icon_brand_id,
+            version_name="v1",
+            content=valid_body(marker="ORIGINAL. "),
+        ),
     ).json()["id"]
     client.post(f"/api/v1/prompts/{v1}/activate", headers=AUTH)
 
@@ -169,7 +203,11 @@ def test_save_creates_new_active_version_and_old_survives(client, icon_brand_id)
     v2 = client.post(
         "/api/v1/prompts",
         headers=AUTH,
-        json=_payload(icon_brand_id, version_name="v2 (edited)", content="Edited body."),
+        json=_payload(
+            icon_brand_id,
+            version_name="v2 (edited)",
+            content=valid_body(marker="EDITED. "),
+        ),
     ).json()["id"]
     resp = client.post(f"/api/v1/prompts/{v2}/activate", headers=AUTH)
     assert resp.status_code == 200
@@ -178,10 +216,10 @@ def test_save_creates_new_active_version_and_old_survives(client, icon_brand_id)
     # New version is active, old version still exists but is inactive.
     old = client.get(f"/api/v1/prompts/{v1}", headers=AUTH).json()
     assert old["is_active"] is False
-    assert old["content"] == "Original."
+    assert old["content"].startswith("ORIGINAL. ")
     new = client.get(f"/api/v1/prompts/{v2}", headers=AUTH).json()
     assert new["is_active"] is True
-    assert new["content"] == "Edited body."
+    assert new["content"].startswith("EDITED. ")
 
 
 # --- Analyze (NTS task 3) -----------------------------------------------

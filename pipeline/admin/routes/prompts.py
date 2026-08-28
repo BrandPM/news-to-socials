@@ -16,12 +16,96 @@ from pipeline.admin.schemas import (
     PromptDiffOut,
     PromptIn,
     PromptOut,
+    PromptPlaceholderCheckOut,
     PromptTestIn,
     PromptTestOut,
     PromptType,
 )
 
 router = APIRouter()
+
+
+# --- placeholder validation (NTS_071 §2; closes the NTS_063 pending) -------
+#
+# Until now the admin UI could save a prompt whose placeholders the renderer
+# cannot satisfy. Nothing failed: the resolver rejected the row at run time and
+# generation silently used the in-code constant, so the operator's edit stopped
+# reaching production with only ``db_prompt_rejected`` in a log nobody reads.
+# The check below is the same contract the resolvers apply, applied at the API
+# edge where the operator can still see it.
+
+
+def placeholder_contract(prompt_type: str) -> tuple[frozenset[str], frozenset[str]]:
+    """``(required, allowed)`` placeholder names for a prompt type.
+
+    Imported from the modules that actually render, never restated here — a
+    second copy of this contract would drift and the drift would be invisible
+    (the symptom is a *silently correct-looking* prompt).
+    """
+    if prompt_type == "editorial_guard":
+        from pipeline.selector.editorial_guard import (
+            GUARD_REQUIRED_PLACEHOLDERS,
+        )
+
+        # The guard renders exactly its ten: an extra name has nothing to
+        # substitute it with, so required and allowed are the same set.
+        return GUARD_REQUIRED_PLACEHOLDERS, GUARD_REQUIRED_PLACEHOLDERS
+
+    from pipeline.generator.comment_writer import (
+        _ALLOWED_PLACEHOLDERS,
+        _REQUIRED_PLACEHOLDERS,
+    )
+
+    required = frozenset(_REQUIRED_PLACEHOLDERS.get(prompt_type, frozenset()))
+    allowed = frozenset(_ALLOWED_PLACEHOLDERS.get(prompt_type, set())) | required
+    return required, allowed
+
+
+def check_placeholders(prompt_type: str, content: str) -> PromptPlaceholderCheckOut:
+    """Validate a prompt body against its contract. Never raises."""
+    import string
+
+    required, allowed = placeholder_contract(prompt_type)
+    present = frozenset(
+        name for _, name, _, _ in string.Formatter().parse(content or "") if name
+    )
+    missing = sorted(required - present)
+    # An unknown placeholder is only a defect where we know the full allowed
+    # set. For types with no contract recorded (topic_picker, image_prompt)
+    # ``allowed`` is empty and we do not invent a rule.
+    unknown = sorted(present - allowed) if allowed else []
+    ok = not missing and not unknown
+    if ok:
+        message = "OK — every placeholder resolves at run time."
+    else:
+        parts = []
+        if missing:
+            parts.append(f"missing required: {', '.join('{' + m + '}' for m in missing)}")
+        if unknown:
+            parts.append(
+                f"unknown (nothing substitutes these): "
+                f"{', '.join('{' + u + '}' for u in unknown)}"
+            )
+        message = (
+            "This body would be REJECTED at run time and the in-code prompt "
+            "would run instead — " + "; ".join(parts)
+        )
+    return PromptPlaceholderCheckOut(
+        ok=ok,
+        prompt_type=prompt_type,  # type: ignore[arg-type]
+        required=sorted(required),
+        present=sorted(present),
+        missing=missing,
+        unknown=unknown,
+        message=message,
+    )
+
+
+@router.post("/validate", response_model=PromptPlaceholderCheckOut)
+def validate_prompt(payload: PromptIn) -> PromptPlaceholderCheckOut:
+    """Dry-run the placeholder check — what the editor calls as you type."""
+    return check_placeholders(payload.prompt_type, payload.content)
+
 
 
 # --- Analyze rate limit -------------------------------------------------
@@ -93,7 +177,7 @@ def diff_prompts(a: int, b: int) -> PromptDiffOut:
     the ``same_brand`` / ``same_prompt_type`` booleans so the UI can
     warn before the operator activates the wrong thing.
     """
-    import difflib  # noqa: PLC0415
+    import difflib
 
     with session_scope() as session:
         prompt_a = session.get(Prompt, a)
@@ -145,6 +229,11 @@ def get_prompt(prompt_id: int) -> PromptOut:
 
 @router.post("", response_model=PromptOut, status_code=status.HTTP_201_CREATED)
 def create_prompt(payload: PromptIn) -> PromptOut:
+    # NOT validated here, deliberately. A saved-but-inactive version is a
+    # work-in-progress, and the resolver only ever reads the ACTIVE row — an
+    # invalid draft harms nobody, while refusing to save one would make the
+    # editor unusable mid-edit. Enforcement is at ``activate``, which is the
+    # moment a body would start (or stop) reaching production.
     with session_scope() as session:
         p = Prompt(
             brand_id_fk=payload.brand_id,
@@ -170,6 +259,8 @@ def create_prompt(payload: PromptIn) -> PromptOut:
 def activate_prompt(prompt_id: int) -> PromptOut:
     """Make this prompt the active one for its (brand_id_fk, prompt_type).
 
+    Validates the placeholder set first — see the comment below.
+
     Runs in a single transaction so we never end up with two active rows
     (the partial UNIQUE index would reject it anyway, but the transaction
     keeps the failure mode coherent for the caller).
@@ -178,6 +269,22 @@ def activate_prompt(prompt_id: int) -> PromptOut:
         p = session.get(Prompt, prompt_id)
         if p is None:
             raise HTTPException(status_code=404, detail="prompt not found")
+        # The NTS_063 pending, closed: refuse to make a body active that the
+        # renderer cannot satisfy. Activating it would "work", and then the
+        # in-code constant would run instead — the operator's edits silently
+        # not reaching production, with only ``db_prompt_rejected`` in a log
+        # nobody reads (NTS_071 §2).
+        check = check_placeholders(p.prompt_type, p.content)
+        if not check.ok:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": check.message,
+                    "missing": check.missing,
+                    "unknown": check.unknown,
+                    "required": check.required,
+                },
+            )
         session.execute(
             update(Prompt)
             .where(
@@ -214,7 +321,7 @@ async def test_prompt(prompt_id: int, payload: PromptTestIn) -> PromptTestOut:
     Doesn't save anything. The sample topic is a fixed string so two
     test runs of the same prompt are comparable.
     """
-    from pipeline.admin import llm  # noqa: PLC0415
+    from pipeline.admin import llm
 
     with session_scope() as session:
         p = session.get(Prompt, prompt_id)
@@ -245,7 +352,7 @@ async def analyze_prompt(prompt_id: int) -> PromptAnalysisOut:
     cost row (visible in Costs). Rate-limited per version. A malformed
     LLM reply surfaces as 422, not 500.
     """
-    from pipeline.admin import llm  # noqa: PLC0415
+    from pipeline.admin import llm
 
     _enforce_analyze_rate_limit(prompt_id)
 

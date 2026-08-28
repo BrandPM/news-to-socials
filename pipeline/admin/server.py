@@ -22,7 +22,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version
 
 from fastapi import Depends, FastAPI
@@ -35,16 +35,18 @@ from .auth import require_admin_token
 
 logger = logging.getLogger(__name__)
 from .routes import brands as brands_routes
+from .routes import candidates as candidates_routes
 from .routes import config as config_routes
 from .routes import cost as cost_routes
-from .routes import eval as eval_routes
 from .routes import dashboard as dashboard_routes
 from .routes import drafts as drafts_routes
+from .routes import eval as eval_routes
 from .routes import health as health_routes
+from .routes import notifications as notifications_routes
 from .routes import prompts as prompts_routes
 from .routes import runs as runs_routes
 from .routes import sources as sources_routes
-from .routes import notifications as notifications_routes
+from .routes import taxonomy as taxonomy_routes
 from .routes import topics as topics_routes
 
 
@@ -85,7 +87,7 @@ def _build_lifespan(settings):
         watchdog_task = watchdog.start_watchdog()
         if settings.admin_run_scheduler:
             try:
-                from apscheduler.schedulers.background import (  # noqa: PLC0415
+                from apscheduler.schedulers.background import (
                     BackgroundScheduler,
                 )
 
@@ -107,13 +109,13 @@ def _build_lifespan(settings):
                             logger.info(
                                 "orphan-sweep force-failed %d run(s)", orphaned
                             )
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.exception("orphan-sweep failed")
                     try:
                         closed = jobs.close_stale_runs(max_age_hours=max_age)
                         if closed:
                             logger.info("stale-run cleanup closed %d run(s)", closed)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.exception("stale-run cleanup failed")
 
                 scheduler = BackgroundScheduler(timezone="UTC")
@@ -124,13 +126,13 @@ def _build_lifespan(settings):
                     id="close_stale_runs",
                     # First sweep ~15s after boot, on the scheduler thread —
                     # clears reboot-orphaned runs without blocking startup.
-                    next_run_time=datetime.now(timezone.utc) + timedelta(seconds=15),
+                    next_run_time=datetime.now(UTC) + timedelta(seconds=15),
                     max_instances=1,
                     coalesce=True,
                     misfire_grace_time=300,
                 )
                 scheduler.start()
-            except Exception:  # noqa: BLE001 — scheduler must never block boot
+            except Exception:
                 logger.exception("stale-run scheduler failed to start; continuing")
                 scheduler = None
         try:
@@ -141,7 +143,7 @@ def _build_lifespan(settings):
             if scheduler is not None:
                 try:
                     scheduler.shutdown(wait=False)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("scheduler shutdown failed")
 
     return lifespan
@@ -221,6 +223,16 @@ def create_app() -> FastAPI:
     app.include_router(
         eval_routes.router, prefix="/api/v1/eval",
         tags=["eval"], dependencies=auth,
+    )
+    # v3 contour 1 — the Portfolio board (NTS_098 §7, NTS_111). Mounted last so
+    # the route table reads in the order the sections were built.
+    app.include_router(
+        candidates_routes.router, prefix="/api/v1/candidates",
+        tags=["candidates"], dependencies=auth,
+    )
+    app.include_router(
+        taxonomy_routes.router, prefix="/api/v1/taxonomy",
+        tags=["taxonomy"], dependencies=auth,
     )
     return app
 

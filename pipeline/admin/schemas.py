@@ -18,6 +18,7 @@ format keeps the friendlier name.
 from __future__ import annotations
 
 import json
+from datetime import date as date_type
 from datetime import datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1257,3 +1258,357 @@ class SourceHealthOut(BaseModel):
     last_fetch_at: datetime | None
     last_error: str | None
     series: list[SourceHealthDayOut]
+
+
+# =========================================================================
+# v3 contour 1 — the Portfolio, Sources and Editorial Policy surfaces
+# (NTS_111 §Портфель/§Источники/§Редполитика, NTS_098 §7). Session S3.
+# =========================================================================
+
+# The verdict vocabulary, restated as Literals because Pydantic needs static
+# types. ``test_candidate_api_nts111`` asserts each one equals the tuple in
+# ``pipeline.admin.models`` — the S1 rule that the guard, the API and the UI
+# filters spell these the same way only holds if something checks.
+CandidateInputKind = Literal["document", "news"]
+CandidateVerdict = Literal["accept", "reject"]
+CandidateReasonCode = Literal[
+    "ok",
+    "personnel",
+    "forecast",
+    "award_pr",
+    "no_document",
+    "no_consequence",
+    "out_of_jurisdiction",
+    "out_of_scope",
+    "duplicate_stage",
+    "retail_crypto",
+    "daily_cap",
+    "guard_error",
+]
+CandidateEventStage = Literal[
+    "consultation",
+    "adopted",
+    "in_force",
+    "ruling",
+    "deal_announced",
+    "deal_closed",
+    "list_update",
+    "other",
+]
+CandidateDepth = Literal["note", "article", "deep"]
+CandidateStatus = Literal[
+    "pending",
+    "selected",
+    "in_production",
+    "drafted",
+    "returned",
+    "ready",
+    "published",
+    "doc_missing",
+    "expired",
+    "failed",
+    "superseded",
+    "rejected",
+]
+CandidateManualAction = Literal["promoted", "held", "rejected"]
+ReviewAction = Literal[
+    "approve", "return", "reject", "hold", "promote", "disagree_guard"
+]
+SourceRole = Literal["news", "primary_feed", "primary_site"]
+SourceClass = Literal[
+    "regulator",
+    "tax_authority",
+    "legislation",
+    "jurisdiction_list",
+    "filings",
+    "court",
+    "professional_alert",
+    "corporate_pr",
+    "news",
+]
+LicenseClass = Literal[
+    "public_official",
+    "public_domain",
+    "corporate_pr",
+    "professional_commentary",
+    "news_paywalled",
+]
+FetchMethod = Literal["rss", "atom", "html_list", "edgar_fts"]
+
+
+class CandidateOut(BaseModel):
+    """One row on the Portfolio board (NTS_111 §Портфель).
+
+    Carries the guard's ``reason`` on **every** card, accepted or not: it is the
+    main instrument for proofreading the rubric, so a list endpoint that made
+    it a detail-only field would defeat the screen's purpose.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    brand_id: int = Field(validation_alias="brand_id_fk")
+    input_kind: CandidateInputKind
+    status: CandidateStatus
+    verdict: CandidateVerdict
+    reason_code: CandidateReasonCode
+    reason: str
+    confidence: float | None
+    service_category: str | None
+    jurisdictions: list[str]
+    event_stage: CandidateEventStage | None
+    depth_prior: CandidateDepth | None
+    depth_final: CandidateDepth | None
+    source_id: int | None = Field(validation_alias="source_id_fk")
+    source_name: str | None
+    source_class: str | None
+    source_title: str
+    source_summary: str | None
+    source_url: str | None
+    source_published_at: datetime | None
+    source_language: str | None
+    primary_doc_hint: str | None
+    primary_doc_url: str | None
+    doc_language_expected: str | None
+    manual_action: CandidateManualAction | None
+    manual_by: str | None
+    manual_at: datetime | None
+    cap_overflow: bool
+    sanity_draft_id: str | None
+    publication_slot: date_type | None
+    canon_dirty: bool
+    attempts: int
+    last_error: str | None
+    supersedes_id: int | None
+    created_at: datetime
+    expires_at: datetime | None
+    selected_at: datetime | None
+    drafted_at: datetime | None
+    published_at: datetime | None
+    failed_at: datetime | None
+
+    @field_validator("jurisdictions", mode="before")
+    @classmethod
+    def _parse_jurisdictions(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return json.loads(v) if v else []
+        return list(v) if v is not None else []
+
+
+class CandidateDedupMatchOut(BaseModel):
+    """One line of "похоже на кандидата #412, 0.91" (NTS_111 §Портфель)."""
+
+    candidate_id: int
+    similarity: float
+    window: str
+    status: str
+    title: str
+
+
+class CandidateDetailOut(BaseModel):
+    """The side panel: the card plus everything behind it."""
+
+    candidate: CandidateOut
+    service_label: str | None
+    dedup_matches: list[CandidateDedupMatchOut]
+    review_decisions: list[ReviewDecisionOut]
+    superseded_by: list[int]
+
+
+class CandidateCountsOut(BaseModel):
+    """Board column counters plus today's reject distribution.
+
+    ``by_reason_code_today`` is what turns the rejected column into a rubric
+    review: 143 rejects is a number, "personnel 61 · forecast 40" is a finding.
+    """
+
+    by_status: dict[str, int]
+    by_reason_code_today: dict[str, int]
+    rejected_today: int
+    accepted_today: int
+    cap_overflow_today: int
+    nav_portfolio: int
+    nav_review: int
+    nav_ready: int
+    nav_sources_unhealthy: int
+
+
+class PortfolioSlotOut(BaseModel):
+    """One publication slot on the strip above the board.
+
+    The field is called ``date`` and its type is imported as ``date_type``:
+    inside this class body the name ``date`` is the field, so annotating it
+    with the bare type would be a self-reference.
+    """
+
+    date: date_type
+    day: str
+    capacity: int
+    filled: int
+
+
+class PortfolioSummaryOut(BaseModel):
+    """The strip above the board: slots, month spend, brand timezone."""
+
+    slots: list[PortfolioSlotOut]
+    month_spend_usd: float
+    month_cap_usd: float
+    month_spend_pct: float
+    brand_timezone: str
+    today: date_type
+
+
+class CandidateActionIn(BaseModel):
+    """A manual action from the board (NTS_098 §7).
+
+    ``comment`` is optional for promote/hold and **required** for reject: a
+    rejection with no sentence is indistinguishable from a mis-click when the
+    row is read back a week later.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["promote", "hold", "reject", "reset"]
+    comment: str | None = Field(default=None, max_length=2000)
+    reviewer: str = Field(default="admin", max_length=100)
+    time_spent_s: int | None = Field(default=None, ge=0, le=86400)
+
+
+class CandidateDocumentIn(BaseModel):
+    """Manual document link (NTS_111 §Портфель, NTS_098 §7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    primary_doc_url: HttpUrl
+    reviewer: str = Field(default="admin", max_length=100)
+
+
+class ReviewDecisionIn(BaseModel):
+    """A row in ``review_decisions`` — including «не согласен с вердиктом»."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: int
+    action: ReviewAction
+    scope: str | None = Field(default=None, max_length=100)
+    comment: str | None = Field(default=None, max_length=2000)
+    reviewer: str = Field(default="admin", max_length=100)
+    time_spent_s: int | None = Field(default=None, ge=0, le=86400)
+
+
+class ReviewDecisionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    brand_id: int = Field(validation_alias="brand_id_fk")
+    candidate_id: int = Field(validation_alias="candidate_id_fk")
+    action: ReviewAction
+    scope: str | None
+    comment: str | None
+    reviewer: str
+    time_spent_s: int | None
+    at: datetime
+
+
+class BrandTaxonomyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    brand_id: int = Field(validation_alias="brand_id_fk")
+    key: str
+    label: str
+    description_for_guard: str
+    service_url_path: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class BrandTaxonomyIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    brand_id: int
+    key: str = Field(min_length=1, max_length=40, pattern=r"^[a-z][a-z0-9_]*$")
+    label: str = Field(min_length=1, max_length=120)
+    # The guard renders this verbatim into {services}; an empty description
+    # gives the rubric a service key with no meaning attached.
+    description_for_guard: str = Field(min_length=10, max_length=2000)
+    service_url_path: str = Field(min_length=1, max_length=200, pattern=r"^/")
+
+
+class BrandTaxonomyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str | None = Field(default=None, min_length=1, max_length=120)
+    description_for_guard: str | None = Field(
+        default=None, min_length=10, max_length=2000
+    )
+    service_url_path: str | None = Field(
+        default=None, min_length=1, max_length=200, pattern=r"^/"
+    )
+
+
+class SourceRegistryOut(BaseModel):
+    """A row in the Sources table (NTS_111 §Источники).
+
+    ``doc_find_share`` is the share of this source's candidates that reached a
+    primary document. It is ``None`` — not 0.0 — until S5 writes
+    ``primary_doc_url`` for ``news`` items, because a hard zero on the screen
+    reads as "this source never finds documents" rather than "not measured
+    yet".
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    brand_id: int = Field(validation_alias="brand_id_fk")
+    name: str
+    url: str
+    source_type: SourceType
+    primary_category: str
+    active: bool
+    polling_minutes: int
+    source_role: SourceRole
+    source_class: SourceClass
+    license_class: LicenseClass
+    doc_language: str | None
+    fetch_method: FetchMethod | None
+    reliability: float | None
+    cache_ttl_days: int | None
+    last_run_at: datetime | None
+    health: list[bool | None] = Field(default_factory=list)
+    success_rate_pct: float | None = None
+    last_error: str | None = None
+    candidates_30d: int = 0
+    accepted_30d: int = 0
+    doc_find_share: float | None = None
+
+
+class SourceRegistryUpdate(BaseModel):
+    """Editing a source's v3 classification from the Sources screen."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_role: SourceRole | None = None
+    source_class: SourceClass | None = None
+    license_class: LicenseClass | None = None
+    doc_language: str | None = Field(default=None, max_length=10)
+    fetch_method: FetchMethod | None = None
+    cache_ttl_days: int | None = Field(default=None, ge=0, le=3650)
+    active: bool | None = None
+
+
+class PromptPlaceholderCheckOut(BaseModel):
+    """Placeholder validation for a prompt body (closes the NTS_063 pending).
+
+    Returned by ``POST /prompts/validate`` and enforced on save. ``ok=False``
+    means the body would be rejected at run time and the code constant would
+    run instead — the NTS_071 §2 failure, which is silent everywhere else.
+    """
+
+    ok: bool
+    prompt_type: PromptType
+    required: list[str]
+    present: list[str]
+    missing: list[str]
+    unknown: list[str]
+    message: str
