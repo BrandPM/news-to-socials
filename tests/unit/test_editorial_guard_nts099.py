@@ -250,6 +250,47 @@ def test_primary_doc_hint_is_nulled_for_document_input() -> None:
     assert news.primary_doc_hint == "Council directive, EUR-Lex, DAC8"
 
 
+def test_no_document_is_not_a_legal_verdict_for_a_document_input() -> None:
+    """Shadow-week finding 1 (run #125): 21 items from primary feeds came back
+    ``reason_code='no_document'``.
+
+    NTS_099 §4 makes that a contradiction — for ``input_kind='document'`` the
+    feed item **is** the document, so the existence marker is a news-only test
+    and no_document is outside the vocabulary the rubric may answer with here.
+    An out-of-vocabulary code is a ``guard_error`` by the same rule as an
+    unknown enum (NTS_099 §3): no candidate row, counted in the summary.
+    Coercing it into a reject would file 21 editorial statements the rubric
+    never made, and the funnel would read as a strict guard rather than a
+    broken one.
+    """
+    payload = _accept_payload(
+        verdict="reject",
+        reason_code="no_document",
+        reason="No marker that a document exists.",
+    )
+    with pytest.raises(GuardSchemaError, match="no_document"):
+        parse_guard_response(
+            payload, input_kind="document", allowed_service_keys=_ALLOWED
+        )
+
+    # The same body on a news item is a perfectly ordinary reject.
+    news = parse_guard_response(
+        payload, input_kind="news", allowed_service_keys=_ALLOWED
+    )
+    assert news.reason_code == "no_document"
+    assert news.accepted is False
+
+
+def test_the_rubric_tells_the_model_no_document_is_news_only() -> None:
+    """The other half of finding 1, and the half that stops the wrong call
+    being made at all: the code turns a no_document@document into a
+    guard_error, but only the rubric can stop the model producing one. Both
+    levels, or the fix trades 21 wrong rejects for 21 guard errors."""
+    body = _GUARD_PROMPT.lower()
+    assert "never return no_document when input_kind is document".lower() in body
+    assert "news only" in body
+
+
 def test_a_non_object_response_is_a_schema_error() -> None:
     for payload in ([], "accept", None, 7):
         with pytest.raises(GuardSchemaError):
@@ -728,6 +769,7 @@ def test_taxonomy_loads_ordered_and_is_empty_for_an_unknown_brand(
 _020 = "020_v3_portfolio_core"
 _021 = "021_editorial_guard_prompt_type"
 _022 = "022_intake_flags_and_primary_feeds"
+_023 = "023_seed_editorial_guard_rubric"
 
 
 @pytest.fixture
@@ -810,6 +852,87 @@ def test_023_is_idempotent_and_never_overwrites_an_edit(alembic_db) -> None:
         ).fetchall()
     assert len(rows) == before
     assert all(r[0] == edited for r in rows)
+
+
+def _previous_rubric_text() -> str:
+    """The rubric text 024 supersedes, read from 024 itself.
+
+    Loaded by path because a module name starting with a digit cannot be
+    imported. Reading it from the migration rather than restating it here is
+    the point: if the two ever drift, the row on prod matches neither and the
+    re-sync silently does nothing."""
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "pipeline/admin/migrations/versions/024_resync_editorial_guard_rubric.py"
+    )
+    spec = importlib.util.spec_from_file_location("_m024", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._PREVIOUS_CONTENT
+
+
+def test_024_reseeds_the_machine_seeded_rubric_and_spares_the_operators(
+    alembic_db,
+) -> None:
+    """Shadow-week finding 1, prompt half: a rubric edit ships as a migration
+    (NTS_071 §"UI-правки"/009/011/019), never as a patch to 023.
+
+    Who gets rewritten is the whole design. 024 replaces exactly the text this
+    repo shipped at ``e6383e6`` and nothing else, so the row 023 wrote on prod
+    is fixed while an operator's own version — the same text with Andriy's line
+    added — is left as he saved it. Rewriting that would silently undo a rubric
+    decision, which is the failure NTS_071 exists to prevent; the placeholder
+    set is unchanged, so his row stays valid and keeps working."""
+    db, alembic = alembic_db
+    alembic("upgrade", "head")
+
+    # A fresh DB is seeded from the constant by 023 and 024 has nothing to do —
+    # the row already carries the rule.
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT brand_id_fk, content FROM prompts "
+            "WHERE prompt_type = 'editorial_guard' AND is_active = 1"
+        ).fetchall()
+    assert rows
+    for _brand, content in rows:
+        assert content == _GUARD_PROMPT
+        assert "never return no_document when input_kind is document" in content
+        assert guard_template_placeholders(content) == GUARD_REQUIRED_PLACEHOLDERS
+
+    # Now the state a deployed VPS is actually in: the pre-hotfix text sitting
+    # in the row 023 wrote, plus an operator's own edit alongside it.
+    stale = _previous_rubric_text()
+    assert stale != _GUARD_PROMPT
+    assert "never return no_document when input_kind is document" not in stale
+    edited = stale + "\nAndriy: also take Liechtenstein foundation rulings.\n"
+    brand_id = rows[0][0]
+    alembic("downgrade", _023)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE prompts SET content = ? WHERE prompt_type = 'editorial_guard'",
+            (stale,),
+        )
+        conn.execute(
+            "INSERT INTO prompts (brand_id_fk, prompt_type, version_name, content, "
+            "is_active, created_by, created_at) "
+            "VALUES (?, 'editorial_guard', 'operator', ?, 0, 'human', ?)",
+            (brand_id, edited, datetime.now(tz=UTC).replace(tzinfo=None).isoformat(sep=" ")),
+        )
+    alembic("upgrade", "head")
+
+    with sqlite3.connect(db) as conn:
+        seeded = conn.execute(
+            "SELECT content FROM prompts WHERE prompt_type = 'editorial_guard' "
+            "AND created_by = 'migration_023'"
+        ).fetchall()
+        human = conn.execute(
+            "SELECT content FROM prompts WHERE prompt_type = 'editorial_guard' "
+            "AND created_by = 'human'"
+        ).fetchall()
+    assert seeded and all(r[0] == _GUARD_PROMPT for r in seeded)
+    assert human and all(r[0] == edited for r in human)
 
 
 def test_the_full_v3_stack_walks_down_to_020_and_back_up_cleanly(

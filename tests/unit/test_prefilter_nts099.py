@@ -165,6 +165,41 @@ def test_require_summary_off_lets_a_bare_headline_through() -> None:
     assert _decide(summary="Short.", rules=rules).reason == "summary_too_short"
 
 
+def test_the_summary_thresholds_do_not_apply_to_a_primary_feed() -> None:
+    """Shadow-week finding 2 (run #125). BaFin's feed titles its items and
+    summarises them in 13-60 characters, so ``prefilter_min_summary_chars=80``
+    dropped the whole source before the guard ever saw it —
+    ``intake.prefilter_drop / summary_too_short``.
+
+    Same reasoning as the deny-list rule one section up (NTS_099 §1): the
+    length threshold is a proxy for "a news item with nothing in it", and on a
+    regulator's own feed a bare headline is a published document, not an empty
+    story. The guard, not the character count, decides whether it has a
+    consequence. Both keys stay in the config and both keep applying to news —
+    the exemption is by ``source_role``, not by lowering the bar for everyone.
+    """
+    bafin = "BaFin: Verbraucherhinweis"  # 25 chars, shorter than the 80 floor
+    assert len(bafin) < 80
+
+    assert _decide(summary=bafin, source_role="news").reason == "summary_too_short"
+    assert _decide(summary=bafin, source_role="primary_feed").keep is True
+    assert _decide(summary=bafin, source_role="primary_site").keep is True
+
+    # And a primary feed with no annotation at all is still judged, not dropped.
+    assert _decide(summary=None, source_role="news").reason == "no_summary"
+    assert _decide(summary=None, source_role="primary_feed").keep is True
+
+
+def test_the_news_thresholds_are_untouched_by_the_primary_feed_exemption() -> None:
+    """The exemption must not become a global loosening: the numbers Andriy
+    set for news feeds are the same numbers after the hotfix."""
+    assert _decide(summary="x" * 79, source_role="news").reason == "summary_too_short"
+    assert _decide(summary="x" * 80, source_role="news").keep is True
+    tightened = _rules(prefilter_min_summary_chars=200)
+    assert _decide(summary="x" * 120, source_role="news", rules=tightened).keep is False
+    assert _decide(summary="x" * 120, source_role="primary_feed", rules=tightened).keep
+
+
 def test_language_filter_only_fires_when_the_language_is_known() -> None:
     assert _decide(source_language="fr").reason == "language"
     assert _decide(source_language="de").keep is True

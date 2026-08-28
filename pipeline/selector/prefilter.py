@@ -13,6 +13,14 @@ by test:
   regulator's own feed those words describe the composition of an organ or a
   fiscal projection, not a personnel story. Applying the news deny-list there
   silently drops exactly the class of item v3 exists to read (NTS_099 §1).
+* **Neither summary rule applies to ``primary_feed`` either.**
+  ``prefilter_require_summary`` and ``prefilter_min_summary_chars`` are a proxy
+  for "a news item with nothing in it". A regulator's feed annotates in 13-60
+  characters — BaFin does — and the headline alone is still a published
+  document, so the 80-character floor dropped that whole source before the
+  guard saw it (shadow-week run #125). Same exemption as the deny list, for the
+  same reason: the guard judges the document, a character count cannot. The
+  keys keep their values and keep applying to news.
 * **Age is per source role**, 72 h for news and 240 h for primary feeds
   (NTS_099 §1): a consultation paper is still worth writing about a week
   later, a news item about it is not.
@@ -120,21 +128,29 @@ def prefilter_item(
     now = now or datetime.now(tz=UTC)
     text = (title or "").strip()
     body = (summary or "").strip()
+    is_primary = source_role in ("primary_feed", "primary_site")
 
     # 1. Deny patterns — news feeds only (see module docstring).
-    if source_role not in ("primary_feed", "primary_site"):
+    if not is_primary:
         lowered = text.lower()
         for pattern in rules.deny_title_patterns:
             if pattern in lowered:
                 return PrefilterDecision(False, "deny_title", pattern)
 
-    # 2. Summary present / long enough.
-    if rules.require_summary and not body:
-        return PrefilterDecision(False, "no_summary")
-    if body and len(body) < rules.min_summary_chars:
-        return PrefilterDecision(
-            False, "summary_too_short", f"{len(body)}<{rules.min_summary_chars}"
-        )
+    # 2. Summary present / long enough — news feeds only, same reason as the
+    #    deny list. The length floor is a proxy for "a news item with nothing
+    #    in it"; on a regulator's own feed a bare headline is a published
+    #    document, and BaFin annotates in 13-60 characters, so applying the
+    #    news floor there dropped a whole primary source before the guard ever
+    #    saw it (shadow-week run #125). The guard, not a character count,
+    #    decides whether a document has a consequence.
+    if not is_primary:
+        if rules.require_summary and not body:
+            return PrefilterDecision(False, "no_summary")
+        if body and len(body) < rules.min_summary_chars:
+            return PrefilterDecision(
+                False, "summary_too_short", f"{len(body)}<{rules.min_summary_chars}"
+            )
 
     # 3. Age. An item with no date is KEPT: plenty of regulator feeds omit
     #    pubDate, and dropping those would remove a whole source class on a

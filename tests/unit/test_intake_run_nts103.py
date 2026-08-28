@@ -353,6 +353,139 @@ async def test_intake_refuses_to_run_while_its_own_flag_is_off(
     assert stats.total("accepted") == 1
 
 
+async def test_the_disabled_flag_closes_the_run_as_cancelled_not_a_traceback(
+    brand, monkeypatch
+) -> None:
+    """Shadow-week finding 3 (log 14:03:41). With ``intake_enabled=false`` the
+    unit died with a traceback and exit 1, and systemd recorded ``Failed``.
+
+    A flag that is off is the state NTS_103 шаг 1 ships in — the *expected*
+    outcome for every day before Andriy switches the shadow week on — so it
+    has to look like the v2 gate already does: a terminal ``cancelled`` row
+    tagged ``run_type='intake'``, the reason where the operator reads it, and
+    nothing in the failure channel. A daily red unit teaches the operator to
+    ignore the failure channel, which is the one thing monitoring cannot
+    survive (NTS_106).
+    """
+    with admin_db.get_session_factory()() as session:
+        session.get(PipelineConfig, brand).intake_enabled = False
+        session.commit()
+
+    harness = _install(monkeypatch, _Harness(), {"ESMA News": [_item(1)]})
+    with pytest.raises(IntakeDisabled):
+        await run_intake(brand_slug="icon", embed=harness.embed)
+    assert harness.calls == 0
+
+    from sqlalchemy import select
+
+    with admin_db.get_session_factory()() as session:
+        run = session.scalars(select(Run).order_by(Run.id.desc())).first()
+    assert run is not None
+    assert run.status == "cancelled"
+    assert run.run_type == "intake"
+    assert run.finished_at is not None
+    assert "intake_enabled" in (run.log_excerpt or "")
+    payload = json.loads(run.stats)
+    assert payload["run_type"] == "intake"
+    assert payload["cancelled_reason"] == "intake_enabled is off"
+    assert payload["funnel"]["fetched"] == 0
+
+
+def test_the_cli_exits_zero_when_the_flag_is_off(brand, monkeypatch) -> None:
+    """The other half of finding 3: ``run_intake`` still refuses in the type
+    system — a caller must not read "nothing ran" as "nothing matched" — but
+    the CLI, which is what systemd runs, turns that refusal into exit 0 and a
+    sentence. The exception is the API; the exit code is the operator's."""
+    from typer.testing import CliRunner
+
+    from pipeline.intake import app
+
+    with admin_db.get_session_factory()() as session:
+        session.get(PipelineConfig, brand).intake_enabled = False
+        session.commit()
+
+    async def exploding_fetch(*args, **kwargs):
+        raise AssertionError("a disabled intake must not fetch")
+
+    monkeypatch.setattr("pipeline.intake._fetch_items", exploding_fetch)
+
+    result = CliRunner().invoke(app, ["--brand-slug", "icon"])
+    assert result.exit_code == 0, result.output
+    assert result.exception is None
+    assert "intake_enabled" in result.output
+
+
+# --- the shadow-week findings, at the funnel level ------------------------
+
+
+async def test_a_document_item_judged_no_document_is_a_guard_error(
+    brand, monkeypatch
+) -> None:
+    """Finding 1 end to end: 21 primary-feed items were filed as rejects that
+    the rubric had no right to make. After the fix the same response is a
+    ``guard_error`` — no candidate row, counted in the summary — so it shows up
+    as a guard problem to fix rather than as an editorial decision to trust."""
+    harness = _install(
+        monkeypatch,
+        _Harness(
+            verdicts=[
+                _verdict(
+                    verdict="reject",
+                    reason_code="no_document",
+                    reason="No marker that a document exists.",
+                )
+            ]
+        ),
+        {"ESMA News": [_item(1)]},
+    )
+    stats = await run_intake(brand_slug="icon", embed=harness.embed)
+
+    assert stats.by_kind["document"]["guard_errors"] == 1
+    assert stats.total("rejected") == 0
+    assert stats.reason_codes == {"guard_error": 1}
+
+    from sqlalchemy import select
+
+    with admin_db.get_session_factory()() as session:
+        assert session.scalars(select(Candidate)).all() == []
+
+
+async def test_a_bare_primary_feed_annotation_reaches_the_guard(
+    brand, monkeypatch
+) -> None:
+    """Finding 2 end to end: BaFin-shaped items (13-60 char annotations) are
+    judged, and the identically-short news item is still dropped free."""
+    short = "BaFin: Hinweis"
+    assert len(short) == 14
+
+    bafin = RawItem(
+        source_id="1",
+        source_name="feed",
+        url="https://bafin.test/1",
+        title="BaFin publishes consultation on outsourcing requirements",
+        summary=short,
+        published_at=NOW - timedelta(hours=2),
+    )
+    wire = RawItem(
+        source_id="2",
+        source_name="feed",
+        url="https://wire.test/1",
+        title="FINMA revises the circular on trustee onboarding requirements",
+        summary=short,
+        published_at=NOW - timedelta(hours=2),
+    )
+    harness = _install(
+        monkeypatch, _Harness(), {"ESMA News": [bafin], "Wire News": [wire]}
+    )
+    stats = await run_intake(brand_slug="icon", embed=harness.embed)
+
+    assert stats.by_kind["document"]["after_prefilter"] == 1
+    assert stats.by_kind["document"]["guarded"] == 1
+    assert stats.by_kind["news"].get("after_prefilter", 0) == 0
+    assert stats.prefilter_drops == {"summary_too_short": 1}
+    assert harness.calls == 1
+
+
 # --- the funnel ----------------------------------------------------------
 
 

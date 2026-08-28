@@ -298,6 +298,31 @@ async def run_intake(
 
     if not getattr(config, "intake_enabled", False) and not force:
         log.info("intake.disabled", brand=brand_row.slug)
+        # A flag that is off is the shipped state (NTS_103 шаг 1), so it is a
+        # normal outcome and gets a terminal row, exactly as the v2 gate does:
+        # ``cancelled``, tagged ``run_type='intake'``, with the reason where
+        # the operator reads it. Before this, the daily unit exited 1 with a
+        # traceback and systemd logged Failed every morning — which trains the
+        # operator to ignore the one channel that has to stay meaningful
+        # (NTS_106). The run row also answers "did the timer fire at all?",
+        # which a missing row cannot.
+        cancelled_run_id = client.record_run_start(
+            source_ids=[], triggered_by=triggered_by, run_type="intake"
+        )
+        client.record_run_finish(
+            cancelled_run_id,
+            status="cancelled",
+            stats={
+                **IntakeStats().as_dict(),
+                "cancelled_reason": "intake_enabled is off",
+            },
+            log_excerpt=(
+                f"intake_enabled is OFF for brand {brand_row.slug!r} "
+                "(NTS_103 шаг 1). No source was fetched and no item was "
+                "judged. Switch it on in Settings to start the shadow week, "
+                "or run with --force for a one-off."
+            ),
+        )
         raise IntakeDisabled(
             f"intake_enabled is off for brand {brand_row.slug!r} — "
             "switch it on in Settings, or pass force=True for a one-off run"
@@ -700,15 +725,23 @@ def main(
     """Run contour 1 (intake + guard) once. No generation, ever."""
     import asyncio
 
-    stats = asyncio.run(
-        run_intake(
-            brand_slug=brand_slug,
-            brand_id=brand_id,
-            limit=limit,
-            force=force,
-            triggered_by=triggered_by,
+    try:
+        stats = asyncio.run(
+            run_intake(
+                brand_slug=brand_slug,
+                brand_id=brand_id,
+                limit=limit,
+                force=force,
+                triggered_by=triggered_by,
+            )
         )
-    )
+    # The refusal stays an exception in the API — a caller must not read
+    # "nothing ran" as "nothing matched" — but here it is the expected daily
+    # outcome while the flag is off, and systemd reads the exit code. The run
+    # row was already written as ``cancelled`` by ``run_intake``.
+    except IntakeDisabled as exc:
+        typer.echo(str(exc))
+        return
     typer.echo(json.dumps(stats.as_dict(), indent=2, ensure_ascii=False))
 
 

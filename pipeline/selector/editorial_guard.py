@@ -223,6 +223,20 @@ def parse_guard_response(
     if reason_code not in MODEL_REASON_CODES:
         raise GuardSchemaError(f"unknown reason_code: {reason_code!r}")
 
+    # NTS_099 §4: for a document input the item IS the document, so the
+    # existence marker is a news-only test and ``no_document`` is not in the
+    # vocabulary the rubric may answer with here. Treated exactly like an
+    # unknown enum — a schema violation, therefore ``guard_error`` with no
+    # candidate row — and deliberately NOT rewritten into some other reject:
+    # the shadow week's run #125 filed 21 primary-feed items this way, and a
+    # coerced code would have kept them looking like editorial decisions
+    # instead of surfacing as a rubric or model problem to fix.
+    if input_kind == "document" and reason_code == "no_document":
+        raise GuardSchemaError(
+            "reason_code='no_document' is not available for "
+            "input_kind='document' (NTS_099 §4: the item is the document)"
+        )
+
     # An accept whose reason_code is a rejection reason (or vice versa) is a
     # contradiction, and the two halves would be read by different consumers:
     # the portfolio board reads the code, the editor reads the verdict.
@@ -387,8 +401,10 @@ Changes to rules that affect private capital:
 
 === THE TEST OF VALUE ===
 input_kind is {input_kind}.
-- document: the document exists by construction. Ask whether there is a
-  CONSEQUENCE for an owner of private capital, and which service it falls
+- document: the feed item IS the document announcement, so the document
+  exists by construction. The existence marker below is a news-only test:
+  never return no_document when input_kind is document. Ask whether there is
+  a CONSEQUENCE for an owner of private capital, and which service it falls
   under. If there is no consequence, reject with no_consequence.
 - news: the text must contain a marker that a document EXISTS — "published",
   "adopted", "enters into force", "ruled", "filed", "announced the acquisition
@@ -409,8 +425,8 @@ published_at: {published_at}
 Return JSON only, with every field:
 - verdict: "accept" or "reject"
 - reason_code: "ok" on accept; on reject one of personnel, forecast, award_pr,
-  no_document, no_consequence, out_of_jurisdiction, out_of_scope,
-  duplicate_stage, retail_crypto
+  no_document (news only — never for input_kind document), no_consequence,
+  out_of_jurisdiction, out_of_scope, duplicate_stage, retail_crypto
 - reason: one sentence, at most 200 characters, REQUIRED on accept and on
   reject. Name the specific thing that decided it, not the category.
 - service_category: exactly one service key from the list above (required on
