@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the News-to-Socials intake once a day (NTS_098 §5)
+Requires=nts-intake.service
+
+[Timer]
+# 06:10 UTC — early enough that the 09:00 brand-timezone heartbeat
+# (NTS_106 §2) has real numbers to report, late enough that the overnight
+# European regulator publications are already in the feeds.
+OnCalendar=*-*-* 06:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

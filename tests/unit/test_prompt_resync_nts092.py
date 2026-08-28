@@ -179,9 +179,13 @@ def test_019_is_idempotent_and_does_not_flip_active(alembic_db):
             "SELECT id, content, version_name, created_at, is_active FROM prompts "
             "ORDER BY id"
         ).fetchall()
+        # Grouped by (brand, type), which is what idx_active_prompt actually
+        # enforces. Grouping by type alone started counting 5 the moment
+        # migration 023 seeded one rubric per brand — a true fact about a
+        # different invariant.
         active_count = conn.execute(
-            "SELECT prompt_type, COUNT(*) FROM prompts WHERE is_active = 1 "
-            "GROUP BY prompt_type"
+            "SELECT brand_id_fk, prompt_type, COUNT(*) FROM prompts "
+            "WHERE is_active = 1 GROUP BY brand_id_fk, prompt_type"
         ).fetchall()
 
     # Re-running is a no-op, not a duplicate row and not a new timestamp.
@@ -193,7 +197,7 @@ def test_019_is_idempotent_and_does_not_flip_active(alembic_db):
         ).fetchall()
     assert second == first
     # In place: the same row ids, still exactly one active per type.
-    assert all(count == 1 for _t, count in active_count)
+    assert all(count == 1 for _b, _t, count in active_count)
     assert all(row[4] == 1 for row in second)
 
 
@@ -255,8 +259,12 @@ def test_a_fresh_seed_needs_no_resync(alembic_db):
 
     alembic("upgrade", "head")
     with sqlite3.connect(db_path) as conn:
+        # Scoped to writer_draft: migration 023 also seeds an editorial_guard
+        # row for the brand, and this test is about 019 not touching a fresh
+        # writer seed.
         rows = conn.execute(
-            "SELECT content, version_name FROM prompts WHERE brand_id_fk = ?",
+            "SELECT content, version_name FROM prompts WHERE brand_id_fk = ? "
+            "AND prompt_type = 'writer_draft'",
             (brand_id,),
         ).fetchall()
     assert rows == [(content, version)]

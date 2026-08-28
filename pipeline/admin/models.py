@@ -438,6 +438,35 @@ class PipelineConfig(Base):
         Integer, nullable=False, default=80, server_default="80"
     )
 
+    # === v3 contour-1 mode flags (NTS_103 шаг 1/3) — migration 022 =========
+    # Both modes are explicit and independently switchable, because the whole
+    # point of NTS_103 is that the cutover is a sequence of flags rather than a
+    # deploy. Both default OFF:
+    #
+    # * ``intake_enabled`` is a NEW mode, and a new mode ships off — the run
+    #   that fills ``candidates`` starts when the operator says so, not when
+    #   the deploy lands.
+    # * ``v2_generation_enabled`` is the OLD mode, and it ships off by
+    #   Andriy's gate-journal directive of 2026-08-28 (NTS_105 §9, NTS_114 S2):
+    #   the daily generation was paying for translations and covers on articles
+    #   the rubric itself calls rejects. Turning it back on is one PUT away if
+    #   publications are needed before the v3 production path exists.
+    #
+    # Consequence worth stating out loud: on the deploy that applies 022 the
+    # cron does nothing until a flag is flipped. That is deliberate — an idle
+    # pipeline is visible in the runs list; a pipeline generating waste is not.
+    intake_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    v2_generation_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # NTS_099 §2 — "дешёвая модель (gpt-4o-mini или аналог)". A config key so
+    # swapping the guard model is a Settings edit, not a deploy.
+    guard_model: Mapped[str] = mapped_column(
+        Text, nullable=False, default="gpt-4o-mini", server_default="gpt-4o-mini"
+    )
+
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
     banned_phrases: Mapped[str] = mapped_column(Text, nullable=False, default="[]")

@@ -71,7 +71,12 @@ from pipeline.publisher.sanity import (
 )
 from pipeline.selector.dedup import extract_entities
 from pipeline.admin.judge import score_draft
-from pipeline.selector.dedup_service import DedupEngine, cleanup_old_embeddings
+from pipeline.selector.dedup_service import (
+    EMBED_USD_PER_1M,
+    DedupEngine,
+    cleanup_old_embeddings,
+    embed_text,
+)
 from pipeline.selector.topic_picker import BrandContext, TopicPicker
 from pipeline.sources.base import Source
 
@@ -233,31 +238,19 @@ def _resolve_brand_image_styles(voice_profile_yaml: str | None) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-# USD per 1M tokens for the dedup embedding model (OpenAI, 2026-07 pricing).
-_EMBED_USD_PER_1M = {"text-embedding-3-small": 0.02, "text-embedding-3-large": 0.13}
+# Kept as a re-export: NTS_090's cost assertion and several tests read it here.
+_EMBED_USD_PER_1M = EMBED_USD_PER_1M
 
 
 async def _embed(text: str, *, model: str = "text-embedding-3-small") -> np.ndarray:
     """Get an embedding from OpenAI. Cheap, ~$0.00002/topic.
 
-    NTS_090 (C1): every paid call records a ``cost_records`` row. Cost is
-    computed from the API's reported token usage × the model's per-1M price.
-    Recording is best-effort (``record_cost`` no-ops without a cost context).
+    NTS_090 (C1): every paid call records a ``cost_records`` row. The
+    implementation moved to :func:`pipeline.selector.dedup_service.embed_text`
+    in S2 so the v3 intake can embed without importing this module (and with it
+    the generator); this stays as the v2 call site's name.
     """
-    from pipeline.admin.cost_recorder import record_cost  # noqa: PLC0415
-
-    settings = get_settings()
-    client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
-    resp = await client.embeddings.create(model=model, input=text)
-    tokens = int(getattr(resp.usage, "total_tokens", 0) or 0)
-    record_cost(
-        provider="openai",
-        operation="embedding",
-        model=model,
-        tokens_in=tokens,
-        cost_usd=tokens / 1_000_000 * _EMBED_USD_PER_1M.get(model, 0.02),
-    )
-    return np.array(resp.data[0].embedding, dtype=np.float32)
+    return await embed_text(text, model=model)
 
 
 # --------------------------------------------------------------------------
@@ -1151,6 +1144,39 @@ async def run_pipeline(
         id_fk=brand_row.id,
     )
 
+    # NTS_103 шаг 3 / NTS_105 §9 — the v2 generation kill switch. Default OFF
+    # (migration 022, Andriy's gate-journal directive of 2026-08-28): the daily
+    # run was paying for four translations and a cover per article that the v3
+    # rubric classifies as a reject. The check is HERE, before any source is
+    # fetched and before the Sanity publisher is built, so "off" costs nothing
+    # at all rather than costing a fetch.
+    #
+    # dry_run is gated too. A dry run skips the Sanity write but still pays for
+    # research, draft, polish and translation — it is a spend switch, not a
+    # publish switch.
+    if not getattr(config, "v2_generation_enabled", False):
+        log.warning(
+            "pipeline.v2_generation_disabled",
+            brand=brand_row.slug,
+            run_id=existing_run_id,
+        )
+        if existing_run_id is not None:
+            # An operator-triggered run gets a terminal status and a reason:
+            # a row stuck at 'running' forever is how a disabled flag turns
+            # into a support question.
+            client.record_run_finish(
+                existing_run_id,
+                status="cancelled",
+                stats={"fetched": 0, "scored": 0, "drafted": 0, "errors": 0},
+                log_excerpt=(
+                    "v2_generation_enabled is OFF for this brand "
+                    "(NTS_103 шаг 3). No source was fetched and nothing was "
+                    "generated. Switch it on in Settings if publications are "
+                    "needed before the v3 production path exists."
+                ),
+            )
+        return []
+
     brand_id_fk = brand_row.id
     languages = _languages_for_brand(brand_row, override=language)
 
@@ -1389,6 +1415,26 @@ async def run_pipeline_for_run(run_id: int) -> None:
         brand_slug = brand_row.slug if brand_row is not None else "icon"
 
     client = AdminConfigClient(brand_slug=brand_slug)
+
+    # Same gate as run_pipeline, checked once here as well: this function
+    # writes the authoritative final status after the per-source fanout, so
+    # without it a run of cancelled sources would still be reported 'success'.
+    if not getattr(client.get_config(), "v2_generation_enabled", False):
+        log.warning("pipeline.v2_generation_disabled", brand=brand_slug, run_id=run_id)
+        client.record_run_finish(
+            run_id,
+            status="cancelled",
+            stats={"fetched": 0, "scored": 0, "drafted": 0, "errors": 0},
+            log_excerpt=(
+                "v2_generation_enabled is OFF for this brand (NTS_103 шаг 3). "
+                "Nothing was fetched or generated."
+            ),
+        )
+        client.update_run_progress(
+            run_id, sources_total=0, sources_done=0, stage="done"
+        )
+        return
+
     source_ids = client.get_run_source_ids(run_id)
 
     # Pull the SourceRecords for those ids out of admin.db. We bypass

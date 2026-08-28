@@ -78,7 +78,15 @@ _SEVERITY_RANK = {"danger": 0, "warning": 1}
 # we can tell them apart from the NTS_073 incident ids ("run-47", "source-3")
 # and keep them OUT of the "recovered" reconciliation (one-shot pulses, not
 # clearable incidents).
-VISIBILITY_PREFIXES = ("run_started:", "run_finished:", "published:")
+VISIBILITY_PREFIXES = (
+    "run_started:",
+    "run_finished:",
+    "published:",
+    # NTS_106 §2 — the daily contour-1 funnel. A pulse, not an incident: the
+    # numbers are always "true", so there is nothing for the recovered
+    # reconciliation to clear.
+    "intake_heartbeat:",
+)
 
 # NTS_088 — backup-heartbeat alert. Key is "backup_stale:YYYY-MM-DD" so it
 # sends at most once per calendar day (the date rolls the dedup key). Like
@@ -269,6 +277,91 @@ def format_published(
     return "\n".join(lines)
 
 
+# --- Intake heartbeat (NTS_106 §2) -----------------------------------------
+
+INTAKE_HEARTBEAT_PREFIX = "intake_heartbeat:"
+
+
+def format_intake_heartbeat(
+    *,
+    run_id: int | None,
+    finished_at: datetime,
+    stats: dict,
+) -> str:
+    """The daily contour-1 summary, in ABSOLUTE numbers (NTS_106 §2).
+
+    "Молчаливый сбой интейка неотличим от строгой рубрики: портфель пуст, все
+    думают, что рубрика режет." So this renders counts, per ``input_kind``, and
+    never a bare percentage: ``accepted: 0`` under ``fetched: 0`` is a dead
+    parser, ``accepted: 0`` under ``fetched: 340`` is an editorial question, and
+    a rate of 0% reads identically in both cases.
+
+    ``prefilter_drop_rate`` is printed with a 🟡 marker outside [0.3, 0.95]
+    (NTS_099 §1: below means the prefilter is not filtering, above means it is
+    eating the feed) and ``guard_error_rate`` with one above 20% (NTS_106 §1).
+    """
+    funnel = stats.get("funnel", {}) or {}
+    by_kind = stats.get("by_input_kind", {}) or {}
+    drop_rate_value = float(stats.get("prefilter_drop_rate", 0.0) or 0.0)
+    guard_error_rate = float(stats.get("guard_error_rate", 0.0) or 0.0)
+    considered = int(funnel.get("after_dedup", 0) or 0)
+
+    lines = [f"📥 <b>Интейк · Run #{run_id if run_id is not None else '—'}</b>"]
+    lines.append(
+        "fetched {fetched} → after_dedup {dedup} → after_prefilter {pre} "
+        "→ guarded {guarded} → accepted {acc}".format(
+            fetched=int(funnel.get("fetched", 0) or 0),
+            dedup=considered,
+            pre=int(funnel.get("after_prefilter", 0) or 0),
+            guarded=int(funnel.get("guarded", 0) or 0),
+            acc=int(funnel.get("accepted", 0) or 0),
+        )
+    )
+    for kind in sorted(by_kind):
+        k = by_kind[kind] or {}
+        lines.append(
+            "· {kind}: fetched {f} · dedup {d} · prefilter {p} · guarded {g} "
+            "· accepted {a} · rejected {r} · errors {e} · deferred {df}".format(
+                kind=html.escape(kind),
+                f=int(k.get("fetched", 0) or 0),
+                d=int(k.get("after_dedup", 0) or 0),
+                p=int(k.get("after_prefilter", 0) or 0),
+                g=int(k.get("guarded", 0) or 0),
+                a=int(k.get("accepted", 0) or 0),
+                r=int(k.get("rejected", 0) or 0),
+                e=int(k.get("guard_errors", 0) or 0),
+                df=int(k.get("deferred", 0) or 0),
+            )
+        )
+    drop_flag = (
+        " 🟡"
+        if considered >= 10 and (drop_rate_value < 0.3 or drop_rate_value > 0.95)
+        else ""
+    )
+    lines.append(f"prefilter_drop_rate: {drop_rate_value:.2f}{drop_flag}")
+    if guard_error_rate > 0:
+        err_flag = " 🟡" if guard_error_rate > 0.20 else ""
+        lines.append(f"guard_error_rate: {guard_error_rate:.2f}{err_flag}")
+    cap_overflow = int(stats.get("cap_overflow", 0) or 0)
+    if cap_overflow:
+        lines.append(f"⛔ суточный лимит: {cap_overflow} (можно повысить вручную)")
+    if int(stats.get("superseded", 0) or 0):
+        lines.append(f"🔄 superseded: {stats['superseded']}")
+    if int(stats.get("embed_failures", 0) or 0):
+        lines.append(f"⚠️ embed failures: {stats['embed_failures']}")
+    if int(stats.get("source_errors", 0) or 0):
+        lines.append(f"🔴 источников с ошибкой: {stats['source_errors']}")
+    reason_codes = stats.get("reason_codes", {}) or {}
+    if reason_codes:
+        top = sorted(reason_codes.items(), key=lambda kv: -int(kv[1]))[:6]
+        lines.append(
+            "причины: "
+            + ", ".join(f"{html.escape(str(k))} {v}" for k, v in top)
+        )
+    lines.append(f"🕓 {_fmt_hm(finished_at)} UTC")
+    return "\n".join(lines)
+
+
 # --- Backup heartbeat (NTS_088) --------------------------------------------
 
 
@@ -400,10 +493,29 @@ def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
             .all()
         )
         for r in finished:
+            stats = _parse_stats(r.stats)
+            # An intake run gets the contour-1 heartbeat instead of the
+            # generation pulse: "релевантных 0/340, черновиков 0" is true of
+            # every intake run and says nothing, while the funnel is the whole
+            # point of the shadow week (NTS_106 §2).
+            if r.run_type == "intake":
+                key = f"{INTAKE_HEARTBEAT_PREFIX}{r.id}"
+                if key in already or r.finished_at is None:
+                    continue
+                out.append(
+                    (
+                        key,
+                        format_intake_heartbeat(
+                            run_id=r.id,
+                            finished_at=r.finished_at,
+                            stats=stats,
+                        ),
+                    )
+                )
+                continue
             key = f"run_finished:{r.id}"
             if key in already:
                 continue
-            stats = _parse_stats(r.stats)
             out.append(
                 (
                     key,

@@ -1,11 +1,17 @@
 # systemd units
 
-The active deployment (ADR-018 Sanity pivot; NTS_025/073/074) runs two units:
+The active deployment (ADR-018 Sanity pivot; NTS_025/073/074) runs three units:
 
 * `nts-admin-api.service` — the FastAPI admin API (uvicorn). Triggers pipeline
   runs as detached subprocesses (NTS_074), serves the operator UI's backend.
 * `nts-monitor.timer` / `.service` — the Telegram failure + pipeline-visibility
   alerter (NTS_073/075), every 15 minutes.
+* `nts-intake.timer` / `.service` — the v3 contour-1 intake (NTS_099/NTS_103),
+  once a day at 06:10 UTC. **Reads `pipeline_config.intake_enabled`**: with the
+  flag off (the shipped default) the run exits without fetching anything, so
+  the unit can be enabled before the shadow week starts and the start itself is
+  a Settings edit. It makes no generation call of any kind — one embedding plus
+  one cheap guard completion per item.
 
 The legacy Directus-era units (`news-poll`, `news-dispatch`, `news-stale`,
 `news-summary`, `news-bot`) were removed in NTS_076 — dead since the ADR-018
@@ -18,10 +24,12 @@ All units run as the unprivileged service user with access to
 ## Install
 
 ```bash
-sudo cp nts-admin-api.service nts-monitor.service nts-monitor.timer /etc/systemd/system/
+sudo cp nts-admin-api.service nts-monitor.service nts-monitor.timer \
+        nts-intake.service nts-intake.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now nts-admin-api.service
 sudo systemctl enable --now nts-monitor.timer
+sudo systemctl enable --now nts-intake.timer
 ```
 
 ## Verify

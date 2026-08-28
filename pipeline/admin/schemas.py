@@ -26,7 +26,16 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 SourceType = Literal["rss", "web", "telegram"]
 PromptType = Literal[
-    "writer_polish", "writer_draft", "topic_picker", "image_prompt", "writer_translate"
+    "writer_polish",
+    "writer_draft",
+    "topic_picker",
+    "image_prompt",
+    "writer_translate",
+    # NTS_099 §6 — the guard rubric is a prompt. Without it in this Literal the
+    # rubric would exist in the DB (migration 021 widened the CHECK) but be
+    # unreachable from the API, so an edit could never reach a run — which is
+    # exactly what DoD 5 measures.
+    "editorial_guard",
 ]
 RunStatus = Literal["running", "success", "failed", "dry_run", "cancelled"]
 TopicStatus = Literal[
@@ -267,6 +276,10 @@ class PipelineConfigOut(BaseModel):
     prefilter_max_age_hours_primary: int
     prefilter_languages: list[str]
     prefilter_min_summary_chars: int
+    # Mode flags (NTS_103) — migration 022
+    intake_enabled: bool
+    v2_generation_enabled: bool
+    guard_model: str
     updated_at: datetime
 
     @field_validator("banned_phrases", mode="before")
@@ -347,6 +360,10 @@ class PipelineConfigUpdate(BaseModel):
     prefilter_max_age_hours_primary: int | None = Field(default=None, ge=1, le=8760)
     prefilter_languages: list[str] | None = None
     prefilter_min_summary_chars: int | None = Field(default=None, ge=0, le=5000)
+    # Mode flags (NTS_103 шаг 1/3) — the cutover is flags, not deploys.
+    intake_enabled: bool | None = None
+    v2_generation_enabled: bool | None = None
+    guard_model: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("brand_timezone")
     @classmethod

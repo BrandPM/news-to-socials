@@ -5,7 +5,8 @@ config surface that nothing read: a value saved in Settings that the next run
 ignored, with no error anywhere. The failure is silent by nature — the run
 succeeds, it just uses a number nobody chose.
 
-So each of the 25 keys added by migration 020 is walked end to end:
+So each of the 28 v3 keys — 25 from migration 020, three mode flags from 022 —
+is walked end to end:
 
     migration default → ORM column → ConfigRecord → GET /config
                      → PUT /config → ConfigRecord again
@@ -108,6 +109,12 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
         ["en", "de"],
     ),
     ("prefilter_min_summary_chars", 80, 120),
+    # --- mode flags (NTS_103 шаг 1/3) — migration 022. Both default OFF, and
+    # that is the assertion that matters: the cutover directive is that the
+    # deploy which lands these keys generates nothing until a human says so.
+    ("intake_enabled", False, True),
+    ("v2_generation_enabled", False, True),
+    ("guard_model", "gpt-4o-mini", "gpt-4o"),
 )
 
 # JSON-as-TEXT columns: ConfigRecord hands back immutable Python objects, the
@@ -194,7 +201,7 @@ def test_every_v3_column_has_a_sentinel() -> None:
         f"unsentinelled column(s): {sorted(v3_columns - covered)}; "
         f"sentinel for a column that no longer exists: {sorted(covered - v3_columns)}"
     )
-    assert len(_SENTINELS) == 25
+    assert len(_SENTINELS) == 28
 
 
 # --- default reaches the runtime -----------------------------------------

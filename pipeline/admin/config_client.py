@@ -51,6 +51,17 @@ class SourceRecord:
     url: str
     primary_category: str
     polling_minutes: int
+    # NTS_101 §1 registry fields, added by migration 020 and read by the v3
+    # intake run. Defaults describe a pre-v3 news feed, which is what every
+    # row that predates the columns actually is — and what the hardcoded
+    # fallback sources are. ``source_role`` decides the item's ``input_kind``
+    # and which prefilter age limit applies, so a wrong default here would
+    # quietly route regulator documents through the news rules.
+    source_role: str = "news"
+    source_class: str = "news"
+    license_class: str = "news_paywalled"
+    doc_language: str | None = None
+    fetch_method: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +145,12 @@ class ConfigRecord:
         "en", "de", "fr", "it", "pl", "uk", "ru", "el",
     )
     prefilter_min_summary_chars: int = 80
+    # --- v3 mode flags (NTS_103) — migration 022. Both default False, which
+    # is also the safe answer on the hardcoded-fallback path: a runtime that
+    # cannot read admin.db must not decide on its own to spend money.
+    intake_enabled: bool = False
+    v2_generation_enabled: bool = False
+    guard_model: str = "gpt-4o-mini"
 
 
 # --- v3 contour-1 config (NTS_098 §4, NTS_099 §1) -------------------------
@@ -294,6 +311,16 @@ def _v3_keys(row: Any) -> dict[str, Any]:
             getattr(row, "prefilter_min_summary_chars", None),
             d.prefilter_min_summary_chars,
         ),
+        # NTS_103 — mode flags. ``bool(getattr(..., default))`` and not
+        # ``or default``: ``False or True`` is True, which would turn a mode
+        # the operator switched OFF back on.
+        "intake_enabled": bool(
+            getattr(row, "intake_enabled", d.intake_enabled)
+        ),
+        "v2_generation_enabled": bool(
+            getattr(row, "v2_generation_enabled", d.v2_generation_enabled)
+        ),
+        "guard_model": _str_or(getattr(row, "guard_model", None), d.guard_model),
     }
 
 
@@ -485,6 +512,13 @@ class AdminConfigClient:
                 url=r.url,
                 primary_category=r.primary_category,
                 polling_minutes=r.polling_minutes,
+                source_role=getattr(r, "source_role", None) or "news",
+                source_class=getattr(r, "source_class", None) or "news",
+                license_class=(
+                    getattr(r, "license_class", None) or "news_paywalled"
+                ),
+                doc_language=getattr(r, "doc_language", None),
+                fetch_method=getattr(r, "fetch_method", None),
             )
             for r in rows
         ]
@@ -581,9 +615,17 @@ class AdminConfigClient:
         self,
         source_ids: list[int],
         triggered_by: str = "cron",
+        run_type: str | None = None,
     ) -> int | None:
         """Create a new ``runs`` row and return its id. Returns ``None``
-        if admin.db / brand row are unavailable."""
+        if admin.db / brand row are unavailable.
+
+        ``run_type`` (NTS_106 §5) is which v3 contour this run belongs to —
+        ``intake`` / ``production`` / ``publish`` / ``ttl``. It stays optional
+        because the ~72 pre-v3 rows carry NULL and callers that predate the
+        column must keep working; the intake and production entry points pass
+        it explicitly.
+        """
         brand_id_fk = self._resolve_brand_id_fk()
         if brand_id_fk is None:
             return None
@@ -595,6 +637,7 @@ class AdminConfigClient:
                 source_ids=json.dumps(source_ids),
                 started_at=datetime.now(tz=timezone.utc),
                 status="running",
+                run_type=run_type,
             )
             session.add(run)
             session.commit()

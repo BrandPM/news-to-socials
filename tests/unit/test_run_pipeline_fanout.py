@@ -69,6 +69,11 @@ def fresh_admin_db_with_source(tmp_path, monkeypatch):
                 topics_per_run=3,
                 banned_phrases=json.dumps(["delve into"]),
                 voice_profile="mission: edited via admin\n",
+                # NTS_103 шаг 3 — the v2 generation path ships OFF (migration
+                # 022). This suite exercises that path, so it has to switch it
+                # on explicitly; without this every run_pipeline call below
+                # returns [] before fetching a single source.
+                v2_generation_enabled=True,
             )
         )
         session.commit()

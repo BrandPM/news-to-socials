@@ -43,6 +43,40 @@ YELLOW_FLOOR = 0.75
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 _JACCARD_DUP = 0.70  # L1: strictly greater than this → duplicate title
 
+# USD per 1M tokens for the embedding models (OpenAI, 2026-07 pricing).
+EMBED_USD_PER_1M = {"text-embedding-3-small": 0.02, "text-embedding-3-large": 0.13}
+
+
+async def embed_text(
+    text: str, *, model: str = DEFAULT_EMBED_MODEL
+) -> np.ndarray:
+    """One embedding from OpenAI, with its ``cost_records`` row. ~$0.00002.
+
+    Lives here rather than in ``pipeline.run`` because the v3 intake needs it
+    and importing ``pipeline.run`` would pull the whole generator — including
+    the paid draft/polish/translate call sites — into a run whose defining
+    property is that it makes no generation call at all (NTS_103 шаг 1).
+    ``pipeline.run._embed`` delegates here, so there is still one
+    implementation and one cost row per embedding.
+    """
+    import openai
+
+    from pipeline.admin.cost_recorder import record_cost
+    from pipeline.common.config import get_settings
+
+    settings = get_settings()
+    client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
+    resp = await client.embeddings.create(model=model, input=text)
+    tokens = int(getattr(resp.usage, "total_tokens", 0) or 0)
+    record_cost(
+        provider="openai",
+        operation="embedding",
+        model=model,
+        tokens_in=tokens,
+        cost_usd=tokens / 1_000_000 * EMBED_USD_PER_1M.get(model, 0.02),
+    )
+    return np.array(resp.data[0].embedding, dtype=np.float32)
+
 
 @dataclass(frozen=True)
 class DedupDecision:

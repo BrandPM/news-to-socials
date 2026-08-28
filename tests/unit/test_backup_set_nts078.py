@@ -97,7 +97,7 @@ def db_at_head(tmp_path: Path) -> Path:
             "INSERT INTO sources (brand_id_fk, name, source_type, url, "
             "primary_category, active, paywall, polling_minutes, created_at, "
             "updated_at, source_role, source_class, license_class, doc_language, "
-            "fetch_method, reliability, cache_ttl_days) VALUES (?, 'FINMA News EN', "
+            "fetch_method, reliability, cache_ttl_days) VALUES (?, 'FINMA News EN (fixture)', "
             "'rss', 'https://www.finma.ch/en/rss/news/', 'regulation', 1, 0, 720, "
             "datetime('now'), datetime('now'), 'primary_feed', 'regulator', "
             "'public_official', 'en', 'rss', 0.97, 14)",
@@ -180,8 +180,11 @@ def test_v3_rows_survive_a_real_backup_and_restore(
         source_columns = {r[1] for r in conn.execute("PRAGMA table_info(sources)")}
         assert set(_SOURCE_V3_COLUMNS) <= source_columns
         assert conn.execute(
+            # Named "(fixture)" because migration 022 seeds a real feed
+            # called 'FINMA News EN'; matching on the bare name would silently
+            # start asserting against the seeded row instead of this one.
             "SELECT source_role, license_class, reliability FROM sources "
-            "WHERE name = 'FINMA News EN'"
+            "WHERE name = 'FINMA News EN (fixture)'"
         ).fetchone() == ("primary_feed", "public_official", 0.97)
 
 

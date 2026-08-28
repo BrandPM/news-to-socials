@@ -1,0 +1,25 @@
+[Unit]
+Description=News-to-Socials: contour-1 intake — dedup, prefilter, editorial guard (NTS_099/NTS_103)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials/repo
+EnvironmentFile=/opt/news-to-socials/repo/.env
+# No --force: the unit obeys pipeline_config.intake_enabled, so the shadow
+# week starts and stops from Settings rather than from systemctl. With the
+# flag off the run exits immediately without fetching anything.
+ExecStart=/opt/news-to-socials/repo/.venv/bin/python -m pipeline.intake --brand-slug icon --triggered-by cron
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/news-to-socials /opt/news-to-socials/repo
+MemoryMax=512M
+
+StandardOutput=append:/var/log/news-to-socials/intake.log
+StandardError=append:/var/log/news-to-socials/intake.log

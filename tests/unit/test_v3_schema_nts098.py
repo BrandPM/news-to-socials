@@ -392,7 +392,15 @@ def test_brand_timezone_is_backfilled_from_the_brand_row(alembic_db) -> None:
 def test_migrating_a_populated_database_loses_nothing(alembic_db) -> None:
     """The rebuild steps (draft_approvals, runs, sources, prompts) copy data.
     Row counts and integrity are checked on a database that has rows in it —
-    an empty-database migration proves very little."""
+    an empty-database migration proves very little.
+
+    S2 added two seeding migrations, so "unchanged" became the wrong assertion:
+    022 inserts the twelve NTS_115 primary feeds and 023 inserts one rubric per
+    brand. The invariant is *no loss* — the pre-existing rows survive the
+    rebuilds — plus the exact expected additions, spelled out so a migration
+    that starts inserting something else fails here instead of quietly growing
+    the tables.
+    """
     db, alembic = alembic_db
     alembic("upgrade", _PREV)
     brand_id, _source_id = _seed_brand_and_source(db)
@@ -422,7 +430,19 @@ def test_migrating_a_populated_database_loses_nothing(alembic_db) -> None:
             t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
             for t in before
         }
-        assert after == before
+        brands = before["brands"]
+        expected = {
+            **before,
+            # 022 — the primary feeds from NTS_115 artefact 1: thirteen rows
+            # for its twelve listed feeds, because its EUR-Lex line is one row
+            # per saved search and it asks for two.
+            "sources": before["sources"] + 13,
+            # 023 — one active editorial_guard rubric per brand.
+            "prompts": before["prompts"] + brands,
+        }
+        assert after == expected
+        # Nothing the earlier revisions wrote was dropped by a rebuild.
+        assert all(after[t] >= before[t] for t in before)
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         # The v2 approval row is intact and simply has no candidate.
@@ -563,7 +583,14 @@ def test_021_admits_editorial_guard_and_still_rejects_nonsense(
     db, alembic = alembic_db
     alembic("upgrade", "head")
 
-    _seed_prompt(db, "editorial_guard")
+    # 023 already seeded one ACTIVE rubric per brand, so the type being
+    # admitted is proved by the row's existence; a second row of the type has
+    # to be inactive or it hits the partial unique index.
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM prompts WHERE prompt_type = 'editorial_guard'"
+        ).fetchone()[0] >= 1
+    _seed_prompt(db, "editorial_guard", active=0)
     with sqlite3.connect(db) as conn, pytest.raises(sqlite3.IntegrityError, match="CHECK"):
         conn.execute(
             "INSERT INTO prompts (prompt_type, version_name, content, is_active, "
@@ -627,7 +654,11 @@ def test_021_downgrade_refuses_while_a_guard_prompt_exists(alembic_db) -> None:
     silently or fail mid-rebuild. Refuse loudly instead."""
     db, alembic = alembic_db
     alembic("upgrade", "head")
-    _seed_prompt(db, "editorial_guard")
+    # 023's downgrade removes the rubric IT seeded, so a clean head → 020 walk
+    # succeeds (asserted in test_editorial_guard_nts099). What 021 must still
+    # refuse is a rubric row it did not create — an operator's edit, modelled
+    # here as a row with different content that 023 leaves in place.
+    _seed_prompt(db, "editorial_guard", active=0)
 
     with pytest.raises(subprocess.CalledProcessError) as excinfo:
         alembic("downgrade", _020)
