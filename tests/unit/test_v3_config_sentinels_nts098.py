@@ -5,10 +5,10 @@ config surface that nothing read: a value saved in Settings that the next run
 ignored, with no error anywhere. The failure is silent by nature — the run
 succeeds, it just uses a number nobody chose.
 
-So each of the 39 v3 keys — 25 from migration 020, two mode flags from 022,
+So each of the 40 v3 keys — 25 from migration 020, two mode flags from 022,
 ``production_enabled`` + ``rank_weights`` from 026, the five document
-budgets from 027 and the four composition keys from 028 — is walked end to
-end:
+budgets from 027 the four composition keys from 028 and
+``cover_mode`` from 030 — is walked end to end:
 
     migration default → ORM column → ConfigRecord → GET /config
                      → PUT /config → ConfigRecord again
@@ -162,6 +162,10 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
         {"professional_commentary": 10, "corporate_pr": 30},
     ),
     ("attribution_model", "gpt-4o-mini", "gpt-4o"),
+    # migration 030 — NTS_112. Defaults to the CURRENT behaviour (flux), for
+    # the same reason every other v3 flag does: the deploy that lands a new
+    # mode must not switch modes.
+    ("cover_mode", "flux", "data"),
     ("guard_model", "gpt-4o-mini", "gpt-4o"),
 )
 
@@ -253,8 +257,9 @@ def test_every_v3_column_has_a_sentinel() -> None:
         f"sentinel for a column that no longer exists: {sorted(covered - v3_columns)}"
     )
     # 25 from 020, three mode flags (022 + 026), rank weights (026), the five
-    # document budgets (027) and the four composition keys (028).
-    assert len(_SENTINELS) == 39
+    # document budgets (027) the four composition
+    # keys (028) and the cover mode (030).
+    assert len(_SENTINELS) == 40
 
 
 # --- default reaches the runtime -----------------------------------------

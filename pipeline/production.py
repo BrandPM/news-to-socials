@@ -601,6 +601,59 @@ def _patch_fact_pack(fact_pack_id: int, **values: Any) -> None:
         )
 
 
+async def _upload_data_cover(
+    *,
+    candidate_id: int,
+    topic_id: str,
+    fact_pack: Any,
+    document_sections: int,
+    sanity_publisher: Any,
+) -> str | None:
+    """Draw the cover from data and upload it as one asset (NTS_112, NTS_069).
+
+    One asset for all four siblings, as before: the cover carries currencies,
+    percentages, ISO dates and act names, and none of those need translating —
+    which is exactly why the data cover can be shared where a captioned image
+    could not.
+    """
+    from pipeline.admin.cost_recorder import record_cost
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import Candidate
+    from pipeline.generator.cover_svg import (
+        build_svg,
+        cover_from_candidate,
+        render_png,
+    )
+
+    with get_session_factory()() as session:
+        row = session.get(Candidate, candidate_id)
+        if row is None:
+            return None
+        data = cover_from_candidate(
+            candidate=row,
+            fact_pack=fact_pack,
+            document_sections=document_sections,
+        )
+    png = render_png(build_svg(data))
+    # Recorded at zero rather than not recorded: NTS_112's DoD asks for the
+    # operation in the ledger, and an operation missing from it is
+    # indistinguishable from one that never ran.
+    record_cost(
+        provider="local", operation="cover_data", model="cover_svg/1", cost_usd=0.0
+    )
+    asset_id = await sanity_publisher.upload_cover_image(
+        png, filename=f"icon-{topic_id}-cover.png"
+    )
+    log.info(
+        "production.data_cover",
+        candidate_id=candidate_id,
+        stamp=data.stamp,
+        service=data.service,
+        depth=data.depth,
+    )
+    return str(asset_id)
+
+
 def _writer_for(brand: Any) -> Any:
     """A ``CommentWriter`` bound to the brand, for the repair pass."""
     from pipeline.generator.comment_writer import CommentWriter
@@ -956,15 +1009,31 @@ async def produce_candidate(
             if fact_pack_id is not None:
                 _store_plan(fact_pack_id, plan.as_dict())
 
-        # --- cover -------------------------------------------------------
+        # --- cover (NTS_112) ---------------------------------------------
+        # ``data`` draws it from the article's own figures: free, deterministic
+        # on the candidate id, and different for two articles in a way the
+        # diffusion path never was. The Sanity write happens with the drafts,
+        # so here we only build the bytes and upload the asset.
         asset_id = None
         images_on_demand = bool(getattr(config, "images_on_demand", False))
         if stages["cover"] and not images_on_demand and not dry_run:
+            cover_mode = str(getattr(config, "cover_mode", "flux") or "flux")
             try:
-                asset_id = await generate_image_for_topic(
-                    topic, brand, sanity_publisher
-                )
+                if cover_mode == "data":
+                    asset_id = await _upload_data_cover(
+                        candidate_id=candidate_id,
+                        topic_id=topic.id,
+                        fact_pack=fact_pack,
+                        document_sections=len(doc_sections),
+                        sanity_publisher=sanity_publisher,
+                    )
+                else:
+                    asset_id = await generate_image_for_topic(
+                        topic, brand, sanity_publisher
+                    )
             except Exception:
+                # A missing cover is not a lost article — the manager can
+                # generate one from the card (NTS_091/094).
                 log.exception("production.cover_failed", candidate_id=candidate_id)
                 asset_id = None
 

@@ -173,6 +173,8 @@ class ConfigRecord:
         {"professional_commentary": 15, "corporate_pr": 25, "news_paywalled": 0}
     )
     attribution_model: str = "gpt-4o-mini"
+    # NTS_112 — data | flux.
+    cover_mode: str = "flux"
     # NTS_100 §2 — the rank formula's seven weights, parsed here like the other
     # JSON-as-TEXT keys so the selector never sees a string.
     rank_weights: Mapping[str, float] = MappingProxyType(
@@ -401,6 +403,7 @@ def _v3_keys(row: Any) -> dict[str, Any]:
         "attribution_model": _str_or(
             getattr(row, "attribution_model", None), d.attribution_model
         ),
+        "cover_mode": _str_or(getattr(row, "cover_mode", None), d.cover_mode),
         # A weight the operator zeroed is a weight the operator zeroed, so the
         # per-key fallback is only for keys the JSON does not mention at all.
         "rank_weights": MappingProxyType(

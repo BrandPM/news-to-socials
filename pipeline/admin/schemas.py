@@ -294,6 +294,8 @@ class PipelineConfigOut(BaseModel):
     depth_length_targets: dict[str, list[int | None]]
     max_quote_words: dict[str, int]
     attribution_model: str
+    # NTS_112 — data | flux (migration 030)
+    cover_mode: str
     guard_model: str
     updated_at: datetime
 
@@ -418,6 +420,7 @@ class PipelineConfigUpdate(BaseModel):
     attribution_model: str | None = Field(
         default=None, min_length=1, max_length=100
     )
+    cover_mode: Literal["data", "flux"] | None = None
     guard_model: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("brand_timezone")

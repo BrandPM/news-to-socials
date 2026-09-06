@@ -16,6 +16,8 @@ to repair articles that went live without a cover.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pipeline.common.logging import get_logger
 from pipeline.common.models import Channel, RawItem, Topic
 from pipeline.generator.image import BrandVisual, ImageGenerator
@@ -35,7 +37,7 @@ def _brand_visual_for(brand_id: str) -> BrandVisual:
     style_prompts``), same as a real run, so Regenerate honours operator
     edits. Falls back to the built-in default set if the profile carries
     none / the DB read fails (never blocks a regenerate)."""
-    from pipeline.run import _resolve_brand_image_styles  # noqa: PLC0415
+    from pipeline.run import _resolve_brand_image_styles
 
     if brand_id != "icon":
         raise NotImplementedError(
@@ -44,17 +46,17 @@ def _brand_visual_for(brand_id: str) -> BrandVisual:
 
     voice_yaml: str | None = None
     try:
-        from sqlalchemy import select  # noqa: PLC0415
+        from sqlalchemy import select
 
-        from pipeline.admin.db import session_scope  # noqa: PLC0415
-        from pipeline.admin.models import Brand  # noqa: PLC0415
+        from pipeline.admin.db import session_scope
+        from pipeline.admin.models import Brand
 
         with session_scope() as session:
             row = session.execute(
                 select(Brand).where(Brand.slug == "icon")
             ).scalar_one_or_none()
             voice_yaml = row.voice_profile_yaml if row is not None else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         voice_yaml = None
 
     return BrandVisual(
@@ -70,17 +72,17 @@ def _icon_brand_id_fk() -> int | None:
     never load-bearing, so every failure degrades to None.
     """
     try:
-        from sqlalchemy import select  # noqa: PLC0415
+        from sqlalchemy import select
 
-        from pipeline.admin.db import session_scope  # noqa: PLC0415
-        from pipeline.admin.models import Brand  # noqa: PLC0415
+        from pipeline.admin.db import session_scope
+        from pipeline.admin.models import Brand
 
         with session_scope() as session:
             row = session.execute(
                 select(Brand).where(Brand.slug == "icon")
             ).scalar_one_or_none()
             return row.id if row is not None else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -96,6 +98,8 @@ async def generate_and_apply_cover(
     custom_prompt: str | None = None,
     summary: str | None = None,
     filename_suffix: str = "regen",
+    mode: str = "flux",
+    cover_data: Any = None,
 ) -> str:
     """Generate ONE cover and attach it to every id in ``target_ids``.
 
@@ -112,6 +116,23 @@ async def generate_and_apply_cover(
 
     client = client or SanityClient()
     publisher = publisher or SanityPublisher(client=client)
+
+    # NTS_112 — ``data`` draws the cover from the article's own figures: SVG
+    # through resvg, deterministic on the candidate id, $0 and no model call.
+    # ``flux`` is the old diffusion path, kept as the operator's button for the
+    # cases where a picture is genuinely wanted. An explicit custom prompt is
+    # by definition a request for the artistic one.
+    if mode == "data" and cover_data is not None and not custom_prompt:
+        asset_id = await _apply_data_cover(
+            cover_data=cover_data,
+            topic_id=topic_id,
+            target_ids=target_ids,
+            client=client,
+            publisher=publisher,
+            filename_suffix=filename_suffix,
+            cost_doc_id=cost_doc_id,
+        )
+        return asset_id
 
     fake_topic = Topic(
         id=topic_id,
@@ -130,7 +151,7 @@ async def generate_and_apply_cover(
             brand_id=visual.brand_id, image_style_prompts=[custom_prompt]
         )
 
-    from pipeline.admin.cost_recorder import CostContext, cost_context  # noqa: PLC0415
+    from pipeline.admin.cost_recorder import CostContext, cost_context
 
     icon_brand_id_fk = _icon_brand_id_fk()
 
@@ -175,6 +196,61 @@ async def generate_and_apply_cover(
         topic_id=topic_id,
         applied_to=len(target_ids),
         ids=target_ids,
+    )
+    return asset_id
+
+
+async def _apply_data_cover(
+    *,
+    cover_data: Any,
+    topic_id: str,
+    target_ids: list[str],
+    client: SanityClient,
+    publisher: SanityPublisher,
+    filename_suffix: str,
+    cost_doc_id: str | None,
+) -> str:
+    """Draw the cover from data and patch every sibling (NTS_112).
+
+    A cost row is written with ``cost_usd=0`` rather than skipped: NTS_112's
+    DoD asks for the operation to be recorded, and an operation missing from
+    the ledger is indistinguishable from one that never ran when somebody asks
+    later why a cover looks the way it does.
+    """
+    from pipeline.admin.cost_recorder import CostContext, cost_context, record_cost
+    from pipeline.generator.cover_svg import build_svg, render_png
+
+    svg = build_svg(cover_data)
+    png = render_png(svg)
+    with cost_context(
+        CostContext(brand_id_fk=_icon_brand_id_fk(), draft_id=cost_doc_id)
+    ):
+        record_cost(
+            provider="local",
+            operation="cover_data",
+            model="cover_svg/1",
+            cost_usd=0.0,
+        )
+        asset_id = await publisher.upload_cover_image(
+            png, filename=f"icon-{topic_id}-{filename_suffix}.png"
+        )
+    cover_ref = {
+        "_type": "image",
+        "asset": {"_type": "reference", "_ref": asset_id},
+    }
+    await client.mutate(
+        [
+            {"patch": {"id": sid, "set": {"coverImage": cover_ref}}}
+            for sid in target_ids
+        ]
+    )
+    log.info(
+        "image.data_cover_applied",
+        asset_id=asset_id,
+        topic_id=topic_id,
+        applied_to=len(target_ids),
+        service=getattr(cover_data, "service", None),
+        stamp=getattr(cover_data, "stamp", ""),
     )
     return asset_id
 

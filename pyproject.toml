@@ -17,6 +17,9 @@ dependencies = [
     # system libraries, which matters because the extractor runs on the VPS
     # under a hardened systemd unit with ProtectSystem=strict.
     "pypdf>=5.0.0",
+    # NTS_112 — SVG → PNG for the data covers. Ships a static rust binary, so
+    # there is nothing to install on the VPS beyond the wheel.
+    "resvg-py>=0.1.5",
     "python-slugify>=8.0.4",
 
     # Data / validation

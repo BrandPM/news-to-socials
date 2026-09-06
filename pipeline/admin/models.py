@@ -529,6 +529,13 @@ class PipelineConfig(Base):
     attribution_model: Mapped[str] = mapped_column(
         Text, nullable=False, default="gpt-4o-mini", server_default="gpt-4o-mini"
     )
+    # NTS_112 — ``data`` draws the cover from the article's own figures (free,
+    # deterministic, actually different per article); ``flux`` is the diffusion
+    # path. Defaults to ``flux``, the current behaviour: the deploy that lands
+    # a new mode must not switch modes.
+    cover_mode: Mapped[str] = mapped_column(
+        Text, nullable=False, default="flux", server_default="flux"
+    )
 
     # --- Primary document fetch budgets (NTS_101 §4) — migration 027.
     # In the config rather than in code because they are the knobs an operator
