@@ -473,6 +473,24 @@ class PipelineConfig(Base):
     v2_generation_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("0")
     )
+    # NTS_103 шаг 3 / NTS_114 S4 — the v3 generation path. Third flag, same
+    # rule as the two above: a new mode ships OFF, so the deploy that lands the
+    # production run does not start paying for drafts because it landed.
+    production_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # NTS_100 §2 — the seven weights of the rank formula, in the brand config
+    # rather than in code. The spec is explicit that they were "подобраны на
+    # глаз" and are meant to be corrected against editor decisions (NTS_113);
+    # a weight that needs a deploy to change is a weight nobody changes.
+    rank_weights: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='{"w_conf": 0.3, "w_depth": 0.25, "w_fresh": 0.15, '
+        '"w_juris": 0.15, "w_kind": 0.05, "w_div": 0.2, "w_juris_div": 0.1}',
+        server_default='{"w_conf": 0.3, "w_depth": 0.25, "w_fresh": 0.15, '
+        '"w_juris": 0.15, "w_kind": 0.05, "w_div": 0.2, "w_juris_div": 0.1}',
+    )
     # NTS_099 §2 — "дешёвая модель (gpt-4o-mini или аналог)". A config key so
     # swapping the guard model is a Settings edit, not a deploy.
     guard_model: Mapped[str] = mapped_column(
@@ -1098,6 +1116,15 @@ class Candidate(Base):
     # Required from ``drafted`` onward — the link to the Sanity draft.
     sanity_draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
     publication_slot: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Which daily production batch took this candidate (NTS_100 §3.3) — the
+    # (brand, date) key from ``production_batches``. Provenance, not a lock:
+    # the "one batch per day" guarantee is the UNIQUE constraint on that table.
+    production_batch: Mapped[str | None] = mapped_column(String, nullable=True)
+    # What the editor sent back (NTS_100 §5): plan / text / translation:<lang> /
+    # blocks / cover / sources. Regeneration restarts THIS stage and everything
+    # after it, and nothing before it — which is what keeps a return costing one
+    # stage instead of a whole article.
+    return_scope: Mapped[str | None] = mapped_column(String, nullable=True)
     # EN canon was edited after translation (NTS_107 §4).
     canon_dirty: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("0")
@@ -1288,4 +1315,41 @@ class FactPack(Base):
         Index("ix_fact_packs_draft", "sanity_draft_id"),
         Index("ix_fact_packs_topic", "topic_id"),
         Index("ix_fact_packs_brand_created", "brand_id_fk", "created_at"),
+    )
+
+
+class ProductionBatch(Base):
+    """One production run's claim on one day of one brand (NTS_100 §3.3).
+
+    "``production_batch`` = (brand, date) уникален — повторный запуск в тот же
+    день ничего не берёт." The guarantee is the UNIQUE constraint, not a
+    SELECT-then-INSERT: the case this exists for is a cron firing while the
+    operator presses "Run now", and a read-then-write check loses that race in
+    exactly the situation that costs money twice.
+
+    A run with an empty portfolio still writes its row with
+    ``selected_count=0``. "The run happened and found nothing" and "the run
+    never happened" are different facts, and only one of them is a bug.
+    """
+
+    __tablename__ = "production_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=False
+    )
+    # The brand's local date (NTS_098 §5) — the day the operator means.
+    batch_date: Mapped[date] = mapped_column(Date, nullable=False)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "brand_id_fk", "batch_date", name="uq_production_batch_day"
+        ),
     )

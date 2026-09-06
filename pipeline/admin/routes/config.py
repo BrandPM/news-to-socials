@@ -25,6 +25,8 @@ _JSON_COLUMNS = (
     "jurisdiction_tiers",
     "prefilter_deny_title_patterns",
     "prefilter_languages",
+    # NTS_100 §2 — the rank weights, migration 026.
+    "rank_weights",
 )
 
 

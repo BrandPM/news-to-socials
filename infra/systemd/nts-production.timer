@@ -1,0 +1,16 @@
+[Unit]
+Description=Run News-to-Socials production twice a week (NTS_123 §S4)
+Requires=nts-production.service
+
+[Timer]
+# Wednesday and Sunday, 05:00 UTC — an hour before the intake so the
+# production run works the portfolio as it stood at the end of the previous
+# day, and the operator reads one funnel per morning rather than two.
+# The rhythm is NTS_123's; NTS_098 §5 wrote "daily", and the difference is
+# absorbed by the weekly budget (weekly_draft_budget), which counts articles
+# per ISO week rather than per run.
+OnCalendar=Wed,Sun *-*-* 05:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=News-to-Socials: daily portfolio passes — TTL, production timeout, retention (NTS_100 §6)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials/repo
+EnvironmentFile=/opt/news-to-socials/repo/.env
+# Runs every day, unlike production (Wed/Sun): NTS_100 §6 makes the three
+# passes daily, and a candidate must not sit four days past its TTL waiting
+# for Wednesday. Not gated on production_enabled — expiry and retention are
+# hygiene, not generation, and they cost nothing.
+ExecStart=/opt/news-to-socials/repo/.venv/bin/python -m pipeline.selector.portfolio_sweep icon
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/news-to-socials /opt/news-to-socials/repo
+MemoryMax=256M
+
+StandardOutput=append:/var/log/news-to-socials/production.log
+StandardError=append:/var/log/news-to-socials/production.log

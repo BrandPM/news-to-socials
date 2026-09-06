@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -379,6 +380,43 @@ class SanityPublisher:
 
     async def publish_draft(self, post: SanityPostInput) -> str:
         """Create a draft document in Sanity. Returns the draft's ``_id``."""
+        doc = await self._build_draft_doc(post)
+        draft_id = await self.client.create_draft(doc)
+        return draft_id
+
+    async def publish_draft_batch(
+        self, posts: Sequence[SanityPostInput]
+    ) -> list[str]:
+        """Create every language sibling in ONE Sanity transaction (NTS_100 §4).
+
+        The spec asks for the four siblings to be written as a single
+        transaction, and for a failed transaction to leave no draft behind.
+        Four separate ``create`` calls can and did leave an article
+        half-translated in the Studio: the editor sees an EN draft, the UK one
+        never arrives, and nothing in the system knows the set is incomplete.
+        Sanity applies a mutation list atomically, so either all four documents
+        exist or none do.
+
+        Ids are pre-generated per document (so the returned list is ordered
+        like ``posts``) and slug de-duplication still runs per language before
+        the transaction — those are reads, and doing them inside would not make
+        them any more atomic.
+        """
+        if not posts:
+            return []
+        docs = [await self._build_draft_doc(post) for post in posts]
+        await self.client.mutate([{"create": doc} for doc in docs])
+        draft_ids = [str(doc["_id"]) for doc in docs]
+        log.info("sanity.draft_batch_created", ids=draft_ids, count=len(draft_ids))
+        return draft_ids
+
+    async def _build_draft_doc(self, post: SanityPostInput) -> dict[str, Any]:
+        """The Sanity ``post`` document for one language, ready to create.
+
+        Split out of :meth:`publish_draft` so the single-document path and the
+        four-sibling transaction build byte-identical documents — the failure
+        mode of two builders is one of them quietly missing ``displayDate``.
+        """
         body_pt = markdown_to_portable_text(post.body_markdown)
         read_time = estimate_read_time(post.body_markdown)
         # Pre-generate the document id so the slug-uniqueness check can
@@ -422,8 +460,7 @@ class SanityPublisher:
             if post.cover_image_alt:
                 doc["coverImageAlt"] = post.cover_image_alt[:200]
 
-        draft_id = await self.client.create_draft(doc)
-        return draft_id
+        return doc
 
     async def promote_draft_to_published(
         self, draft_id: str, *, published_at: datetime | None = None

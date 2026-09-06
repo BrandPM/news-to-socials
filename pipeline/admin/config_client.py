@@ -150,6 +150,23 @@ class ConfigRecord:
     # cannot read admin.db must not decide on its own to spend money.
     intake_enabled: bool = False
     v2_generation_enabled: bool = False
+    # NTS_114 S4 — the v3 generation path, migration 026. Same rule as the two
+    # above on the fallback path: a runtime that cannot read admin.db must not
+    # decide on its own to start producing.
+    production_enabled: bool = False
+    # NTS_100 §2 — the rank formula's seven weights, parsed here like the other
+    # JSON-as-TEXT keys so the selector never sees a string.
+    rank_weights: Mapping[str, float] = MappingProxyType(
+        {
+            "w_conf": 0.30,
+            "w_depth": 0.25,
+            "w_fresh": 0.15,
+            "w_juris": 0.15,
+            "w_kind": 0.05,
+            "w_div": 0.20,
+            "w_juris_div": 0.10,
+        }
+    )
     guard_model: str = "gpt-4o-mini"
 
 
@@ -231,6 +248,9 @@ def _v3_keys(row: Any) -> dict[str, Any]:
     )
     langs = _json_or_default(
         getattr(row, "prefilter_languages", None), list(d.prefilter_languages)
+    )
+    weights = _json_or_default(
+        getattr(row, "rank_weights", None), dict(d.rank_weights)
     )
     return {
         "publication_slots": tuple(slots),
@@ -319,6 +339,17 @@ def _v3_keys(row: Any) -> dict[str, Any]:
         ),
         "v2_generation_enabled": bool(
             getattr(row, "v2_generation_enabled", d.v2_generation_enabled)
+        ),
+        "production_enabled": bool(
+            getattr(row, "production_enabled", d.production_enabled)
+        ),
+        # A weight the operator zeroed is a weight the operator zeroed, so the
+        # per-key fallback is only for keys the JSON does not mention at all.
+        "rank_weights": MappingProxyType(
+            {
+                str(key): _float_or(dict(weights).get(key), default)
+                for key, default in d.rank_weights.items()
+            }
         ),
         "guard_model": _str_or(getattr(row, "guard_model", None), d.guard_model),
     }

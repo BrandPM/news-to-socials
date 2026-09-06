@@ -356,10 +356,20 @@ def downgrade() -> None:
             # A feed that has produced work stays: deleting it would either
             # break a RESTRICT FK or orphan provenance. Downgrade is for
             # undoing a deploy, not for erasing history.
+            #
+            # ``source_health_records`` joined this list in S4. It was missed
+            # first time round because on 2026-08-28 the new feeds had no
+            # health history yet; a week of intake later, a primary feed that
+            # was fetched but never produced a candidate had 23 health rows and
+            # no other trace, so the downgrade deleted the source and left them
+            # pointing at nothing. ``PRAGMA foreign_key_check`` on a rehearsed
+            # rollback of the prod database is what surfaced it.
             used = bind.execute(
                 sa.text(
                     "SELECT (SELECT COUNT(*) FROM topics WHERE source_id = :s) + "
-                    "(SELECT COUNT(*) FROM candidates WHERE source_id_fk = :s)"
+                    "(SELECT COUNT(*) FROM candidates WHERE source_id_fk = :s) + "
+                    "(SELECT COUNT(*) FROM source_health_records "
+                    "WHERE source_id = :s)"
                 ),
                 {"s": source_id},
             ).scalar()

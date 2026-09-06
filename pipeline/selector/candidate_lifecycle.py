@@ -187,6 +187,61 @@ def link_candidate_to_draft(
     return True
 
 
+def begin_production(
+    *,
+    candidate_id: int,
+    brand_id_fk: int,
+    batch_key: str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """``selected`` → ``in_production`` (NTS_098 §2). ``True`` if it stuck.
+
+    A compare-and-set like every other transition here, and for the same
+    reason: ``claim_pending`` already decided who owns this candidate, but the
+    two calls are not one transaction, and a crash between them must leave a
+    row the timeout sweep can recognise. ``in_production`` is the only status
+    :func:`pipeline.selector.portfolio_sweep.sweep_production_timeouts` looks
+    at, so a candidate that never reaches it would be stuck in ``selected``
+    until its TTL — invisible, and paid for.
+
+    ``returned`` is admitted so a regeneration after an editor return
+    (NTS_100 §5) goes back through the same door rather than a parallel one.
+    """
+    from sqlalchemy import update
+
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import Candidate
+
+    now = now or datetime.now(tz=UTC)
+    values: dict[str, Any] = {"status": "in_production", "selected_at": now}
+    if batch_key is not None:
+        values["production_batch"] = batch_key
+    with get_session_factory()() as session:
+        result = session.execute(
+            update(Candidate)
+            .where(
+                Candidate.id == candidate_id,
+                Candidate.brand_id_fk == brand_id_fk,
+                Candidate.status.in_(("selected", "returned")),
+            )
+            .values(**values)
+        )
+        if not result.rowcount:  # type: ignore[attr-defined]
+            session.rollback()
+            log.warning(
+                "candidate_lifecycle.production_refused",
+                candidate_id=candidate_id,
+            )
+            return False
+        session.commit()
+    log.info(
+        "candidate_lifecycle.production_started",
+        candidate_id=candidate_id,
+        batch=batch_key,
+    )
+    return True
+
+
 def candidate_for_draft(
     sanity_draft_id: str, brand_id_fk: int
 ) -> int | None:
@@ -544,6 +599,63 @@ def candidate_spend_usd(candidate_id: int) -> float:
         )
 
 
+def monthly_spend_usd(
+    brand_id_fk: int, *, now: datetime | None = None
+) -> float:
+    """Everything this brand has spent in the calendar month of ``now``.
+
+    The denominator of ``monthly_spend_cap_usd`` (NTS_106 §3). Calendar month
+    in UTC rather than a rolling 30 days, because the number has to match the
+    one the operator reads on the Portfolio screen and the one an invoice
+    shows.
+    """
+    from sqlalchemy import func, select
+
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import CostRecord
+
+    now = now or datetime.now(tz=UTC)
+    start = now.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=UTC
+    )
+    with get_session_factory()() as session:
+        return float(
+            session.execute(
+                select(func.coalesce(func.sum(CostRecord.cost_usd), 0.0)).where(
+                    CostRecord.brand_id_fk == brand_id_fk,
+                    CostRecord.created_at >= start,
+                )
+            ).scalar()
+            or 0.0
+        )
+
+
+def run_spend_usd(run_id: int | None) -> float:
+    """Everything charged to one ``runs`` row so far.
+
+    Used by the production loop's own ceiling (``--cost-cap-usd``), which is a
+    different question from the monthly cap: "is this one run about to run
+    away with the budget", asked between candidates rather than once at the
+    start.
+    """
+    if run_id is None:
+        return 0.0
+    from sqlalchemy import func, select
+
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import CostRecord
+
+    with get_session_factory()() as session:
+        return float(
+            session.execute(
+                select(func.coalesce(func.sum(CostRecord.cost_usd), 0.0)).where(
+                    CostRecord.run_id == run_id
+                )
+            ).scalar()
+            or 0.0
+        )
+
+
 def exceeds_cost_cap(candidate_id: int, cap_usd: float) -> bool:
     """``max_cost_per_candidate_usd`` (NTS_106 §3), now that it is computable.
 
@@ -551,9 +663,11 @@ def exceeds_cost_cap(candidate_id: int, cap_usd: float) -> bool:
     uses — rather than "everything is over budget", which is how a fresh config
     row with an unset key would otherwise stop all production.
 
-    **No caller yet.** The production loop this belongs in is S4; it is here
-    because the ceiling was not merely unenforced but arithmetically impossible
-    before ``cost_records.candidate_id_fk`` existed (NTS_121 §2).
+    Called by the production run (S4) both before starting a candidate — a
+    retry of one that already burned its budget must not buy a second draft —
+    and after it drafts. Until ``cost_records.candidate_id_fk`` existed
+    (migration 025) this ceiling was not merely unenforced but arithmetically
+    impossible (NTS_121 §2).
     """
     if cap_usd is None or cap_usd <= 0:
         return False

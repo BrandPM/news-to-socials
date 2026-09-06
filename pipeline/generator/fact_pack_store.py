@@ -112,3 +112,50 @@ def persist_fact_pack(
             topic_id=topic_id,
         )
         return None
+
+
+def load_latest_fact_pack(candidate_id: int) -> tuple[int, dict[str, Any]] | None:
+    """The newest **non-empty** pack for a candidate, as ``(row_id, pack)``.
+
+    NTS_100 §4 — "частично записанные артефакты (fact pack, кэш документа)
+    **сохраняются** и переиспользуются при повторе: повтор не платит за ресёрч
+    заново". A production retry after a failure in composition or translation
+    must not buy the same research a second time; research is 59% of the cost
+    of an article (NTS_122), so this is the difference between a cheap retry
+    and a doubled bill.
+
+    Empty packs are skipped on purpose: a row saying "research produced
+    nothing" is a valuable record and a useless input, and reusing it would
+    make one bad research call permanent for that candidate.
+    """
+    try:
+        from sqlalchemy import select
+
+        from pipeline.admin.db import get_session_factory
+        from pipeline.admin.models import FactPack
+
+        with get_session_factory()() as session:
+            rows = (
+                session.execute(
+                    select(FactPack.id, FactPack.pack)
+                    .where(FactPack.candidate_id_fk == candidate_id)
+                    .order_by(FactPack.created_at.desc(), FactPack.id.desc())
+                    .limit(10)
+                )
+                .all()
+            )
+        for row_id, raw in rows:
+            try:
+                pack = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                continue
+            if isinstance(pack, dict) and not pack.get("empty", True):
+                return int(row_id), pack
+        return None
+    except Exception as exc:
+        log.warning(
+            "fact_pack.load_failed",
+            candidate_id=candidate_id,
+            err=f"{type(exc).__name__}: {exc}",
+        )
+        return None

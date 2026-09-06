@@ -719,7 +719,9 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
         cost_context,
     )
     from pipeline.common.models import Language, Topic
+    from pipeline.production import batch_key
     from pipeline.selector import candidate_lifecycle as lifecycle
+    from pipeline.selector.candidate_lifecycle import begin_production
     from pipeline.selector.candidate_dedup import (
         CandidateDedupConfig,
         check_post_guard,
@@ -998,24 +1000,51 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
         )
 
         # ---- 6. select ------------------------------------------------
+        # S4 closed this. The rank runs for real here — over the one candidate
+        # the walkthrough built — so a regression in the formula shows up as a
+        # changed stage line rather than as a silently different ordering in
+        # production.
+        from pipeline.production import eligible_candidates
+        from pipeline.selector.ranking import RankWeights, select_batch
+
         before = table_counts()
+        facts = eligible_candidates(brand_id_fk=brand_id, now=now)
+        picks = select_batch(
+            facts,
+            weights=RankWeights.from_config(config),
+            tiers=getattr(config, "jurisdiction_tiers", {}) or {},
+            now=now,
+            limit=int(getattr(config, "weekly_draft_budget", 6)),
+        )
+        top = picks[0] if picks else None
         won = claim_pending(candidate_id, now=now)
+        started = begin_production(
+            candidate_id=candidate_id,
+            brand_id_fk=brand_id,
+            batch_key=batch_key("icon", now.date()),
+        )
         ledger.add(
             Stage(
                 name="select",
-                status=GAP,
-                owner="S4",
                 inputs=(
-                    "candidates in `pending`; weekly_draft_budget="
-                    f"{getattr(config, 'weekly_draft_budget', '?')}"
+                    f"{len(facts)} eligible in `pending`; weekly_draft_budget="
+                    f"{getattr(config, 'weekly_draft_budget', '?')}; "
+                    f"weights={RankWeights.from_config(config)}"
                 ),
-                outputs=f"claim_pending → {won} (status now `selected`)",
+                outputs=(
+                    f"rank={top.rank:.4f} "
+                    f"({', '.join(f'{k}={v:+.3f}' for k, v in top.terms.items() if not k.startswith('_'))})"
+                    if top
+                    else "no eligible candidate"
+                )
+                + f"; claim_pending → {won}; begin_production → {started}",
                 db_writes=diff_counts(before, table_counts()),
                 note=(
-                    "the atomic claim exists and works. What does NOT: the "
-                    "NTS_100 rank formula with its logged terms, the "
-                    "weekly_draft_budget ceiling, the production_timeout_min "
-                    "sweep and the TTL pass — no key of the four has a reader"
+                    "S4: the formula's terms are logged per candidate, the "
+                    "batch is claimed once per (brand, day), and the four keys "
+                    "NTS_121 §2 found without a reader — weekly_draft_budget, "
+                    "production_timeout_min, candidate_ttl_days, "
+                    "retention_days_rejected — all have one now"
                 ),
             )
         )

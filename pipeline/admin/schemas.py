@@ -277,9 +277,12 @@ class PipelineConfigOut(BaseModel):
     prefilter_max_age_hours_primary: int
     prefilter_languages: list[str]
     prefilter_min_summary_chars: int
-    # Mode flags (NTS_103) — migration 022
+    # Mode flags (NTS_103) — migration 022 + 026
     intake_enabled: bool
     v2_generation_enabled: bool
+    production_enabled: bool
+    # Rank formula weights (NTS_100 §2) — migration 026
+    rank_weights: dict[str, float]
     guard_model: str
     updated_at: datetime
 
@@ -302,7 +305,7 @@ class PipelineConfigOut(BaseModel):
             return json.loads(v) if v else []
         return list(v) if isinstance(v, tuple) else v
 
-    @field_validator("candidate_ttl_days", "jurisdiction_tiers", mode="before")
+    @field_validator("candidate_ttl_days", "jurisdiction_tiers", "rank_weights", mode="before")
     @classmethod
     def _parse_json_obj(cls, v: Any) -> Any:
         if isinstance(v, str):
@@ -314,7 +317,21 @@ class PipelineConfigUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scoring_threshold: int | None = Field(default=None, ge=1, le=10)
-    topics_per_run: int | None = Field(default=None, ge=1, le=10)
+    # NTS_121 §2 / NTS_114 S4 — DEPRECATED. The slider has no consumer in the
+    # pipeline: v2's per-source limit comes from the CLI ``--limit`` and the v3
+    # production batch is bounded by ``weekly_draft_budget``. Kept writable
+    # because the deployed Settings form still submits it; the field goes in
+    # S7 and the column in S10 with the rest of v2 (Andriy, 2026-08-28).
+    topics_per_run: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description=(
+            "DEPRECATED (NTS_121 §2): no consumer in the pipeline. v2 takes "
+            "its limit from the CLI, v3 production from weekly_draft_budget. "
+            "Removed from the form in S7, column dropped in S10."
+        ),
+    )
     banned_phrases: list[str] | None = None
     voice_profile: str | None = None
     stale_draft_days: int | None = Field(default=None, ge=1, le=60)
@@ -364,6 +381,8 @@ class PipelineConfigUpdate(BaseModel):
     # Mode flags (NTS_103 шаг 1/3) — the cutover is flags, not deploys.
     intake_enabled: bool | None = None
     v2_generation_enabled: bool | None = None
+    production_enabled: bool | None = None
+    rank_weights: dict[str, float] | None = None
     guard_model: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("brand_timezone")
@@ -381,6 +400,37 @@ class PipelineConfigUpdate(BaseModel):
             ZoneInfo(v)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError(f"unknown timezone: {v!r}") from exc
+        return v
+
+    @field_validator("rank_weights")
+    @classmethod
+    def _known_weights(
+        cls, v: dict[str, float] | None
+    ) -> dict[str, float] | None:
+        """Only the seven weights NTS_100 §2 names are read.
+
+        A key outside that set is a typo that would be saved, displayed, and
+        never used — the exact silent-config failure the sentinel suite exists
+        to prevent. Negative weights are rejected for the same reason: the
+        formula's two subtractive terms already carry their sign, so a negative
+        ``w_div`` would quietly turn the diversity penalty into a bonus.
+        """
+        if v is None:
+            return v
+        from pipeline.selector.ranking import RANK_WEIGHT_KEYS
+
+        unknown = set(v) - set(RANK_WEIGHT_KEYS)
+        if unknown:
+            raise ValueError(
+                f"unknown rank weight(s): {sorted(unknown)} — expected a "
+                f"subset of {list(RANK_WEIGHT_KEYS)}"
+            )
+        negative = sorted(k for k, value in v.items() if value < 0)
+        if negative:
+            raise ValueError(
+                f"rank weight(s) must be >= 0: {negative} — the two penalty "
+                "terms carry their own sign in the formula"
+            )
         return v
 
     @field_validator("jurisdiction_tiers")

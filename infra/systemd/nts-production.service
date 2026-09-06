@@ -1,0 +1,33 @@
+[Unit]
+Description=News-to-Socials: contour-2 production — rank, select, draft (NTS_100/NTS_103)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials/repo
+EnvironmentFile=/opt/news-to-socials/repo/.env
+# No --force, for the same reason the intake unit has none: the unit obeys
+# pipeline_config.production_enabled, so production starts and stops from
+# Settings rather than from systemctl. With the flag off the run writes a
+# 'cancelled' row and exits 0 — visible in Runs, silent in the journal.
+ExecStart=/opt/news-to-socials/repo/.venv/bin/python -m pipeline.production --brand icon --triggered-by cron
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/news-to-socials /opt/news-to-socials/repo
+# Higher than intake's 512M: this run holds a fact pack, four drafts and an
+# image buffer at once, where intake holds one feed item at a time.
+MemoryMax=1G
+# One production run must never overlap the next. The daily batch claim
+# (NTS_100 §3.3) already makes a second run a no-op, but a run still in
+# progress at the next trigger means something is wrong, not something to
+# start again alongside.
+TimeoutStartSec=3600
+
+StandardOutput=append:/var/log/news-to-socials/production.log
+StandardError=append:/var/log/news-to-socials/production.log

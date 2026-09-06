@@ -71,15 +71,33 @@ def test_the_chain_completes_through_the_slot(walkthrough_output: str):
     assert slot >= date.today()
 
 
-def test_every_stage_is_reported_and_five_are_still_unbuilt(
+def test_every_stage_is_reported_and_the_unbuilt_ones_are_named(
     walkthrough_output: str,
 ):
+    """The count of unbuilt stages is pinned, and it only ever goes down.
+
+    S4 closed the one ``gap`` (selection), which is why zero remain; the five
+    ``NOT IMPLEMENTED`` stages belong to S5 and S6 and are checked here so a
+    half-built stage cannot be quietly promoted to ``ok``.
+    """
     assert "17 total" in walkthrough_output
+    assert "0 gap" in walkthrough_output
     assert "5 not implemented" in walkthrough_output
-    for owner in ("S4", "S5", "S6"):
+    for owner in ("S5", "S6"):
         assert f"[{owner}]" in walkthrough_output, f"nothing waits on {owner}"
+    assert "[S4]" not in walkthrough_output, "S4 is done; nothing may wait on it"
     # Each unbuilt stage says so in words, not by omission.
     assert walkthrough_output.count("nothing —") >= 4
+
+
+def test_the_selection_stage_reports_the_rank_it_computed(walkthrough_output: str):
+    """S4's DoD 1 as an end-to-end check: the walkthrough prints the rank and
+    its terms, so a formula that silently stopped ranking is visible in the
+    report rather than only in a unit test."""
+    assert "rank=" in walkthrough_output
+    assert "begin_production → True" in walkthrough_output
+    for term in ("conf=", "depth=", "fresh=", "juris=", "kind="):
+        assert term in walkthrough_output, term
 
 
 def test_spend_is_accounted_but_never_charged(walkthrough_output: str):

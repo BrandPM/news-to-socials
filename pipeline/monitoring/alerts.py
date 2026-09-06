@@ -46,7 +46,8 @@ from __future__ import annotations
 import asyncio
 import html
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import select
 
@@ -94,9 +95,36 @@ VISIBILITY_PREFIXES = (
 # "recovered" reconciliation.
 BACKUP_STALE_PREFIX = "backup_stale:"
 
+# NTS_100 §3.5 / NTS_106 §3 — the three production pulses added in S4. All
+# one-shot: their dedup keys carry a date or a candidate id, so the key rolls
+# on its own and there is nothing for the "recovered" pass to clear.
+#
+# ``thin_portfolio`` is the one that has to fire EARLY: NTS_100 §3.5 says the
+# alert goes out three days before a slot, not on the morning of it. A calendar
+# that tells you it is empty on the day it is empty is a calendar, not an alert.
+THIN_PORTFOLIO_PREFIX = "thin_portfolio:"
+CANDIDATE_FAILED_PREFIX = "candidate_failed:"
+SPEND_CAP_PREFIX = "spend_cap:"
+PRODUCTION_PREFIXES = (
+    THIN_PORTFOLIO_PREFIX,
+    CANDIDATE_FAILED_PREFIX,
+    SPEND_CAP_PREFIX,
+)
+
+# NTS_100 §3.5 — how far ahead the thin-portfolio pulse looks.
+THIN_PORTFOLIO_LEAD_DAYS = 3
+
+_WEEKDAY_INDEX = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+}
+
 # One-shot alert_sent keys that must NOT be treated as clearable incidents in
 # the "recovered" reconciliation (visibility pulses + backup-stale pulses).
-ONESHOT_PREFIXES = (*VISIBILITY_PREFIXES, BACKUP_STALE_PREFIX)
+ONESHOT_PREFIXES = (
+    *VISIBILITY_PREFIXES,
+    BACKUP_STALE_PREFIX,
+    *PRODUCTION_PREFIXES,
+)
 
 # Only look back this far when detecting visibility pulses — bounds the query
 # and stops the first tick after a deploy from replaying the whole backlog.
@@ -360,6 +388,260 @@ def format_intake_heartbeat(
         )
     lines.append(f"🕓 {_fmt_hm(finished_at)} UTC")
     return "\n".join(lines)
+
+
+# --- Production pulses (NTS_100 §3.5, NTS_106 §3) — S4 ---------------------
+
+
+def format_thin_portfolio(
+    *,
+    slot_date: date,
+    capacity: int,
+    in_pipeline: int,
+    brand_name: str | None = None,
+) -> str:
+    """🟡 the slot in three days has less coming than it can hold.
+
+    NTS_100 §3.5 is explicit that an empty portfolio is a *valid* outcome of a
+    production run and must not be reported as a failure — the alert belongs to
+    the calendar, three days out, when there is still time to promote something
+    by hand. Reported in absolute numbers for the same reason the intake
+    heartbeat is (NTS_106 §2): "0 of 2" and "1 of 2" call for different actions.
+    """
+    who = f" · {html.escape(brand_name)}" if brand_name else ""
+    return "\n".join(
+        [
+            f"🟡 <b>Тонкий портфель{who}</b>",
+            f"Слот {slot_date.isoformat()}: ёмкость {capacity}, "
+            f"в работе {in_pipeline}",
+            "Продвинь кандидата из «Портфеля» или прими, что выйдет меньше.",
+            _link(f"{ALERT_BASE_URL}/portfolio", "Открыть портфель"),
+        ]
+    )
+
+
+def format_candidate_failed(
+    *,
+    candidate_id: int,
+    title: str,
+    attempts: int,
+    last_error: str | None,
+    brand_name: str | None = None,
+) -> str:
+    """🔴 a candidate hit ``max_attempts`` and is terminal (NTS_100 §4)."""
+    who = f" · {html.escape(brand_name)}" if brand_name else ""
+    lines = [
+        f"🔴 <b>Кандидат провалил производство{who}</b>",
+        f"#{candidate_id} · {html.escape(title[:120])}",
+        f"Попыток: {attempts} — дальше только вручную, из «Портфеля».",
+    ]
+    if last_error:
+        lines.append(f"<code>{html.escape(last_error[:300])}</code>")
+    lines.append(_link(f"{ALERT_BASE_URL}/portfolio", "Открыть портфель"))
+    return "\n".join(lines)
+
+
+def format_spend_cap(
+    *,
+    spent_usd: float,
+    cap_usd: float,
+    stopped: bool,
+    brand_name: str | None = None,
+) -> str:
+    """🟡 at 80% of the monthly cap, 🔴 at 100% (NTS_106 §3).
+
+    The two are one message with two faces on purpose: they are the same fact
+    at two thresholds, and the second one has to say what actually stopped —
+    production, not intake, which keeps running at cents a day.
+    """
+    who = f" · {html.escape(brand_name)}" if brand_name else ""
+    pct = (spent_usd / cap_usd * 100.0) if cap_usd else 0.0
+    head = "🔴 <b>Месячный кап исчерпан" if stopped else "🟡 <b>Месячный кап на исходе"
+    lines = [
+        f"{head}{who}</b>",
+        f"Потрачено ${spent_usd:.2f} из ${cap_usd:.2f} ({pct:.0f}%)",
+    ]
+    lines.append(
+        "Производство не стартует; интейк продолжает работать."
+        if stopped
+        else "Производство ещё идёт. Подними кап или подожди начала месяца."
+    )
+    lines.append(_link(f"{ALERT_BASE_URL}/settings", "Настройки"))
+    return "\n".join(lines)
+
+
+def check_thin_portfolio(
+    *,
+    brand_id_fk: int,
+    slots: Any,
+    timezone_name: str | None,
+    now: datetime,
+    brand_name: str | None = None,
+) -> tuple[str, str] | None:
+    """A pulse for the nearest slot exactly ``lead`` days out, if it is thin.
+
+    Returns ``(alert_sent key, message)`` or ``None``. Counted against every
+    candidate that could still reach that slot — ``ready``, ``drafted``,
+    ``returned`` and ``in_production`` — because an article being written right
+    now is not a hole in the calendar.
+    """
+    from pipeline.selector.candidate_lifecycle import parse_slots
+    from pipeline.selector.candidate_store import resolve_timezone
+
+    parsed = parse_slots(slots)
+    if not parsed:
+        return None
+    weekdays: dict[int, int] = {}
+    for entry in parsed:
+        index = _WEEKDAY_INDEX[entry["day"]]
+        weekdays[index] = weekdays.get(index, 0) + int(entry["capacity"])
+
+    target = (
+        now.astimezone(resolve_timezone(timezone_name)).date()
+        + timedelta(days=THIN_PORTFOLIO_LEAD_DAYS)
+    )
+    capacity = weekdays.get(target.weekday())
+    if not capacity:
+        return None
+
+    from pipeline.admin.models import Candidate
+
+    with session_scope() as session:
+        in_pipeline = len(
+            session.execute(
+                select(Candidate.id).where(
+                    Candidate.brand_id_fk == brand_id_fk,
+                    Candidate.status.in_(
+                        ("in_production", "drafted", "returned", "ready")
+                    ),
+                )
+            ).all()
+        )
+    if in_pipeline >= capacity:
+        return None
+    return (
+        f"{THIN_PORTFOLIO_PREFIX}{brand_id_fk}:{target.isoformat()}",
+        format_thin_portfolio(
+            slot_date=target,
+            capacity=capacity,
+            in_pipeline=in_pipeline,
+            brand_name=brand_name,
+        ),
+    )
+
+
+def _gather_production_events(
+    already: set[str], *, now: datetime | None = None
+) -> list[tuple[str, str]]:
+    """Failed candidates, thin slots and the spend cap, for every active brand.
+
+    Pull-based like every other gatherer here: the production run itself only
+    writes rows and logs, and the monitoring pass decides what is worth a
+    message. That keeps a Telegram outage from being able to fail a run, and it
+    means an alert missed while the bot was down is re-detected on the next
+    pass rather than lost (NTS_106 §1).
+    """
+    from pipeline.admin.models import Candidate, PipelineConfig
+    from pipeline.selector.candidate_lifecycle import monthly_spend_usd
+
+    now = now or datetime.now(tz=UTC)
+    out: list[tuple[str, str]] = []
+    with session_scope() as session:
+        brands = (
+            session.execute(select(Brand).where(Brand.active.is_(True)))
+            .scalars()
+            .all()
+        )
+        multi = len(brands) > 1
+        rows = [
+            (
+                b.id,
+                b.name if multi else None,
+                session.get(PipelineConfig, b.id),
+            )
+            for b in brands
+        ]
+        configs = [
+            (
+                bid,
+                name,
+                getattr(cfg, "publication_slots", None),
+                getattr(cfg, "brand_timezone", None),
+                float(getattr(cfg, "monthly_spend_cap_usd", 0.0) or 0.0),
+            )
+            for bid, name, cfg in rows
+        ]
+        failures = (
+            session.execute(
+                select(
+                    Candidate.id,
+                    Candidate.brand_id_fk,
+                    Candidate.source_title,
+                    Candidate.attempts,
+                    Candidate.last_error,
+                ).where(
+                    Candidate.status == "failed",
+                    Candidate.failed_at.is_not(None),
+                    Candidate.failed_at >= (now - VISIBILITY_WINDOW).replace(tzinfo=None),
+                )
+            )
+        ).all()
+
+    names = {bid: name for bid, name, *_ in configs}
+    for cid, brand_id, title, attempts, last_error in failures:
+        key = f"{CANDIDATE_FAILED_PREFIX}{cid}"
+        if key in already:
+            continue
+        out.append(
+            (
+                key,
+                format_candidate_failed(
+                    candidate_id=int(cid),
+                    title=title or "(untitled)",
+                    attempts=int(attempts or 0),
+                    last_error=last_error,
+                    brand_name=names.get(brand_id),
+                ),
+            )
+        )
+
+    for brand_id, name, slots, tz_name, cap in configs:
+        pulse = check_thin_portfolio(
+            brand_id_fk=brand_id,
+            slots=slots,
+            timezone_name=tz_name,
+            now=now,
+            brand_name=name,
+        )
+        if pulse is not None and pulse[0] not in already:
+            out.append(pulse)
+        if cap <= 0:
+            continue
+        spent = monthly_spend_usd(brand_id, now=now)
+        # Two thresholds, one key per month per threshold: 80% is a warning
+        # while there is still room to act, 100% is the kill-switch reporting
+        # that it fired.
+        for threshold, stopped in ((1.0, True), (0.8, False)):
+            if spent < cap * threshold:
+                continue
+            key = (
+                f"{SPEND_CAP_PREFIX}{brand_id}:{now.strftime('%Y-%m')}:"
+                f"{int(threshold * 100)}"
+            )
+            if key not in already:
+                out.append(
+                    (
+                        key,
+                        format_spend_cap(
+                            spent_usd=spent,
+                            cap_usd=cap,
+                            stopped=stopped,
+                            brand_name=name,
+                        ),
+                    )
+                )
+            break
+    return out
 
 
 # --- Backup heartbeat (NTS_088) --------------------------------------------
@@ -726,6 +1008,14 @@ async def run_alerts(
         visibility.extend(await _gather_published_events(already))
     except Exception:  # noqa: BLE001 — unattended; never crash the timer
         log.exception("alerts.visibility_gather_failed")
+
+    # NTS_100 §3.5 / NTS_106 §3 — production pulses. Gathered in their own try
+    # so a schema that predates migration 026 costs these three alerts and not
+    # the whole pass.
+    try:
+        visibility.extend(_gather_production_events(already))
+    except Exception:  # unattended; never crash the timer
+        log.exception("alerts.production_gather_failed")
 
     # NTS_088 — backup-heartbeat check. One-shot pulse (dedup key rolls daily),
     # gathered defensively so a filesystem hiccup can't crash the timer.

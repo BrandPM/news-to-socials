@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -210,6 +211,53 @@ class FactPack:
             lines.append("CITATIONS (the only URLs behind the facts above):")
             lines.extend(f"  - {u}" for u in self.citations)
         return "\n".join(lines)
+
+
+def fact_pack_from_dict(
+    stored: Mapping[str, Any] | None,
+) -> FactPack | None:
+    """Rebuild a pack from the row ``fact_packs`` stored (NTS_100 §4).
+
+    The inverse of ``pipeline.run._fact_pack_as_dict``, and the reason a
+    production retry does not pay for research twice: the pack that the first
+    attempt bought is on disk, and research is 59% of the cost of an article
+    (NTS_122). Returns ``None`` for a stored pack that recorded an empty result
+    — that row is a valuable record of *why* an article was thin and a useless
+    input to write from.
+    """
+    if not stored or stored.get("empty", True):
+        return None
+
+    def _facts(items: Any) -> list[Fact]:
+        out: list[Fact] = []
+        for item in list(items or []):
+            if not isinstance(item, Mapping):
+                continue
+            text = str(item.get("text") or "").strip()
+            url = str(item.get("url") or "").strip()
+            # Same invariant as ``_clean_facts``: no URL, no fact. A restored
+            # pack must not be able to reintroduce a claim the live path would
+            # have dropped.
+            if not text or not url:
+                continue
+            out.append(
+                Fact(
+                    text=text,
+                    url=url,
+                    publisher=str(item.get("publisher") or ""),
+                    date=str(item.get("date") or ""),
+                )
+            )
+        return out
+
+    pack = FactPack(
+        source_facts=_facts(stored.get("source_facts")),
+        context=_facts(stored.get("context")),
+        angle_hints=[str(h) for h in list(stored.get("angle_hints") or [])],
+        citations=[str(u) for u in list(stored.get("citations") or [])],
+        searches=int(stored.get("searches") or 0),
+    )
+    return None if pack.is_empty() else pack
 
 
 # The block rendered into ``{fact_pack}`` when research produced nothing. It

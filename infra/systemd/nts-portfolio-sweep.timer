@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the News-to-Socials portfolio passes once a day (NTS_100 §6)
+Requires=nts-portfolio-sweep.service
+
+[Timer]
+# 04:40 UTC — before production (05:00 Wed/Sun) so a timed-out candidate is
+# back in `pending` and rankable the same morning, and before the intake
+# (06:10) so the daily cap is counted against a portfolio that has already
+# shed its expired rows.
+OnCalendar=*-*-* 04:40:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

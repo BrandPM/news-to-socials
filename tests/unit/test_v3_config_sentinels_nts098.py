@@ -5,8 +5,8 @@ config surface that nothing read: a value saved in Settings that the next run
 ignored, with no error anywhere. The failure is silent by nature — the run
 succeeds, it just uses a number nobody chose.
 
-So each of the 28 v3 keys — 25 from migration 020, three mode flags from 022 —
-is walked end to end:
+So each of the 30 v3 keys — 25 from migration 020, two mode flags from 022,
+and ``production_enabled`` + ``rank_weights`` from 026 — is walked end to end:
 
     migration default → ORM column → ConfigRecord → GET /config
                      → PUT /config → ConfigRecord again
@@ -114,6 +114,31 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
     # deploy which lands these keys generates nothing until a human says so.
     ("intake_enabled", False, True),
     ("v2_generation_enabled", False, True),
+    # migration 026 — the third mode flag, and the rank weights it needs.
+    # ``production_enabled`` defaults OFF for the same reason the two above do:
+    # the deploy that lands S4 must not start spending because it landed.
+    ("production_enabled", False, True),
+    (
+        "rank_weights",
+        {
+            "w_conf": 0.30,
+            "w_depth": 0.25,
+            "w_fresh": 0.15,
+            "w_juris": 0.15,
+            "w_kind": 0.05,
+            "w_div": 0.20,
+            "w_juris_div": 0.10,
+        },
+        {
+            "w_conf": 0.5,
+            "w_depth": 0.1,
+            "w_fresh": 0.1,
+            "w_juris": 0.1,
+            "w_kind": 0.1,
+            "w_div": 0.3,
+            "w_juris_div": 0.2,
+        },
+    ),
     ("guard_model", "gpt-4o-mini", "gpt-4o"),
 )
 
@@ -125,6 +150,7 @@ _JSON_KEYS = {
     "jurisdiction_tiers",
     "prefilter_deny_title_patterns",
     "prefilter_languages",
+    "rank_weights",
 }
 
 
@@ -201,7 +227,8 @@ def test_every_v3_column_has_a_sentinel() -> None:
         f"unsentinelled column(s): {sorted(v3_columns - covered)}; "
         f"sentinel for a column that no longer exists: {sorted(covered - v3_columns)}"
     )
-    assert len(_SENTINELS) == 28
+    # 25 from migration 020, three mode flags (022 + 026), rank weights (026).
+    assert len(_SENTINELS) == 30
 
 
 # --- default reaches the runtime -----------------------------------------
