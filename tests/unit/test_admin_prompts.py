@@ -59,7 +59,11 @@ _VALID_BODIES = {
     ),
     "writer_draft": (
         "Draft in {language_name} from {title} / {summary}. "
-        "Voice:{voice_profile_yaml} Banned:{banned_phrases} Facts:{fact_pack}"
+        "Voice:{voice_profile_yaml} Banned:{banned_phrases} Facts:{fact_pack} "
+        # S6 required these three (NTS_102 v2): the plan, the computed length
+        # target and the primary document. A body without them fails to
+        # activate, which is the validator doing its job.
+        "Plan:{plan} Shape:{depth_guidance} Doc:{primary_document}"
     ),
     "writer_translate": (
         "Translate {draft_json} into {language_name}. "

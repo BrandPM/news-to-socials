@@ -239,16 +239,33 @@ _TRANSLATED_JSON = {
     ),
 }
 
+# Written with ``value`` / ``unit`` / ``comparable_group`` filled in, because
+# those three fields are what depth_final counts and what a data block is built
+# from (NTS_102 v2 §1). A fake pack without them would let the block generator
+# report "nothing to build" for the wrong reason.
 _RESEARCH_JSON = {
     "source_facts": [
         {
-            "text": "ESMA proposes a 40-working-day completeness assessment",
+            "text": "The assessment clock stood at 40 working days before the review",
             "url": "https://www.esma.europa.eu/press-news/consultation-casp",
             "publisher": "ESMA",
             "date": "2026-08-27",
+            "value": "40",
+            "unit": "working days",
+            "comparable_group": "assessment clock",
         },
         {
-            "text": "Consultation closes 2026-11-14",
+            "text": "ESMA proposes shortening the assessment clock to 25 working days",
+            "url": "https://www.esma.europa.eu/press-news/consultation-casp",
+            "publisher": "ESMA",
+            "date": "2026-08-27",
+            "value": "25",
+            "unit": "working days",
+            "comparable_group": "assessment clock",
+        },
+        {
+            "text": "Consultation closes 2026-11-14; the standards apply from "
+            "1 January 2027",
             "url": "https://www.esma.europa.eu/press-news/consultation-casp",
             "publisher": "ESMA",
             "date": "2026-08-27",
@@ -296,6 +313,51 @@ The fee for a re-submitted application is set at EUR 5 000.
 """
 
 
+_PLAN_JSON = {
+    "sections": [
+        {
+            "heading": "The clock, and what resets it",
+            "purpose": "state the mechanism the consultation changes",
+            "facts": [
+                "The assessment clock stood at 40 working days before the review"
+            ],
+            "document_sections": ["Article 3"],
+            "block": "statTable",
+        },
+        {
+            "heading": "Who is already in the queue",
+            "purpose": "name the exposure",
+            "facts": ["17 CASP licences granted across the EU in H1 2026"],
+            "document_sections": ["Article 7"],
+            "block": "none",
+        },
+    ],
+    "lede": "Applicants already in the queue get a new clock, not a shorter one.",
+    "close": "Anyone filing before 1 January 2027 files under the old standard.",
+    "omitted": ["the Q&A annex — it carries no figures"],
+}
+
+# One confirmed, one uncovered: enough for the report's proportions to mean
+# something, and no ``distorted``, so the walkthrough does not exercise the
+# repair cycle it would then have to fake the output of as well.
+_ATTRIBUTION_JSON = {
+    "claims": [
+        {
+            "claim": "the assessment clock falls from 40 to 25 working days",
+            "verdict": "confirmed",
+            "why": "both figures are in the consultation paper",
+            "flags": [],
+        },
+        {
+            "claim": "applicants will need new legal advice",
+            "verdict": "uncovered",
+            "why": "reasonable, but no source says it",
+            "flags": [],
+        },
+    ]
+}
+
+
 class FakeCompletions:
     """``chat.completions.create`` for the guard, the writer and the judge.
 
@@ -335,6 +397,14 @@ class FakeCompletions:
         # Matched on the prompts' own opening lines rather than on a loose
         # keyword: "editor" and "translate" both appear in more than one of
         # them, and a fake that answers the wrong prompt hides a routing bug.
+        # S6 — the plan and the attribution check. Dispatched on their own
+        # opening lines, like every other prompt here.
+        if "you are planning an expert commentary" in lowered:
+            self._calls.append("plan")
+            return _completion(json.dumps(_PLAN_JSON), 3100, 320)
+        if "you check whether an article" in lowered:
+            self._calls.append("attribution")
+            return _completion(json.dumps(_ATTRIBUTION_JSON), 4200, 260)
         if "you are a faithful translator" in lowered:
             self._calls.append("translate")
             return _completion(json.dumps(_TRANSLATED_JSON), 2400, 900)
@@ -1271,20 +1341,65 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
             )
         )
 
-        # ---- 9. plan --------------------------------------------------
+        # ---- 9. depth_final + plan ------------------------------------
+        # S6 closed this. Depth is computed from the material and the plan is
+        # a real (faked-model) call whose output is stored on the pack.
+        from pipeline.generator import composition as comp_mod
+
+        before = table_counts()
+        depth_decision = comp_mod.compute_depth_final(
+            fact_pack,
+            article_min_facts=int(getattr(config, "depth_article_min_facts", 4)),
+            deep_min_facts=int(getattr(config, "depth_deep_min_facts", 10)),
+        )
+        targets = dict(getattr(config, "depth_length_targets", {}) or {})
+        guidance = comp_mod.depth_guidance(depth_decision.depth, targets, depth_decision)
+        plan = await comp_mod.build_plan(
+            title=first.title,
+            summary=first.summary,
+            fact_pack=fact_pack,
+            document_text=primary_document.text if primary_document else "",
+            document_url=primary_document.url if primary_document else "",
+            depth=depth_decision.depth,
+            targets=targets,
+            client=FakeOpenAI(),
+        )
+        if fact_pack_id is not None:
+            from sqlalchemy import update as _update
+
+            from pipeline.admin.models import FactPack as _FactPackRow
+
+            with get_session_factory()() as session:
+                session.execute(
+                    _update(_FactPackRow)
+                    .where(_FactPackRow.id == fact_pack_id)
+                    .values(plan=json.dumps(plan.as_dict(), ensure_ascii=False))
+                )
+                session.commit()
+        outcome["depth_final"] = depth_decision.depth
         ledger.add(
             Stage(
-                name="plan",
-                status=NOT_IMPLEMENTED,
-                owner="S6",
-                inputs="fact pack + primary document",
-                outputs="nothing — composition still goes prompt→text",
+                name="depth_final + plan",
+                inputs=(
+                    f"fact pack ({fact_pack.fact_count if fact_pack else 0} facts) "
+                    f"+ primary document; thresholds "
+                    f"{getattr(config, 'depth_article_min_facts', 4)}/"
+                    f"{getattr(config, 'depth_deep_min_facts', 10)}"
+                ),
+                outputs=(
+                    f"depth_prior={verdict.depth_prior} → "
+                    f"depth_final={depth_decision.depth} "
+                    f"(n_facts={depth_decision.n_facts}, "
+                    f"n_pairs={depth_decision.n_pairs}); "
+                    f"plan: {len(plan.sections)} section(s), "
+                    f"stored on the pack"
+                ),
+                db_writes=diff_counts(before, table_counts()),
                 note=(
-                    "NTS_102 v2: a saved plan before the text, depth_final "
-                    "from the fact count (depth_article_min_facts / "
-                    "depth_deep_min_facts have no reader), length with no "
-                    "ceiling. Today depth_prior is written and depth_final "
-                    "never is"
+                    "NTS_102 v2 §1: depth comes from the material, not from the "
+                    "guard's read of an abstract. Facts alone are not enough — "
+                    "``deep`` also needs two comparable pairs, because it "
+                    "promises a table and a table needs pairs"
                 ),
             )
         )
@@ -1299,13 +1414,19 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
             "mission: clarity for cross-border wealth\n",
             Language.en,
             fact_pack=fact_pack,
+            plan=plan.render(),
+            depth_guidance=guidance,
+            primary_document=(
+                primary_document.text if primary_document else ""
+            ),
         )
         ledger.add(
             Stage(
                 name="compose",
                 inputs=(
-                    "topic + voice profile + fact pack; prompts sourced from "
-                    "the brand's active `prompts` rows (NTS_067)"
+                    "topic + voice profile + fact pack + PLAN + document; "
+                    "prompts sourced from the brand's active `prompts` rows "
+                    f"(NTS_067). Target: {depth_decision.depth}"
                 ),
                 outputs=(
                     f"EN draft: {len(en_draft.body)} chars, "
@@ -1313,44 +1434,92 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
                 ),
                 db_writes=diff_counts(before, table_counts()),
                 note=(
-                    "this is the v2 writer (draft → polish). It works, and it "
-                    "is what S4 was told to reuse; the v3 composition — plan, "
-                    "no length ceiling, data blocks — is S6"
+                    "the draft → polish writer, now driven by the plan and by "
+                    "a length target computed from the material rather than "
+                    "written into the prompt (NTS_102 v2 §1b: the deep band "
+                    "has no ceiling)"
                 ),
             )
         )
 
         # ---- 11. data blocks ------------------------------------------
+        # The generator is built and runs here; it returns nothing while
+        # ``data_blocks_enabled`` is off, which is the correct state until the
+        # Sanity schema PR of S8 is merged (NTS_095: schema → render → pipeline).
+        blocks_flag = bool(getattr(config, "data_blocks_enabled", False))
+        blocks = comp_mod.build_data_blocks(
+            fact_pack, depth=depth_decision.depth, enabled=blocks_flag
+        )
+        would_build = comp_mod.build_data_blocks(
+            fact_pack, depth=depth_decision.depth, enabled=True
+        )
         ledger.add(
             Stage(
                 name="data blocks",
-                status=NOT_IMPLEMENTED,
-                owner="S6 + S8",
-                inputs="fact pack figures",
-                outputs="nothing — the body is markdown prose only",
+                owner="" if blocks_flag else "flag: data_blocks_enabled",
+                inputs=(
+                    f"fact pack figures; depth={depth_decision.depth}; "
+                    f"data_blocks_enabled={blocks_flag}"
+                ),
+                outputs=(
+                    f"{[b.type for b in blocks]} written; "
+                    f"{[b.type for b in would_build]} would be built with the "
+                    "flag on"
+                ),
                 note=(
-                    "NTS_095/NTS_102: keyFigures / statTable / chart generated "
-                    "strictly from the fact pack. Blocked on the Sanity schema "
-                    "PR (S8) before the pipeline may write them"
+                    "NTS_095 order is schema → render → pipeline. The generator "
+                    "exists and is tested; it writes nothing into a draft until "
+                    "the S8 PR lands and the flag is switched on"
                 ),
             )
         )
 
         # ---- 12. attribution ------------------------------------------
+        before = table_counts()
+        attribution = await comp_mod.check_attribution(
+            body=f"{en_draft.title}\n\n{en_draft.body}",
+            fact_pack=fact_pack,
+            document_text=primary_document.text if primary_document else "",
+            license_class=getattr(sources[0], "license_class", None)
+            if isinstance(sources[0], dict) is False
+            else sources[0].get("license_class"),
+            max_quote_words=getattr(config, "max_quote_words", {}),
+            client=FakeOpenAI(),
+        )
+        if fact_pack_id is not None:
+            with get_session_factory()() as session:
+                session.execute(
+                    _update(_FactPackRow)
+                    .where(_FactPackRow.id == fact_pack_id)
+                    .values(
+                        attribution=json.dumps(
+                            attribution.as_dict(), ensure_ascii=False
+                        )
+                    )
+                )
+                session.commit()
+        counts = attribution.counts()
+        outcome["attribution"] = counts
         ledger.add(
             Stage(
                 name="attribution check",
-                status=NOT_IMPLEMENTED,
-                owner="S6",
-                inputs="EN body + fact pack + primary document",
-                outputs="nothing — no confirmed/distorted/uncovered verdicts",
+                inputs="EN body + fact pack + primary document, BEFORE translation",
+                outputs=(
+                    f"confirmed {counts['confirmed']}, "
+                    f"distorted {counts['distorted']}, "
+                    f"uncovered {counts['uncovered']}; "
+                    f"person_detail {counts['person_detail']}, "
+                    f"quote_too_long {counts['quote_too_long']}; "
+                    f"needs_fix={attribution.needs_fix}"
+                ),
+                db_writes=diff_counts(before, table_counts()),
                 note=(
-                    "NTS_096 part C, and the reason it exists: '18 years of "
-                    "experience, most recently at CS and UBS' became '18-year "
-                    "tenure at CS and UBS'. Right number, right source, false "
-                    "claim — and every existing check passes it. Must run "
-                    "before translation, so the distortion is not multiplied "
-                    "by four languages"
+                    "NTS_096 part C. The reference case — '18 years of "
+                    "experience, most recently at CS and UBS' becoming "
+                    "'18-year tenure at CS and UBS' — is right number, right "
+                    "source, false claim, and every other defence passes it. "
+                    "Run here rather than after translation so one distortion "
+                    "is not bought four times"
                 ),
             )
         )
@@ -1374,20 +1543,37 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
         )
 
         # ---- 14. internal linking -------------------------------------
+        from pipeline.generator import internal_links as links_mod
+
+        _linked_body, placed = await links_mod.link_draft(
+            body=ru_draft.body,
+            language="ru",
+            category="structuring",
+            brand_id_fk=brand_id,
+            topic_id=topic.id,
+            taxonomy=taxonomy,
+            anchor_pool=(),
+        )
+        linkable = links_mod.linkable_paragraph_indexes(ru_draft.body)
         ledger.add(
             Stage(
                 name="internal linking",
-                status=NOT_IMPLEMENTED,
-                owner="S6",
                 inputs=(
                     "brand_taxonomy.service_url_path "
-                    f"({len(taxonomy)} services), published articles"
+                    f"({len(taxonomy)} services), published articles; "
+                    f"{len(linkable)} linkable paragraph(s) in the RU sibling"
                 ),
-                outputs="nothing — no linker module exists",
+                outputs=(
+                    f"{len(placed)} link(s) placed: "
+                    f"{[t.url for t in placed] or 'none — no natural anchor'}"
+                ),
                 note=(
-                    "NTS_093. The data side is ready and in use by the guard; "
-                    "there is no code that resolves a link. Must run after "
-                    "translation so each language links its own pages"
+                    "NTS_093: run per sibling AFTER translation, because the "
+                    "language prefix and the article slug are both "
+                    "per-language and a faithful translation pass must not be "
+                    "rewriting URLs. Never in the lede or the close — a "
+                    "service link in the close is the generic CTA that "
+                    "NTS_067's close rule removed"
                 ),
             )
         )

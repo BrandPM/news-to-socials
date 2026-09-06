@@ -71,23 +71,57 @@ def test_the_chain_completes_through_the_slot(walkthrough_output: str):
     assert slot >= date.today()
 
 
-def test_every_stage_is_reported_and_the_unbuilt_ones_are_named(
-    walkthrough_output: str,
-):
-    """The count of unbuilt stages is pinned, and it only ever goes down.
+def test_every_stage_runs_and_none_is_left_unbuilt(walkthrough_output: str):
+    """The whole chain, end to end, with nothing standing in for a stage.
 
-    S4 closed the one ``gap`` (selection) and S5 closed the document stage, so
-    the four that remain all belong to S6. The count is pinned here so a
-    half-built stage cannot be quietly promoted to ``ok``.
+    NTS_122 reported 11 ok, 1 gap and 5 NOT IMPLEMENTED. S4 closed the gap, S5
+    the document stage and S6 the remaining four. The counts are pinned here so
+    a stage cannot regress to a placeholder without a failing test to answer
+    for — which is the property that made this report worth writing.
     """
     assert "17 total" in walkthrough_output
+    assert "17 ok" in walkthrough_output
     assert "0 gap" in walkthrough_output
-    assert "4 not implemented" in walkthrough_output
-    assert "[S6]" in walkthrough_output, "nothing waits on S6"
-    for done in ("[S4]", "[S5]"):
+    assert "0 not implemented" in walkthrough_output
+    for done in ("[S4]", "[S5]", "[S6]"):
         assert done not in walkthrough_output, f"{done} is done; nothing waits on it"
-    # Each unbuilt stage says so in words, not by omission.
-    assert walkthrough_output.count("nothing —") >= 4
+    assert "nothing —" not in walkthrough_output
+
+
+def test_the_composition_order_is_the_one_the_spec_fixes(walkthrough_output: str):
+    """NTS_102 v2 §2 — plan, then text, then attribution, then translation.
+
+    Order, not presence: every one of these stages could pass its own unit test
+    while sitting in the wrong place, and the cost of the wrong place is one
+    distortion bought in four languages.
+    """
+    lines = walkthrough_output.splitlines()
+
+    def _at(fragment: str) -> int:
+        # Matched on the stage header, not on the words: the same phrases turn
+        # up in the notes of neighbouring stages, and a substring search would
+        # be asserting the order of the prose.
+        return next(
+            i for i, line in enumerate(lines) if line.startswith("[") and fragment in line
+        )
+
+    assert _at("9. depth_final + plan") < _at("10. compose")
+    assert _at("10. compose") < _at("12. attribution check")
+    assert _at("12. attribution check") < _at("13. translate")
+    assert _at("13. translate") < _at("14. internal linking")
+    assert "BEFORE translation" in walkthrough_output
+    # depth came from the material, and the report says what it counted.
+    assert "depth_prior=" in walkthrough_output and "depth_final=" in walkthrough_output
+    assert "n_pairs=" in walkthrough_output
+
+
+def test_data_blocks_are_built_but_not_written_while_the_flag_is_off(
+    walkthrough_output: str,
+):
+    """NTS_095 order: schema → render → pipeline. The generator runs; it writes
+    nothing into a draft until S8's PR lands and the flag is switched on."""
+    assert "data_blocks_enabled=False" in walkthrough_output
+    assert "would be built with the flag on" in walkthrough_output
 
 
 def test_the_document_stage_reads_before_research_does(walkthrough_output: str):

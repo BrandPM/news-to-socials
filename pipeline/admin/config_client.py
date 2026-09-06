@@ -164,6 +164,15 @@ class ConfigRecord:
     doc_max_tokens_for_composition: int = 12000
     doc_retries: int = 2
     doc_match_model: str = "gpt-4o-mini"
+    # --- Composition (NTS_102 v2, NTS_095, NTS_108 §1) — migration 028.
+    data_blocks_enabled: bool = False
+    depth_length_targets: Mapping[str, tuple[int, int | None]] = MappingProxyType(
+        {"note": (300, 450), "article": (600, 900), "deep": (1200, None)}
+    )
+    max_quote_words: Mapping[str, int] = MappingProxyType(
+        {"professional_commentary": 15, "corporate_pr": 25, "news_paywalled": 0}
+    )
+    attribution_model: str = "gpt-4o-mini"
     # NTS_100 §2 — the rank formula's seven weights, parsed here like the other
     # JSON-as-TEXT keys so the selector never sees a string.
     rank_weights: Mapping[str, float] = MappingProxyType(
@@ -261,6 +270,13 @@ def _v3_keys(row: Any) -> dict[str, Any]:
     )
     weights = _json_or_default(
         getattr(row, "rank_weights", None), dict(d.rank_weights)
+    )
+    targets = _json_or_default(
+        getattr(row, "depth_length_targets", None),
+        {k: list(v) for k, v in d.depth_length_targets.items()},
+    )
+    quotes = _json_or_default(
+        getattr(row, "max_quote_words", None), dict(d.max_quote_words)
     )
     return {
         "publication_slots": tuple(slots),
@@ -364,6 +380,26 @@ def _v3_keys(row: Any) -> dict[str, Any]:
         "doc_retries": _int_or(getattr(row, "doc_retries", None), d.doc_retries),
         "doc_match_model": _str_or(
             getattr(row, "doc_match_model", None), d.doc_match_model
+        ),
+        "data_blocks_enabled": bool(
+            getattr(row, "data_blocks_enabled", d.data_blocks_enabled)
+        ),
+        # ``[min, max]`` with a null max: a tuple of two, second possibly None.
+        "depth_length_targets": MappingProxyType(
+            {
+                str(key): (
+                    int(value[0]),
+                    int(value[1]) if len(value) > 1 and value[1] else None,
+                )
+                for key, value in dict(targets).items()
+                if isinstance(value, (list, tuple)) and value
+            }
+        ),
+        "max_quote_words": MappingProxyType(
+            {str(key): int(value) for key, value in dict(quotes).items()}
+        ),
+        "attribution_model": _str_or(
+            getattr(row, "attribution_model", None), d.attribution_model
         ),
         # A weight the operator zeroed is a weight the operator zeroed, so the
         # per-key fallback is only for keys the JSON does not mention at all.

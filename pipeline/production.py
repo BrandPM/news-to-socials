@@ -455,6 +455,12 @@ class _CandidateSnapshot:
     primary_doc_url: str | None
     primary_doc_hint: str | None
     doc_match: str | None
+    # The guard's guess, kept only so the run can log where it disagreed with
+    # the material (NTS_102 v2 §1 / NTS_099 v2 metric).
+    depth_prior: str | None = None
+    # NTS_108 §1 — set from the candidate's source row; decides the quote
+    # ceiling the attribution check enforces.
+    license_class: str | None = None
 
     @classmethod
     def of(cls, row: Any) -> _CandidateSnapshot:
@@ -469,7 +475,13 @@ class _CandidateSnapshot:
             primary_doc_url=row.primary_doc_url,
             primary_doc_hint=row.primary_doc_hint,
             doc_match=row.doc_match,
+            depth_prior=row.depth_prior,
         )
+
+    def with_license(self, license_class: str | None) -> _CandidateSnapshot:
+        from dataclasses import replace
+
+        return replace(self, license_class=license_class)
 
 
 def _record_document_outcome(
@@ -524,6 +536,138 @@ def _store_document_link(
             row.doc_match = doc_match
         row.doc_sections_used = json.dumps(list(sections), ensure_ascii=False)
         session.commit()
+
+
+def _store_depth(*, candidate_id: int, depth: str) -> None:
+    """``candidates.depth_final`` — the depth the material supported."""
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import Candidate
+
+    with get_session_factory()() as session:
+        row = session.get(Candidate, candidate_id)
+        if row is not None:
+            row.depth_final = depth
+            session.commit()
+
+
+def _store_needs_attention(*, candidate_id: int, value: bool) -> None:
+    """NTS_102 v2 §2 — the flag the review queue sorts on."""
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import Candidate
+
+    with get_session_factory()() as session:
+        row = session.get(Candidate, candidate_id)
+        if row is not None:
+            row.needs_attention = bool(value)
+            session.commit()
+
+
+def _store_plan(fact_pack_id: int, plan: dict[str, Any]) -> None:
+    """The plan, on the pack it was planned from (NTS_102 v2 §3).
+
+    Best-effort like every other traceability write: losing it costs the
+    editor a ``scope=plan`` return, raising would cost the article.
+    """
+    _patch_fact_pack(fact_pack_id, plan=json.dumps(plan, ensure_ascii=False))
+
+
+def _store_attribution(fact_pack_id: int, report: dict[str, Any]) -> None:
+    """The per-claim verdicts (NTS_096 §C)."""
+    _patch_fact_pack(
+        fact_pack_id, attribution=json.dumps(report, ensure_ascii=False)
+    )
+
+
+def _patch_fact_pack(fact_pack_id: int, **values: Any) -> None:
+    try:
+        from sqlalchemy import update
+
+        from pipeline.admin.db import get_session_factory
+        from pipeline.admin.models import FactPack
+
+        with get_session_factory()() as session:
+            session.execute(
+                update(FactPack)
+                .where(FactPack.id == fact_pack_id)
+                .values(**values)
+            )
+            session.commit()
+    except Exception as exc:
+        log.warning(
+            "production.fact_pack_patch_failed",
+            fact_pack_id=fact_pack_id,
+            fields=sorted(values),
+            err=str(exc)[:200],
+        )
+
+
+def _writer_for(brand: Any) -> Any:
+    """A ``CommentWriter`` bound to the brand, for the repair pass."""
+    from pipeline.generator.comment_writer import CommentWriter
+
+    return CommentWriter(brand_id_fk=getattr(brand, "id_fk", None))
+
+
+async def _finish_sibling(
+    *,
+    draft: Any,
+    language: Language,
+    brand: Any,
+    brand_id_fk: int,
+    topic: Any,
+    category: str | None,
+    config: Any,
+) -> Any:
+    """Everything that happens to one language sibling after translation.
+
+    Two things, in this order (NTS_093, NTS_123 S6):
+
+    1. **Dash typography**, deterministically. The model emits the English
+       tight em-dash in every language; RU/UK want a non-breaking space before
+       it and PL wants a half-dash. A rule the model follows nine times in ten
+       is a rule the editor has to check ten times in ten.
+    2. **Internal links**, per sibling, because the language prefix and the
+       article slug are both per-language and a translation pass must not be
+       trusted to rewrite a URL (NTS_093 §Архитектурное решение).
+
+    Banned phrases are reported rather than rewritten: deleting a phrase
+    mechanically leaves a broken sentence, and the count is what tells the
+    operator a per-language list needs work (NTS_072).
+    """
+    from pipeline.generator.comment_writer import parse_voice_guardrails
+    from pipeline.generator.composition import normalise_dashes, strip_banned_phrases
+    from pipeline.generator.internal_links import link_draft
+    from pipeline.selector.editorial_guard import load_brand_taxonomy
+
+    body = normalise_dashes(draft.body, language.value)
+    banned, _examples = parse_voice_guardrails(
+        getattr(brand, "voice_profile_yaml", "") or "", language
+    )
+    survivors = strip_banned_phrases(body, banned)
+    if survivors:
+        log.info(
+            "production.banned_phrases_survived",
+            language=language.value,
+            phrases=survivors[:6],
+        )
+    try:
+        body, _placed = await link_draft(
+            body=body,
+            language=language.value,
+            category=category,
+            brand_id_fk=brand_id_fk,
+            topic_id=topic.id,
+            taxonomy=load_brand_taxonomy(brand_id_fk),
+            anchor_pool=(),
+        )
+    except Exception as exc:
+        log.warning(
+            "production.linking_failed",
+            language=language.value,
+            err=str(exc)[:200],
+        )
+    draft.body = body
+    return draft
 
 
 def _stages_to_run(return_scope: str | None) -> dict[str, bool]:
@@ -612,6 +756,14 @@ async def produce_candidate(
     from pipeline.admin.db import get_session_factory
     from pipeline.admin.models import Candidate
     from pipeline.common.display_date import compute_display_date
+    from pipeline.generator.composition import (
+        Plan,
+        build_data_blocks,
+        build_plan,
+        check_attribution,
+        compute_depth_final,
+        depth_guidance,
+    )
     from pipeline.generator.fact_pack_store import (
         load_latest_fact_pack,
         persist_fact_pack,
@@ -646,6 +798,19 @@ async def produce_candidate(
         return_scope = row.return_scope
         primary_doc_url = row.primary_doc_url
         snapshot = _CandidateSnapshot.of(row)
+    # The licence class lives on the source, not on the candidate: it is a
+    # property of who published the document, and it decides how much of that
+    # document may be quoted (NTS_108 §1).
+    snapshot = snapshot.with_license(
+        next(
+            (
+                getattr(src, "license_class", None)
+                for src in sources
+                if getattr(src, "id", None) == snapshot.source_id_fk
+            ),
+            None,
+        )
+    )
 
     stages = _stages_to_run(return_scope)
     fanout = _languages_from_scope(languages, return_scope)
@@ -756,6 +921,41 @@ async def produce_candidate(
                 "production.thin", candidate_id=candidate_id, reason="no_fact_pack"
             )
 
+        # --- depth_final and the plan (NTS_102 v2 §1, §3) -----------------
+        # Depth comes from the material, never from the guard's guess: the
+        # guard read an abstract. Twelve facts with no comparable pair is an
+        # ``article``, because ``deep`` promises a table and a table needs
+        # pairs.
+        decision = compute_depth_final(
+            fact_pack,
+            article_min_facts=int(getattr(config, "depth_article_min_facts", 4)),
+            deep_min_facts=int(getattr(config, "depth_deep_min_facts", 10)),
+        )
+        targets = dict(getattr(config, "depth_length_targets", {}) or {})
+        guidance = depth_guidance(decision.depth, targets, decision)
+        _store_depth(candidate_id=candidate_id, depth=decision.depth)
+        log.info(
+            "production.depth",
+            candidate_id=candidate_id,
+            depth_prior=snapshot.depth_prior,
+            **decision.as_log(),
+        )
+
+        plan = Plan()
+        if stages["canon"]:
+            plan = await build_plan(
+                title=topic.raw.title,
+                summary=topic.raw.summary,
+                fact_pack=fact_pack,
+                document_text=primary_document.text if primary_document else "",
+                document_url=primary_document.url if primary_document else "",
+                depth=decision.depth,
+                targets=targets,
+                model=str(getattr(config, "attribution_model", "gpt-4o-mini")),
+            )
+            if fact_pack_id is not None:
+                _store_plan(fact_pack_id, plan.as_dict())
+
         # --- cover -------------------------------------------------------
         asset_id = None
         images_on_demand = bool(getattr(config, "images_on_demand", False))
@@ -774,25 +974,86 @@ async def produce_candidate(
         )
         display_date_iso = display_date_val.isoformat()
 
-        # --- drafts: EN canon first, then translations of it (NTS_065) ----
+        # --- the EN canon, from the plan (NTS_102 v2) ---------------------
+        en_draft = await generate_draft_for_language(
+            topic,
+            brand,
+            Language.en,
+            fact_pack=fact_pack,
+            plan=plan.render(),
+            depth_guidance=guidance,
+            primary_document=(
+                f"URL: {primary_document.url}\nRead on: {primary_document.as_of}\n"
+                f"Sections included: {', '.join(primary_document.sections_used) or 'all'}\n\n"
+                f"{primary_document.text}"
+                if primary_document
+                else ""
+            ),
+        )
+
+        # --- ATTRIBUTION, before a single translation (NTS_096 §C) --------
+        # The whole reason this stage sits here: NTS_096's reference case is a
+        # right number attached to a wrong claim, which every other defence
+        # passes. Checked after translation it would be bought four times.
+        report = await check_attribution(
+            body=f"{en_draft.title}\n\n{en_draft.body}",
+            fact_pack=fact_pack,
+            document_text=primary_document.text if primary_document else "",
+            license_class=snapshot.license_class,
+            max_quote_words=getattr(config, "max_quote_words", {}),
+            model=str(getattr(config, "attribution_model", "gpt-4o-mini")),
+        )
+        if report.needs_fix:
+            # Exactly one cycle (NTS_102 v2 §2). A second would be a loop with
+            # a model on both ends of it.
+            log.info(
+                "production.attribution_repair",
+                candidate_id=candidate_id,
+                **report.counts(),
+            )
+            writer = _writer_for(brand)
+            en_draft = await writer.repair_attribution(
+                en_draft, report.fix_instructions(), Language.en
+            )
+            report = await check_attribution(
+                body=f"{en_draft.title}\n\n{en_draft.body}",
+                fact_pack=fact_pack,
+                document_text=primary_document.text if primary_document else "",
+                license_class=snapshot.license_class,
+                max_quote_words=getattr(config, "max_quote_words", {}),
+                model=str(getattr(config, "attribution_model", "gpt-4o-mini")),
+            )
+        needs_attention = bool(report.distorted or report.flagged)
+        if fact_pack_id is not None:
+            _store_attribution(fact_pack_id, report.as_dict())
+        if needs_attention:
+            # The draft is still created — the check advises, it does not block
+            # (NTS_096 §C) — but the review card opens on these claims.
+            log.warning(
+                "production.needs_attention",
+                candidate_id=candidate_id,
+                **report.counts(),
+            )
+        _store_needs_attention(candidate_id=candidate_id, value=needs_attention)
+
+        # --- data blocks, from the pack only (NTS_095, NTS_102 v2 §1b) ----
+        blocks = build_data_blocks(
+            fact_pack,
+            depth=decision.depth,
+            enabled=bool(getattr(config, "data_blocks_enabled", False)),
+        )
+        if decision.depth == "deep" and not blocks:
+            # NTS_102 v2 §1b asks for this to be a metric, not a shrug: more
+            # than 30% of deep articles without a block means the thresholds
+            # are set too low.
+            log.info("production.deep_without_blocks", candidate_id=candidate_id)
+
+        # --- translations, only now (NTS_102 v2 §2) -----------------------
         drafts: list[tuple[Language, Draft]] = []
-        en_draft: Draft | None = None
         for language in _order_languages_en_first(fanout):
             if language == Language.en:
-                en_draft = await generate_draft_for_language(
-                    topic, brand, Language.en, fact_pack=fact_pack
-                )
                 drafts.append((Language.en, en_draft))
                 continue
-            if en_draft is None:
-                # A ``translation:uk`` return re-runs one language, and the
-                # canon it translates is the one already in Sanity — but until
-                # S6 gives regeneration a proper read-back path, producing the
-                # canon again is the honest fallback rather than translating
-                # from nothing.
-                en_draft = await generate_draft_for_language(
-                    topic, brand, Language.en, fact_pack=fact_pack
-                )
             drafts.append(
                 (
                     language,
@@ -801,6 +1062,20 @@ async def produce_candidate(
                     ),
                 )
             )
+
+        # --- deterministic post-process + links, per sibling (NTS_093) ----
+        drafts = [
+            (language, await _finish_sibling(
+                draft=draft,
+                language=language,
+                brand=brand,
+                brand_id_fk=brand_id_fk,
+                topic=topic,
+                category=category,
+                config=config,
+            ))
+            for language, draft in drafts
+        ]
 
         posts = [
             SanityPostInput(

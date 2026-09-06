@@ -206,6 +206,11 @@ _DRAFT_KWARGS = {
     "banned_phrases": "  (none specified)",
     # NTS_092 — the research fact pack is rendered for every draft call.
     "fact_pack": "  (none)",
+    # NTS_102 v2 / S6 — the plan, the computed length target and the primary
+    # document, rendered for every draft call for the same reason.
+    "plan": "  (no plan)",
+    "depth_guidance": "TARGET SHAPE: article.",
+    "primary_document": "  (no document)",
 }
 
 # A valid DB draft template: contains every required placeholder, no unknowns.
@@ -214,7 +219,8 @@ _DRAFT_KWARGS = {
 _VALID_DB_DRAFT = (
     "DB-SOURCED draft for {language_name}. Voice:{voice_profile_yaml} "
     "Title:{title} Summary:{summary} Banned:{banned_phrases} "
-    "Facts:{fact_pack}"
+    "Facts:{fact_pack} Plan:{plan} Shape:{depth_guidance} "
+    "Doc:{primary_document}"
 )
 
 

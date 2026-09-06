@@ -289,6 +289,11 @@ class PipelineConfigOut(BaseModel):
     doc_max_tokens_for_composition: int
     doc_retries: int
     doc_match_model: str
+    # Composition (NTS_102 v2, NTS_095, NTS_108 §1) — migration 028
+    data_blocks_enabled: bool
+    depth_length_targets: dict[str, list[int | None]]
+    max_quote_words: dict[str, int]
+    attribution_model: str
     guard_model: str
     updated_at: datetime
 
@@ -311,7 +316,14 @@ class PipelineConfigOut(BaseModel):
             return json.loads(v) if v else []
         return list(v) if isinstance(v, tuple) else v
 
-    @field_validator("candidate_ttl_days", "jurisdiction_tiers", "rank_weights", mode="before")
+    @field_validator(
+        "candidate_ttl_days",
+        "jurisdiction_tiers",
+        "rank_weights",
+        "depth_length_targets",
+        "max_quote_words",
+        mode="before",
+    )
     @classmethod
     def _parse_json_obj(cls, v: Any) -> Any:
         if isinstance(v, str):
@@ -399,6 +411,13 @@ class PipelineConfigUpdate(BaseModel):
     )
     doc_retries: int | None = Field(default=None, ge=0, le=10)
     doc_match_model: str | None = Field(default=None, min_length=1, max_length=100)
+    # NTS_095 — stays off until the Sanity schema PR of S8 is merged.
+    data_blocks_enabled: bool | None = None
+    depth_length_targets: dict[str, list[int | None]] | None = None
+    max_quote_words: dict[str, int] | None = None
+    attribution_model: str | None = Field(
+        default=None, min_length=1, max_length=100
+    )
     guard_model: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("brand_timezone")

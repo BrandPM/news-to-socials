@@ -5,9 +5,10 @@ config surface that nothing read: a value saved in Settings that the next run
 ignored, with no error anywhere. The failure is silent by nature — the run
 succeeds, it just uses a number nobody chose.
 
-So each of the 35 v3 keys — 25 from migration 020, two mode flags from 022,
-``production_enabled`` + ``rank_weights`` from 026, and the five document
-budgets from 027 — is walked end to end:
+So each of the 39 v3 keys — 25 from migration 020, two mode flags from 022,
+``production_enabled`` + ``rank_weights`` from 026, the five document
+budgets from 027 and the four composition keys from 028 — is walked end to
+end:
 
     migration default → ORM column → ConfigRecord → GET /config
                      → PUT /config → ConfigRecord again
@@ -146,6 +147,21 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
     ("doc_max_tokens_for_composition", 12000, 20000),
     ("doc_retries", 2, 3),
     ("doc_match_model", "gpt-4o-mini", "gpt-4o"),
+    # migration 028 — composition (NTS_102 v2, NTS_095, NTS_108 §1).
+    # ``data_blocks_enabled`` defaults OFF and stays off until the Sanity
+    # schema PR of S8 is merged: the order is schema → render → pipeline.
+    ("data_blocks_enabled", False, True),
+    (
+        "depth_length_targets",
+        {"note": (300, 450), "article": (600, 900), "deep": (1200, None)},
+        {"note": [200, 300], "article": [700, 1000], "deep": [1500, None]},
+    ),
+    (
+        "max_quote_words",
+        {"professional_commentary": 15, "corporate_pr": 25, "news_paywalled": 0},
+        {"professional_commentary": 10, "corporate_pr": 30},
+    ),
+    ("attribution_model", "gpt-4o-mini", "gpt-4o"),
     ("guard_model", "gpt-4o-mini", "gpt-4o"),
 )
 
@@ -158,6 +174,8 @@ _JSON_KEYS = {
     "prefilter_deny_title_patterns",
     "prefilter_languages",
     "rank_weights",
+    "depth_length_targets",
+    "max_quote_words",
 }
 
 
@@ -234,9 +252,9 @@ def test_every_v3_column_has_a_sentinel() -> None:
         f"unsentinelled column(s): {sorted(v3_columns - covered)}; "
         f"sentinel for a column that no longer exists: {sorted(covered - v3_columns)}"
     )
-    # 25 from 020, three mode flags (022 + 026), rank weights (026), and the
-    # five document budgets (027).
-    assert len(_SENTINELS) == 35
+    # 25 from 020, three mode flags (022 + 026), rank weights (026), the five
+    # document budgets (027) and the four composition keys (028).
+    assert len(_SENTINELS) == 39
 
 
 # --- default reaches the runtime -----------------------------------------

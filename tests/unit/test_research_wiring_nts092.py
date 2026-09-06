@@ -234,6 +234,16 @@ async def test_write_does_not_research_on_its_own():
 )
 def test_both_en_prompts_carry_the_new_length(name, prompt):
     """Both, not one: polish compresses the draft back otherwise."""
+    if name == "writer_draft":
+        # S6 moved the length out of the prompt entirely (NTS_102): the target
+        # is computed from the material and rendered into {depth_guidance},
+        # because "a number in a prompt does not know what the article is
+        # about". What must survive is the *priority* — grounding outranks
+        # length — which is asserted below and in
+        # ``test_thin_pack_means_a_shorter_article_not_a_padded_one``.
+        assert "{depth_guidance}" in prompt
+        assert "The length is a target, never an instruction to keep writing" in prompt
+        return
     assert "600-800 words" in prompt, f"{name} missing the new length"
     assert "250-400" not in prompt, f"{name} still carries the old length"
 
@@ -243,6 +253,13 @@ def test_both_en_prompts_carry_the_new_length(name, prompt):
 )
 def test_h2_count_was_recalibrated_for_the_longer_piece(name, prompt):
     """2-3 headings was calibrated for 350 words and is too sparse for 700."""
+    if name == "writer_draft":
+        # Also moved: the section count now comes from the plan (NTS_102 §"План
+        # перед текстом"), so the prompt asks for the plan's sections and keeps
+        # the anti-padding rule that the count existed to protect.
+        assert "the H2 sections (`## Heading`) the PLAN names" in prompt
+        assert "section to reach a count" in prompt
+        return
     assert "3-5 H2 sections" in prompt, f"{name} H2 count not recalibrated"
     assert "2-3 H2" not in prompt, f"{name} still asks for 2-3 H2"
 
@@ -266,7 +283,7 @@ def test_thin_pack_means_a_shorter_article_not_a_padded_one():
     """The one instruction that keeps 600-800 from becoming a filler licence."""
     flat = _flat(_DRAFT_PROMPT)
     assert "write a SHORTER article" in flat
-    assert "A padded 700-word piece is a failure" in flat
+    assert "A piece padded to hit its target is a failure" in flat
     assert "never an instruction to keep writing" in flat
     # polish must not undo it by padding back up to range
     assert "STAYS short" in _POLISH_PROMPT
@@ -281,7 +298,14 @@ def test_polish_may_not_add_facts_to_fill_the_extra_words():
 
 
 def test_fact_pack_is_a_required_placeholder_of_writer_draft():
+    # S6 added three more (NTS_102 v2): the plan, the computed length target
+    # and the primary document. Required for the same reason ``fact_pack`` is —
+    # a DB row missing one would write from a headline while the code constant
+    # wrote from a document, and only a log line would say so.
     assert _REQUIRED_PLACEHOLDERS["writer_draft"] == {
+        "plan",
+        "depth_guidance",
+        "primary_document",
         "voice_profile_yaml",
         "title",
         "summary",

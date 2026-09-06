@@ -152,6 +152,18 @@ class Fact:
     url: str
     publisher: str = ""
     date: str = ""
+    # NTS_102 v2 §1 — the label that makes two facts *comparable*: same unit,
+    # different jurisdiction / period / threshold. ``depth_final`` counts pairs
+    # of these, and a data block is only built from a group with at least two
+    # members (NTS_095). Labelled by the research model because it is the only
+    # step that sees the facts side by side; empty means "not comparable to
+    # anything", which is the honest default.
+    comparable_group: str = ""
+    # The number and its unit, when the model could isolate them. Used only for
+    # building blocks — the prose always quotes ``text``, never a reassembled
+    # figure, because reassembly is where a correct number becomes a wrong claim.
+    value: str = ""
+    unit: str = ""
 
     def render(self) -> str:
         meta = " — ".join(x for x in (self.publisher, self.date) if x)
@@ -361,6 +373,9 @@ def _clean_facts(raw: Any, *, limit: int, bucket: str) -> tuple[list[Fact], int]
                 url=url,
                 publisher=_clean_text(entry.get("publisher"), 80),
                 date=_clean_text(entry.get("date"), 40),
+                comparable_group=_clean_text(entry.get("comparable_group"), 60),
+                value=_clean_text(entry.get("value"), 40),
+                unit=_clean_text(entry.get("unit"), 24),
             )
         )
         if len(out) >= limit:
@@ -499,11 +514,17 @@ Return ONLY a JSON object, no prose and no code fence:
   "source_facts": [
     {{"text": "<one concrete fact from this story>",
       "url": "<https URL you read it on>",
-      "publisher": "<outlet>", "date": "<YYYY-MM-DD if known, else \\"\\">"}}
+      "publisher": "<outlet>", "date": "<YYYY-MM-DD if known, else \\"\\">",
+      "value": "<the bare figure, e.g. 5000000 or 12.5 — empty if the fact has none>",
+      "unit": "<EUR, %, days, … — empty if none>",
+      "comparable_group": "<short label shared by facts that measure the SAME
+       thing on a different jurisdiction, period or threshold, e.g.
+       'reporting threshold' — empty when this fact is comparable to nothing>"}}
   ],
   "context": [
     {{"text": "<corroborating or background fact from another outlet>",
-      "url": "<https URL>", "publisher": "<outlet>", "date": "<YYYY-MM-DD>"}}
+      "url": "<https URL>", "publisher": "<outlet>", "date": "<YYYY-MM-DD>",
+      "value": "", "unit": "", "comparable_group": ""}}
   ],
   "angle_hints": [
     "<what is non-obvious here for high-net-worth individuals, family offices \
@@ -515,6 +536,11 @@ in practice>"
 
 Aim for 4-8 source_facts and 2-4 context entries when the material supports
 it. Return fewer rather than padding with vague statements.
+
+``comparable_group`` is what lets the article build a table or a chart later,
+so label honestly: two thresholds in different jurisdictions share a group,
+a threshold and a deadline do not. A wrong group produces a table comparing
+things that are not comparable, which is worse than no table.
 """
 
 

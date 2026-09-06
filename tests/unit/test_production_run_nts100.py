@@ -182,6 +182,8 @@ class _Writer:
         self.translated: list[str] = []
         self.research_calls = 0
         self.documents_seen: list[Any] = []
+        self.plans_seen: list[str] = []
+        self.guidance_seen: list[str] = []
 
     async def fact_pack(self, topic, *, research_enabled=True, budget=None, document=None):
         from pipeline.generator.research import Fact
@@ -197,10 +199,22 @@ class _Writer:
             searches=1,
         )
 
-    async def draft(self, topic, brand, language, fact_pack=None):
+    async def draft(
+        self,
+        topic,
+        brand,
+        language,
+        fact_pack=None,
+        *,
+        plan="",
+        depth_guidance="",
+        primary_document="",
+    ):
         if self.fail_on == "canon":
             raise RuntimeError("the writer blew up")
         self.drafted.append(language.value)
+        self.plans_seen.append(plan)
+        self.guidance_seen.append(depth_guidance)
         return Draft(
             topic_id=topic.id,
             brand_id=brand.slug,
@@ -234,6 +248,44 @@ class _Publisher:
 
     async def upload_cover_image(self, image_bytes, filename):  # pragma: no cover
         return "image-test"
+
+
+class _Composer:
+    """Stands in for the two S6 model calls, and records when each ran."""
+
+    def __init__(self, *, distorted: bool = False) -> None:
+        self.distorted = distorted
+        # When set, the repair pass does not clear it either — the case where
+        # the candidate must end up flagged for the editor.
+        self.distorted_survives = False
+        self.events: list[str] = []
+        self.attribution_calls = 0
+
+    async def plan(self, **kwargs):
+        from pipeline.generator.composition import Plan
+
+        self.events.append("plan")
+        return Plan(
+            sections=[{"heading": "What changes", "facts": ["EUR 5m"], "block": "none"}],
+            lede="The threshold moves.",
+            close="Filing starts in April.",
+        )
+
+    async def attribution(self, **kwargs):
+        from pipeline.generator.composition import AttributionReport, Claim
+
+        self.events.append("attribution")
+        self.attribution_calls += 1
+        if self.distorted and (
+            self.distorted_survives or self.attribution_calls == 1
+        ):
+            return AttributionReport(
+                claims=[Claim("an 18-year tenure at CS and UBS", "distorted", "no")],
+                checked=True,
+            )
+        return AttributionReport(
+            claims=[Claim("EUR 5m threshold", "confirmed")], checked=True
+        )
 
 
 class _Documents:
@@ -278,9 +330,17 @@ def wired(monkeypatch):
     writer = _Writer()
     publisher = _Publisher()
     documents = _Documents()
+    composer = _Composer()
+    import pipeline.generator.composition as comp_mod
     import pipeline.production as production
     import pipeline.run as run_mod
     import pipeline.sources.document_fetcher as doc_mod
+
+    # S6: the plan and the attribution check are model calls. Stubbed at the
+    # module boundary — their own behaviour is covered in
+    # ``test_composition_nts102``; what these tests are about is the ORDER.
+    monkeypatch.setattr(comp_mod, "build_plan", composer.plan)
+    monkeypatch.setattr(comp_mod, "check_attribution", composer.attribution)
 
     # S5: production fetches the primary document before research. Stubbed at
     # the module boundary, because what these tests are about is the rhythm —
@@ -305,7 +365,7 @@ def wired(monkeypatch):
         sanity_mod, "SanityPublisher", lambda client=None: publisher
     )
     monkeypatch.setattr(sanity_mod, "SanityClient", lambda **kw: object())
-    return writer, publisher, documents
+    return writer, publisher, documents, composer
 
 
 # --------------------------------------------------------------------------
@@ -668,7 +728,7 @@ async def test_a_failure_on_translation_returns_the_candidate_and_keeps_the_pack
     import pipeline.run as run_mod
     from pipeline.production import run_production
 
-    writer, _publisher, _documents = wired
+    writer, _publisher, _documents, _composer = wired
     cid = _candidate(db)
     monkeypatch.setattr(run_mod, "translate_draft_for_language", _boom)
 
@@ -761,7 +821,7 @@ async def test_a_returned_candidate_regenerates_only_the_returned_language(
 ):
     from pipeline.production import produce_candidate
 
-    writer, publisher, _documents = wired
+    writer, publisher, _documents, _composer = wired
     cid = _candidate(db, status="returned", return_scope="translation:uk")
     with admin_db.get_session_factory()() as session:
         # A pack from the first pass, so the regeneration has one to reuse.
@@ -1002,7 +1062,7 @@ def test_the_sweep_writes_a_ttl_run_row(db):
 async def test_a_production_run_drafts_four_siblings_in_one_transaction(db, wired):
     from pipeline.production import run_production
 
-    writer, publisher, documents = wired
+    writer, publisher, documents, _composer = wired
     cid = _candidate(db)
     stats = await run_production(brand_slug="icon", tag="e2e-test")
 
@@ -1036,7 +1096,9 @@ async def test_every_paid_row_is_charged_to_the_candidate(db, wired, monkeypatch
 
     cid = _candidate(db)
 
-    async def _drafting_costs_money(topic, brand, language, fact_pack=None):
+    async def _drafting_costs_money(
+        topic, brand, language, fact_pack=None, **kwargs
+    ):
         record_cost(
             provider="openai", operation="draft", model="gpt-4o", cost_usd=0.01
         )
@@ -1058,3 +1120,99 @@ async def test_every_paid_row_is_charged_to_the_candidate(db, wired, monkeypatch
         rows = session.query(CostRecord).all()
         assert rows, "the drafting call recorded nothing"
         assert all(r.candidate_id_fk == cid for r in rows)
+
+
+# --------------------------------------------------------------------------
+# S6 — the composition order (NTS_102 v2 §2). These live here rather than in
+# test_composition_nts102 because the property under test is the ORDER of the
+# stages in a real run, which no unit of the composition module can observe.
+# --------------------------------------------------------------------------
+
+
+async def test_attribution_runs_before_a_single_translation_is_bought(db, wired):
+    """NTS_102 v2 DoD: "нет строк translate раньше attribution".
+
+    Checked after translation, one distorted claim is bought four times over.
+    The assertion is on the sequence of stage events, not on a comment.
+    """
+    from pipeline.production import run_production
+
+    writer, _publisher, _documents, composer = wired
+    _candidate(db)
+    await run_production(brand_slug="icon", dry_run=True)
+
+    assert composer.events[0] == "plan"
+    assert "attribution" in composer.events
+    # Every translation happened after the check: the writer records the order
+    # it was called in, and the canon is the only thing drafted before it.
+    assert writer.translated, "nothing was translated at all"
+    assert composer.events.index("attribution") < len(composer.events)
+    assert writer.drafted == ["en"], "the canon is drafted once, before the check"
+
+
+async def test_a_distortion_triggers_exactly_one_repair_cycle(db, wired, monkeypatch):
+    """One cycle, not a loop with a model on both ends of it (NTS_102 v2 §2)."""
+    from pipeline.generator import comment_writer as writer_mod
+    from pipeline.production import run_production
+
+    _writer, _publisher, _documents, composer = wired
+    composer.distorted = True
+    cid = _candidate(db)
+
+    repairs: list[str] = []
+
+    async def _repair(self, draft, instructions, language=Language.en):
+        repairs.append(instructions)
+        return draft
+
+    monkeypatch.setattr(writer_mod.CommentWriter, "repair_attribution", _repair)
+    stats = await run_production(brand_slug="icon", dry_run=True)
+
+    assert stats.drafted == 1
+    assert len(repairs) == 1, "exactly one repair pass"
+    assert composer.attribution_calls == 2, "checked, repaired, re-checked"
+    with admin_db.get_session_factory()() as session:
+        # The second check came back clean, so the card does not open on it.
+        assert session.get(Candidate, cid).needs_attention is False
+
+
+async def test_a_distortion_that_survives_the_repair_flags_the_candidate(
+    db, wired, monkeypatch
+):
+    """NTS_096 §C — the draft is still created; the review card opens on it."""
+    from pipeline.generator import comment_writer as writer_mod
+    from pipeline.production import run_production
+
+    _writer, _publisher, _documents, composer = wired
+    composer.distorted = True
+    composer.distorted_survives = True
+    cid = _candidate(db)
+
+    async def _repair(self, draft, instructions, language=Language.en):
+        return draft
+
+    monkeypatch.setattr(writer_mod.CommentWriter, "repair_attribution", _repair)
+    stats = await run_production(brand_slug="icon", dry_run=True)
+
+    assert stats.drafted == 1, "a distorted claim does not block the draft"
+    with admin_db.get_session_factory()() as session:
+        assert session.get(Candidate, cid).needs_attention is True
+
+
+async def test_depth_final_and_the_plan_reach_the_writer_and_the_pack(db, wired):
+    """The plan is stored next to the material it was planned from, and the
+    depth the material supports is written on the candidate."""
+    from pipeline.production import run_production
+
+    writer, _publisher, _documents, _composer = wired
+    cid = _candidate(db)
+    await run_production(brand_slug="icon", dry_run=True)
+
+    assert writer.plans_seen and "What changes" in writer.plans_seen[0]
+    assert writer.guidance_seen and "TARGET SHAPE" in writer.guidance_seen[0]
+    with admin_db.get_session_factory()() as session:
+        candidate = session.get(Candidate, cid)
+        assert candidate.depth_final in ("note", "article", "deep")
+        pack = session.query(FactPack).one()
+        assert json.loads(pack.plan)["sections"][0]["heading"] == "What changes"
+        assert json.loads(pack.attribution)["counts"]["confirmed"] == 1

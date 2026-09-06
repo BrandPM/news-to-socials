@@ -137,9 +137,19 @@ carries the URL it was read on. This is the material you are allowed to be
 specific about:
 {fact_pack}
 
+PRIMARY DOCUMENT — the act, decision or filing this story is about. Where it
+and anything else disagree, IT wins. Quote its wording for definitions and
+thresholds:
+{primary_document}
+
+PLAN — the sections this article was planned as, with the facts assigned to
+each. Follow it. If a planned section has nothing to say, drop it rather than
+padding it; do not invent a section that is not here:
+{plan}
+
 Language: {language}
 Audience: people in the brand's target segment, NOT general public.
-Length: 600-800 words when the fact pack supports it — read GROUNDING first.
+{depth_guidance}
 
 GROUNDING (mandatory — outranks EVERY other rule below, including length):
 * Every number, percentage, currency amount, date, effective date, threshold,
@@ -153,8 +163,9 @@ GROUNDING (mandatory — outranks EVERY other rule below, including length):
   fact pack does not attribute to them.
 * If the fact pack is thin — or says NO RESEARCH AVAILABLE — write a SHORTER
   article, well under the target length. A short, fully grounded piece is
-  CORRECT output. A padded 700-word piece is a failure, and an invented
-  figure is the worst outcome available to you: worse than publishing nothing.
+  CORRECT output. A piece padded to hit its target is a failure, and an
+  invented figure is the worst outcome available to you: worse than
+  publishing nothing.
 * The length is a target, never an instruction to keep writing. Stop when the
   grounded material runs out.
 
@@ -194,12 +205,12 @@ USING THE FACT PACK (mandatory):
 STRUCTURE REQUIREMENTS (mandatory — markdown headings, not bold):
 * Open with a 1-2 sentence lede paragraph that names the specific
   consequence, NOT a general framing. No heading on the lede.
-* Then 3-5 H2 sections (`## Heading`) — one per distinct idea, each carrying
-  its own facts from the pack. Never pad a section to reach that count: if
-  the grounded material only supports two sections, write two and a shorter
-  piece. Heading names must be substantive and describe the actual content
-  (e.g. "## The repricing of mezzanine credit", NOT
-  "## What this means" or "## Key takeaways").
+* Then the H2 sections (`## Heading`) the PLAN names — one per distinct idea,
+  each carrying its own facts from the pack and the document. Never pad a
+  section to reach a count: if the grounded material only supports two
+  sections, write two and a shorter piece. Heading names must be substantive
+  and describe the actual content (e.g. "## The repricing of mezzanine
+  credit", NOT "## What this means" or "## Key takeaways").
 * End with a forward-looking close that is ANCHORED to the article: it must
   reference a specific named entity, number, or mechanism already mentioned
   in the body, and state the concrete shift it creates for the reader's next
@@ -389,6 +400,32 @@ where ``body`` is markdown with the same H2 headings, translated into {language_
 """
 
 
+_ATTRIBUTION_REPAIR_PROMPT = """\
+OUTPUT LANGUAGE: {language_name}. The rewrite must remain in {language_name}.
+
+An attribution check compared this piece against its sources and found the
+statements listed below. Each one is either not what the source says, or
+carries a detail that must not be published.
+
+{repairs}
+
+Rewrite ONLY those statements. For each: restate it as the source actually
+has it, or delete the clause. Do NOT introduce any number, date, name or
+claim that is not already in the draft, do NOT reach for a different figure to
+replace a wrong one, and do NOT shorten or restructure the rest of the piece —
+the lede, the H2 sections and the close stay as they are.
+
+If a statement cannot be repaired without inventing something, delete it. A
+shorter accurate article is the correct outcome; a plausible fix is the
+failure this pass exists to prevent.
+
+Draft:
+{draft_json}
+
+Return ONLY a JSON object in the same shape: {{"title": "...", "body": "...", "key_takeaway": "..."}}
+"""
+
+
 _GENERIC_CLOSE_RETRY_PROMPT = """\
 OUTPUT LANGUAGE: {language_name}. The rewrite must remain in {language_name}. Do NOT translate.
 
@@ -420,9 +457,13 @@ _BANNED_PHRASE_RETRY_THRESHOLD = 2
 # than the English canon in words, and Cyrillic costs more tokens per word than
 # Latin, so an in-range EN piece is comfortably the largest reply in the flow
 # once translated.
-_DRAFT_MAX_TOKENS = 2600
-_POLISH_MAX_TOKENS = 2600
-_TRANSLATE_MAX_TOKENS = 4000
+# Raised again in S6 (NTS_102 v2 §1b): ``deep`` has no upper word limit, and a
+# 1 800-word piece is ~2 700 tokens of English prose before the JSON wrapper.
+# At the old 2 600 the reply was truncated mid-body and landed in ``_parse``'s
+# "(parse failed)" path — a silent quality floor imposed by a constant.
+_DRAFT_MAX_TOKENS = 8000
+_POLISH_MAX_TOKENS = 8000
+_TRANSLATE_MAX_TOKENS = 12000
 
 # Placeholders a DB-stored prompt MUST contain (``required``) for the
 # generation path to trust it, and the full set it MAY reference
@@ -444,6 +485,15 @@ _REQUIRED_PLACEHOLDERS: dict[str, set[str]] = {
         # 019 reseeds the live rows so this addition does not knock every
         # brand onto the fallback constant.
         "fact_pack",
+        # NTS_102 v2 / S6 — the plan the article is written from, the length
+        # target computed from the material, and the primary document itself.
+        # Required for the same reason ``fact_pack`` is: a DB row without them
+        # would write from a headline while the code constant wrote from a
+        # document, and nothing would say the two had diverged. Migration 028
+        # reseeds the live rows.
+        "plan",
+        "depth_guidance",
+        "primary_document",
     },
     "writer_polish": {
         "ai_tells",
@@ -480,6 +530,9 @@ _ALLOWED_PLACEHOLDERS: dict[str, set[str]] = {
         "language_name",
         "banned_phrases",
         "fact_pack",
+        "plan",
+        "depth_guidance",
+        "primary_document",
     },
     "writer_polish": {
         "ai_tells",
@@ -789,6 +842,10 @@ class CommentWriter:
         voice_profile_yaml: str,
         language: Language,
         fact_pack: FactPack | None = None,
+        *,
+        plan: str = "",
+        depth_guidance: str = "",
+        primary_document: str = "",
     ) -> Draft:
         """Produce the canonical draft for ``topic``.
 
@@ -807,7 +864,14 @@ class CommentWriter:
 
         # --- Stage 1: draft (banned phrases injected here too — NTS_067) ---
         draft = await self._draft(
-            topic, voice_profile_yaml, language, banned_phrases, fact_pack
+            topic,
+            voice_profile_yaml,
+            language,
+            banned_phrases,
+            fact_pack,
+            plan=plan,
+            depth_guidance=depth_guidance,
+            primary_document=primary_document,
         )
 
         # --- Anti-AI check ---
@@ -955,6 +1019,9 @@ class CommentWriter:
         language: Language,
         banned_phrases: list[str] | None = None,
         fact_pack: FactPack | None = None,
+        plan: str = "",
+        depth_guidance: str = "",
+        primary_document: str = "",
     ) -> _DraftJSON:
         kwargs = {
             "voice_profile_yaml": voice_profile_yaml,
@@ -968,6 +1035,18 @@ class CommentWriter:
             # "NO RESEARCH AVAILABLE, write shorter" block, never an empty
             # string that reads as "nothing to see here" (NTS_092).
             "fact_pack": render_fact_pack(fact_pack),
+            # S6 seams. Each renders an explicit "there is none" block rather
+            # than an empty string, for the reason ``fact_pack`` does: an empty
+            # placeholder reads to the model as "nothing to see here" and it
+            # writes as if the absent thing had never been promised.
+            "plan": plan or "  (NO PLAN — write from the fact pack and the "
+            "document, keeping every rule above.)",
+            "depth_guidance": depth_guidance
+            or "TARGET SHAPE: around 600-900 words, 3-4 H2 sections. This is a "
+            "guide, not a quota — GROUNDING outranks it.",
+            "primary_document": primary_document
+            or "  (NO PRIMARY DOCUMENT was retrievable for this story. Work "
+            "from the fact pack alone and do not fill the gap from memory.)",
         }
         template = self._resolve_template("writer_draft", _DRAFT_PROMPT, kwargs)
         prompt = template.format(**kwargs)
@@ -1012,6 +1091,45 @@ class CommentWriter:
         )
         _record_openai_cost(resp, model=self.polish_model, operation="polish")
         return self._parse(resp.choices[0].message.content or "{}")
+
+    @with_retry()
+    async def repair_attribution(
+        self, draft: Draft, repairs: str, language: Language = Language.en
+    ) -> Draft:
+        """The single fix cycle of NTS_102 v2 §2, on the EN canon.
+
+        In-code prompt rather than a versioned ``prompt_type``, like the other
+        two internal guards: it is a repair instruction built from the check's
+        own output, not a template an operator tunes. Charged as its own
+        ``cost_records`` operation so the cost of the attribution stage —
+        check plus repair — is separable from composition (NTS_096 §Риски).
+        """
+        payload = _DraftJSON(
+            title=draft.title, body=draft.body, key_takeaway=draft.key_takeaway
+        )
+        prompt = _ATTRIBUTION_REPAIR_PROMPT.format(
+            language_name=_language_name(language),
+            repairs=repairs,
+            draft_json=payload.model_dump_json(),
+        )
+        resp = await self.client.chat.completions.create(
+            model=self.polish_model,
+            max_tokens=_POLISH_MAX_TOKENS,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        _record_openai_cost(
+            resp, model=self.polish_model, operation="attribution_repair"
+        )
+        fixed = self._parse(resp.choices[0].message.content or "{}")
+        return Draft(
+            topic_id=draft.topic_id,
+            brand_id=draft.brand_id,
+            language=draft.language,
+            title=fixed.title,
+            body=fixed.body,
+            key_takeaway=fixed.key_takeaway,
+        )
 
     @with_retry()
     async def _retry_for_generic_close(

@@ -128,7 +128,11 @@ def test_019_reseeds_the_active_rows_with_the_current_constants(alembic_db):
     draft_content, draft_version, draft_notes = _active(db_path, "writer_draft")
     assert draft_content == _DRAFT_PROMPT
     assert "{fact_pack}" in draft_content
-    assert "600-800 words" in draft_content
+    # 019's own length wording was superseded in S6: the target moved out of
+    # the prompt into {depth_guidance}, computed from the material (NTS_102).
+    # What 019 is being tested for here is the RESYNC — that the stale row was
+    # replaced by the live constant — which the equality above already states.
+    assert "{depth_guidance}" in draft_content
     assert "250-400" not in draft_content
     assert "NTS_092" in draft_version
     assert "{fact_pack}" in draft_notes  # the manual for whoever edits it next
@@ -386,6 +390,11 @@ async def test_the_reseeded_row_is_what_generation_renders(live_db):
         "language_name": "English",
         "banned_phrases": "  (none)",
         "fact_pack": "  (none)",
+        # S6 (NTS_102 v2) — rendered for every draft call, so a resolver test
+        # that omits them is testing a call site that no longer exists.
+        "plan": "  (none)",
+        "depth_guidance": "TARGET SHAPE: article.",
+        "primary_document": "  (none)",
     }
     assert writer._resolve_template("writer_draft", "FALLBACK", kwargs) == _DRAFT_PROMPT
 

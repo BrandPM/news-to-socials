@@ -497,6 +497,39 @@ class PipelineConfig(Base):
         Text, nullable=False, default="gpt-4o-mini", server_default="gpt-4o-mini"
     )
 
+    # --- Composition (NTS_102 v2, NTS_095, NTS_108 §1) — migration 028.
+    # ``data_blocks_enabled`` ships OFF and stays off until the Sanity schema
+    # PR of S8 is merged: NTS_095 fixes the order schema → render → pipeline,
+    # and a pipeline writing a block type the site cannot render produces an
+    # article with a hole in it.
+    data_blocks_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # Word bands per depth, ``[min, max]`` with a null max meaning "no ceiling"
+    # (NTS_102 v2 §1b: deep is 1200 *and up*; the text ends where the material
+    # ends, not where the prompt does).
+    depth_length_targets: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='{"note": [300, 450], "article": [600, 900], "deep": [1200, null]}',
+        server_default='{"note": [300, 450], "article": [600, 900], "deep": [1200, null]}',
+    )
+    # NTS_108 §1 — the quote ceiling per licence class, enforced by the
+    # attribution check as ``quote_too_long``. A class not listed here has no
+    # ceiling of its own: an official act may be quoted at length with
+    # attribution, which is the whole legal argument for the v3 sourcing model.
+    max_quote_words: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default='{"professional_commentary": 15, "corporate_pr": 25, '
+        '"news_paywalled": 0}',
+        server_default='{"professional_commentary": 15, "corporate_pr": 25, '
+        '"news_paywalled": 0}',
+    )
+    attribution_model: Mapped[str] = mapped_column(
+        Text, nullable=False, default="gpt-4o-mini", server_default="gpt-4o-mini"
+    )
+
     # --- Primary document fetch budgets (NTS_101 §4) — migration 027.
     # In the config rather than in code because they are the knobs an operator
     # turns when a regulator's site is slow or a directive is enormous, and
@@ -1137,6 +1170,12 @@ class Candidate(Base):
     # Required from ``drafted`` onward — the link to the Sanity draft.
     sanity_draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
     publication_slot: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # NTS_102 v2 §2 — the attribution fix cycle ran and something still reads
+    # ``distorted``. The draft is created anyway (NTS_096 §C: the check advises,
+    # it does not block) and the review card opens on those claims.
+    needs_attention: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
     # NTS_101 §7 — the document search may legitimately miss on the first try:
     # a regulator publishes the act a day or two after announcing it. Two
     # retries, 48h apart, then the candidate expires with ``no_document``.
@@ -1332,6 +1371,16 @@ class FactPack(Base):
     doc_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
     doc_sections_used: Mapped[str | None] = mapped_column(Text, nullable=True)
     doc_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # NTS_102 v2 §3 — the plan the article was written from, as JSON. Stored
+    # because a ``scope=plan`` return gives the editor this to edit, and because
+    # "why is there no section about X" is otherwise unanswerable.
+    plan: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # NTS_096 §C — the per-claim verdicts (confirmed / distorted / uncovered),
+    # as JSON. On the pack rather than the candidate because they are a
+    # statement about the material, and because a regenerated draft gets a new
+    # pack row and therefore a new set of verdicts rather than inheriting the
+    # old one.
+    attribution: Mapped[str | None] = mapped_column(Text, nullable=True)
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     cost_usd: Mapped[float] = mapped_column(
         Float, nullable=False, default=0.0, server_default="0"

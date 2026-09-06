@@ -105,11 +105,23 @@ BACKUP_STALE_PREFIX = "backup_stale:"
 THIN_PORTFOLIO_PREFIX = "thin_portfolio:"
 CANDIDATE_FAILED_PREFIX = "candidate_failed:"
 SPEND_CAP_PREFIX = "spend_cap:"
+# NTS_123 S6 — the close-retry rate. NTS_122 measured one retry costing more
+# than the draft it followed ($0.0143 against $0.0009) on fake text; the
+# directive asks for the share on real ones, and for a prompt fix through a
+# reseed migration if it passes 30%.
+CLOSE_RETRY_PREFIX = "close_retry_rate:"
 PRODUCTION_PREFIXES = (
     THIN_PORTFOLIO_PREFIX,
     CANDIDATE_FAILED_PREFIX,
     SPEND_CAP_PREFIX,
+    CLOSE_RETRY_PREFIX,
 )
+
+# The share above which the close prompt itself is the problem, not the story.
+CLOSE_RETRY_ALERT_SHARE = 0.30
+# Below this many drafts the ratio is noise — three retries out of four drafts
+# is not evidence of anything.
+CLOSE_RETRY_MIN_DRAFTS = 10
 
 # NTS_100 §3.5 — how far ahead the thin-portfolio pulse looks.
 THIN_PORTFOLIO_LEAD_DAYS = 3
@@ -530,6 +542,59 @@ def check_thin_portfolio(
     )
 
 
+def close_retry_rate(
+    brand_id_fk: int, *, days: int = 30, now: datetime | None = None
+) -> tuple[int, int, float]:
+    """``(drafts, retries, share)`` from ``cost_records`` over a window.
+
+    Counted from the accounting table rather than from the log, because the
+    accounting table is the one that survives a log rotation and is already the
+    source for every other cost number the operator reads.
+    """
+    from sqlalchemy import func
+
+    from pipeline.admin.models import CostRecord
+
+    now = now or datetime.now(tz=UTC)
+    since = (now - timedelta(days=days)).replace(tzinfo=None)
+    with session_scope() as session:
+        rows = session.execute(
+            select(CostRecord.operation, func.count(CostRecord.id))
+            .where(
+                CostRecord.brand_id_fk == brand_id_fk,
+                CostRecord.created_at >= since,
+                CostRecord.operation.in_(("draft", "generic_close_retry")),
+            )
+            .group_by(CostRecord.operation)
+        ).all()
+    counts = {operation: int(count) for operation, count in rows}
+    drafts = counts.get("draft", 0)
+    retries = counts.get("generic_close_retry", 0)
+    return drafts, retries, (retries / drafts if drafts else 0.0)
+
+
+def format_close_retry_rate(
+    *,
+    drafts: int,
+    retries: int,
+    share: float,
+    days: int,
+    brand_name: str | None = None,
+) -> str:
+    """🟡 the close prompt is being retried more often than it should be."""
+    who = f" · {html.escape(brand_name)}" if brand_name else ""
+    return "\n".join(
+        [
+            f"🟡 <b>Концовки переписываются слишком часто{who}</b>",
+            f"{retries} повторов на {drafts} черновиков за {days} дней "
+            f"({share:.0%}, порог {CLOSE_RETRY_ALERT_SHARE:.0%})",
+            "Повтор дороже черновика. Правим промпт close (NTS_067) "
+            "миграцией пересева — это не единичный случай.",
+            _link(f"{ALERT_BASE_URL}/editorial", "Редполитика"),
+        ]
+    )
+
+
 def _gather_production_events(
     already: set[str], *, now: datetime | None = None
 ) -> list[tuple[str, str]]:
@@ -617,6 +682,22 @@ def _gather_production_events(
             out.append(pulse)
         if cap <= 0:
             continue
+        drafts, retries, share = close_retry_rate(brand_id, now=now)
+        if drafts >= CLOSE_RETRY_MIN_DRAFTS and share > CLOSE_RETRY_ALERT_SHARE:
+            key = f"{CLOSE_RETRY_PREFIX}{brand_id}:{now.strftime('%Y-%W')}"
+            if key not in already:
+                out.append(
+                    (
+                        key,
+                        format_close_retry_rate(
+                            drafts=drafts,
+                            retries=retries,
+                            share=share,
+                            days=30,
+                            brand_name=name,
+                        ),
+                    )
+                )
         spent = monthly_spend_usd(brand_id, now=now)
         # Two thresholds, one key per month per threshold: 80% is a warning
         # while there is still room to act, 100% is the kill-switch reporting

@@ -27,6 +27,9 @@ _JSON_COLUMNS = (
     "prefilter_languages",
     # NTS_100 §2 — the rank weights, migration 026.
     "rank_weights",
+    # NTS_102 v2 / NTS_108 §1 — composition, migration 028.
+    "depth_length_targets",
+    "max_quote_words",
 )
 
 

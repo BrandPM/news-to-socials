@@ -493,6 +493,10 @@ async def generate_draft_for_language(
     brand: BrandConfig,
     language: Language,
     fact_pack: FactPack | None = None,
+    *,
+    plan: str = "",
+    depth_guidance: str = "",
+    primary_document: str = "",
 ) -> Draft:
     """Generate the CANONICAL draft for ``language`` natively from the topic.
 
@@ -504,8 +508,17 @@ async def generate_draft_for_language(
     fact pack (see :func:`build_fact_pack_for_topic`); both are once per
     topic, this is once per language."""
     writer = CommentWriter(brand_id_fk=brand.id_fk)
+    # The three S6 seams default to empty, which is exactly the v2 path: no
+    # plan, no computed depth target, no document. ``CommentWriter`` renders an
+    # explicit "there is none" block for each rather than an empty string.
     return await writer.write(
-        topic, brand.voice_profile_yaml, language, fact_pack=fact_pack
+        topic,
+        brand.voice_profile_yaml,
+        language,
+        fact_pack=fact_pack,
+        plan=plan,
+        depth_guidance=depth_guidance,
+        primary_document=primary_document,
     )
 
 
