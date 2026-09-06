@@ -51,6 +51,7 @@ from pipeline.admin.schemas import (
     CandidateDetailOut,
     CandidateDocumentIn,
     CandidateOut,
+    CandidateReturnIn,
     PortfolioSlotOut,
     PortfolioSummaryOut,
     ReviewDecisionIn,
@@ -717,3 +718,206 @@ def list_review_decisions(
             stmt = stmt.where(ReviewDecision.action == action)
         stmt = stmt.order_by(ReviewDecision.at.desc()).limit(limit)
         return [ReviewDecisionOut.model_validate(r) for r in session.scalars(stmt)]
+
+
+@router.get("/recall/report")
+def recall_report(
+    brand_id: int,
+    window_days: int = Query(default=30, ge=1, le=365),
+) -> dict[str, Any]:
+    """The two acceptance ratios of NTS_114, over the accumulated candidates.
+
+    ``in_feed`` and ``accepted/in_feed`` (NTS_099 §7). This is what replaced
+    the shadow week's hand-marking after Andriy lifted that gate on
+    2026-09-06: the same measurement, recomputed on every open, so it tracks
+    the portfolio instead of freezing into a document.
+
+    Computed live rather than cached. It is a scan over one brand's candidates
+    with a keyword match — cheap next to being wrong about how recall stands.
+    """
+    from pipeline.selector.recall import compute_recall
+
+    with session_scope() as session:
+        _brand_or_404(session, brand_id)
+    return compute_recall(brand_id_fk=brand_id, window_days=window_days).as_dict()
+
+
+@router.get("/{candidate_id}/traceability")
+def candidate_traceability(candidate_id: int, brand_id: int) -> dict[str, Any]:
+    """Everything the article was made of, without one new paid call.
+
+    NTS_096 part B — the block the editor opens on the review card: the primary
+    document with its ``as_of``, the fact pack behind it, the plan the article
+    was written from and the attribution verdicts it was checked against. The
+    DoD line is "полная трассировка любой статьи собирается **без единого
+    нового платного вызова**", which is why every field here is a read of
+    something the run already stored (migrations 025/027/028).
+    """
+    from pipeline.admin.models import DocumentVersion, FactPack
+
+    with session_scope() as session:
+        _brand_or_404(session, brand_id)
+        candidate = session.get(Candidate, candidate_id)
+        if candidate is None or candidate.brand_id_fk != brand_id:
+            raise HTTPException(status_code=404, detail="candidate not found")
+
+        pack_row = (
+            session.execute(
+                select(FactPack)
+                .where(FactPack.candidate_id_fk == candidate_id)
+                .order_by(FactPack.created_at.desc(), FactPack.id.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        document = None
+        if candidate.doc_version_id:
+            try:
+                document = session.get(DocumentVersion, int(candidate.doc_version_id))
+            except (TypeError, ValueError):
+                document = None
+
+        decisions = [
+            {
+                "action": d.action,
+                "scope": d.scope,
+                "comment": d.comment,
+                "reviewer": d.reviewer,
+                "time_spent_s": d.time_spent_s,
+                "at": d.at.isoformat(),
+            }
+            for d in session.execute(
+                select(ReviewDecision)
+                .where(ReviewDecision.candidate_id_fk == candidate_id)
+                .order_by(ReviewDecision.at.desc())
+            )
+            .scalars()
+            .all()
+        ]
+        # Everything is read INSIDE the session. The first version of this
+        # endpoint built its dict after the block closed, and every attribute
+        # access then raised DetachedInstanceError — an error the endpoint's
+        # own shape made invisible until a test opened a candidate with no
+        # fact pack.
+        snapshot = {
+            "status": candidate.status,
+            "needs_attention": bool(candidate.needs_attention),
+            "canon_dirty": bool(candidate.canon_dirty),
+            "depth_prior": candidate.depth_prior,
+            "depth_final": candidate.depth_final,
+            "return_scope": candidate.return_scope,
+            "primary_doc_url": candidate.primary_doc_url,
+            "doc_match": candidate.doc_match,
+            "doc_sections_used": candidate.doc_sections_used,
+        }
+        document_row = (
+            {
+                "url": document.url,
+                "title": document.title,
+                "as_of": document.fetched_at.isoformat(),
+                "language": document.doc_language,
+                "section_count": document.section_count,
+            }
+            if document is not None
+            else None
+        )
+        pack = (
+            {
+                "pack": pack_row.pack,
+                "plan": pack_row.plan,
+                "attribution": pack_row.attribution,
+                "sources": pack_row.sources,
+            }
+            if pack_row is not None
+            else None
+        )
+
+    def _json(raw: Any, default: Any) -> Any:
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "candidate_id": candidate_id,
+        "status": snapshot["status"],
+        "needs_attention": snapshot["needs_attention"],
+        "canon_dirty": snapshot["canon_dirty"],
+        "depth_prior": snapshot["depth_prior"],
+        "depth_final": snapshot["depth_final"],
+        "return_scope": snapshot["return_scope"],
+        "document": (
+            {
+                **document_row,
+                "sections_used": _json(snapshot["doc_sections_used"], []),
+                "sections_total": document_row["section_count"],
+                "doc_match": snapshot["doc_match"],
+            }
+            if document_row is not None
+            else (
+                {
+                    "url": snapshot["primary_doc_url"],
+                    "doc_match": snapshot["doc_match"],
+                    "sections_used": _json(snapshot["doc_sections_used"], []),
+                }
+                if snapshot["primary_doc_url"]
+                else None
+            )
+        ),
+        "fact_pack": _json(pack["pack"], None) if pack else None,
+        "plan": _json(pack["plan"], None) if pack else None,
+        "attribution": _json(pack["attribution"], None) if pack else None,
+        "sources": _json(pack["sources"], []) if pack else [],
+        "history": decisions,
+    }
+
+
+@router.post("/{candidate_id}/return", response_model=CandidateOut)
+def candidate_return(
+    candidate_id: int, brand_id: int, payload: CandidateReturnIn
+) -> CandidateOut:
+    """Send an article back to one stage (NTS_100 §5, NTS_107).
+
+    The scope is stored on the candidate, which is what makes the next
+    production run cheap: ``translation:uk`` re-runs the UK translation and
+    nothing before it, so one complaint costs one stage rather than a whole
+    article. The decision row carries the same scope, because the review log is
+    the only dataset for tuning the rubric (NTS_113).
+
+    **The slot is released.** A Monday slot held by something nobody approved
+    makes the calendar lie — the same rule ``unreject`` follows.
+    """
+    now = datetime.now(tz=UTC)
+    with session_scope() as session:
+        _brand_or_404(session, brand_id)
+        row = _candidate_or_404(session, candidate_id, brand_id)
+        if row.status not in ("drafted", "ready", "returned"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"candidate is {row.status!r}; a return is only meaningful "
+                    "from drafted / ready / returned"
+                ),
+            )
+        row.status = "returned"
+        row.return_scope = payload.scope
+        row.publication_slot = None
+        row.manual_by = payload.reviewer
+        row.manual_at = now
+        session.add(
+            ReviewDecision(
+                brand_id_fk=brand_id,
+                candidate_id_fk=candidate_id,
+                action="return",
+                scope=payload.scope,
+                comment=payload.comment,
+                reviewer=payload.reviewer,
+                time_spent_s=payload.time_spent_s,
+                at=now,
+            )
+        )
+        session.flush()
+        return CandidateOut.model_validate(row)

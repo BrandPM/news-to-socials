@@ -110,11 +110,17 @@ SPEND_CAP_PREFIX = "spend_cap:"
 # directive asks for the share on real ones, and for a prompt fix through a
 # reseed migration if it passes 30%.
 CLOSE_RETRY_PREFIX = "close_retry_rate:"
+# NTS_106 §5 — the dead-man switch: no heartbeat in the chat by 09:00 in the
+# brand's timezone. The silence itself is the alert, because a monitoring
+# channel that has gone quiet is indistinguishable from a quiet morning.
+DEAD_MAN_PREFIX = "dead_man:"
+DEAD_MAN_HOUR = 9
 PRODUCTION_PREFIXES = (
     THIN_PORTFOLIO_PREFIX,
     CANDIDATE_FAILED_PREFIX,
     SPEND_CAP_PREFIX,
     CLOSE_RETRY_PREFIX,
+    DEAD_MAN_PREFIX,
 )
 
 # The share above which the close prompt itself is the problem, not the story.
@@ -122,6 +128,12 @@ CLOSE_RETRY_ALERT_SHARE = 0.30
 # Below this many drafts the ratio is noise — three retries out of four drafts
 # is not evidence of anything.
 CLOSE_RETRY_MIN_DRAFTS = 10
+
+# NTS_106 §1 — how long a failed delivery waits before it is tried again, and
+# how many times. Ten minutes is the spec's number; five attempts is roughly
+# an hour of a dead Telegram, after which retrying is not the problem to solve.
+ALERT_RETRY_AFTER = timedelta(minutes=10)
+ALERT_MAX_ATTEMPTS = 5
 
 # NTS_100 §3.5 — how far ahead the thin-portfolio pulse looks.
 THIN_PORTFOLIO_LEAD_DAYS = 3
@@ -595,6 +607,118 @@ def format_close_retry_rate(
     )
 
 
+def record_intent(notification_id: str, message: str) -> None:
+    """Write the alert down BEFORE trying to send it (NTS_106 §1).
+
+    The ordering is the whole point. Recording after a successful send — which
+    is what this table did until S7 — means an alert raised while Telegram is
+    down leaves no trace and is never retried: the row that would have said
+    "this needs saying" is the row the failure prevented.
+    """
+    with session_scope() as session:
+        row = session.get(AlertSent, notification_id)
+        if row is None:
+            session.add(
+                AlertSent(
+                    notification_id=notification_id,
+                    sent_at=datetime.now(tz=UTC),
+                    delivered=False,
+                    attempts=0,
+                    message=message,
+                )
+            )
+        elif not row.delivered:
+            row.message = message
+
+
+def mark_delivery(notification_id: str, *, delivered: bool) -> None:
+    """Record the outcome of one send attempt."""
+    with session_scope() as session:
+        row = session.get(AlertSent, notification_id)
+        if row is None:
+            return
+        row.delivered = delivered
+        row.attempts = int(row.attempts or 0) + 1
+        row.last_attempt_at = datetime.now(tz=UTC)
+
+
+def pending_deliveries(*, now: datetime | None = None) -> list[tuple[str, str]]:
+    """Alerts that were recorded, never landed, and are due for another try.
+
+    Ten minutes between attempts and five attempts in all (NTS_106 §1). Past
+    that, retrying is not the problem to solve — the channel is down, and the
+    dead-man switch is what covers a channel that stays down.
+    """
+    now = now or datetime.now(tz=UTC)
+    out: list[tuple[str, str]] = []
+    with session_scope() as session:
+        rows = (
+            session.execute(
+                select(AlertSent).where(
+                    AlertSent.delivered.is_(False),
+                    AlertSent.attempts < ALERT_MAX_ATTEMPTS,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            if not row.message:
+                continue
+            last = row.last_attempt_at
+            if last is not None:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=UTC)
+                if now - last < ALERT_RETRY_AFTER:
+                    continue
+            out.append((row.notification_id, row.message))
+    return out
+
+
+def check_dead_man(
+    *,
+    brand_id_fk: int,
+    timezone_name: str | None,
+    now: datetime,
+    brand_name: str | None = None,
+) -> tuple[str, str] | None:
+    """No heartbeat in the chat by 09:00 in the brand's timezone (NTS_106 §5).
+
+    The silence is the alert. A monitoring channel that has gone quiet looks
+    exactly like a quiet morning, and telling those two apart is the single
+    thing this switch exists for — so it fires on the *absence* of a delivered
+    pulse, not on any failure signal.
+    """
+    from pipeline.selector.candidate_store import resolve_timezone
+
+    local = now.astimezone(resolve_timezone(timezone_name))
+    if local.hour < DEAD_MAN_HOUR:
+        return None
+    day_start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start = day_start_local.astimezone(UTC).replace(tzinfo=None)
+    with session_scope() as session:
+        delivered_today = session.execute(
+            select(AlertSent.notification_id).where(
+                AlertSent.delivered.is_(True),
+                AlertSent.sent_at >= day_start,
+            )
+        ).first()
+    if delivered_today is not None:
+        return None
+    key = f"{DEAD_MAN_PREFIX}{brand_id_fk}:{local.date().isoformat()}"
+    who = f" · {html.escape(brand_name)}" if brand_name else ""
+    message = "\n".join(
+        [
+            f"🔴 <b>Сводки сегодня не было{who}</b>",
+            f"До {DEAD_MAN_HOUR:02d}:00 ({timezone_name or 'UTC'}) в канал не "
+            "пришло ни одного сообщения.",
+            "Возможно, таймеры не отработали, а не «всё тихо».",
+            "<code>systemctl list-timers --all | grep nts-</code>",
+        ]
+    )
+    return key, message
+
+
 def _gather_production_events(
     already: set[str], *, now: datetime | None = None
 ) -> list[tuple[str, str]]:
@@ -671,6 +795,14 @@ def _gather_production_events(
         )
 
     for brand_id, name, slots, tz_name, cap in configs:
+        dead_man = check_dead_man(
+            brand_id_fk=brand_id,
+            timezone_name=tz_name,
+            now=now,
+            brand_name=name,
+        )
+        if dead_man is not None and dead_man[0] not in already:
+            out.append(dead_man)
         pulse = check_thin_portfolio(
             brand_id_fk=brand_id,
             slots=slots,
@@ -1060,26 +1192,37 @@ async def run_alerts(
     publisher = publisher or TelegramPublisher()
     sent: list[str] = []
 
+    async def deliver(notification_id: str, message: str) -> bool:
+        """Record the intent, try to send, record the outcome (NTS_106 §1).
+
+        The intent is written first, on purpose: an alert raised while Telegram
+        is unreachable must leave a row saying it needs saying, or it is lost
+        with no trace and nothing to retry. That was the state NTS_122 §8 found.
+        """
+        record_intent(notification_id, message)
+        try:
+            await publisher._send_message(chat_id, message)
+        except Exception:
+            log.exception("alerts.send_failed", notification_id=notification_id)
+            mark_delivery(notification_id, delivered=False)
+            return False
+        mark_delivery(notification_id, delivered=True)
+        return True
+
     # Send up to the cap individually; fold the overflow into one summary.
     head = new_ids[:MAX_INDIVIDUAL_ALERTS]
     overflow = new_ids[MAX_INDIVIDUAL_ALERTS:]
     for nid in head:
         item, brand_name = current[nid]
-        try:
-            await publisher._send_message(chat_id, format_alert(item, brand_name=brand_name))
-        except Exception:  # noqa: BLE001
-            log.exception("alerts.send_failed", notification_id=nid)
-            continue
-        sent.append(nid)
+        if await deliver(nid, format_alert(item, brand_name=brand_name)):
+            sent.append(nid)
 
     if overflow:
-        try:
-            await publisher._send_message(chat_id, format_summary(len(overflow)))
+        summary_key = f"summary:{datetime.now(tz=UTC).strftime('%Y-%m-%dT%H:%M')}"
+        if await deliver(summary_key, format_summary(len(overflow))):
             # The overflow ids are "handled" — record them so the next pass
             # doesn't re-summarize the same backlog.
             sent.extend(overflow)
-        except Exception:  # noqa: BLE001
-            log.exception("alerts.summary_send_failed", count=len(overflow))
 
     # NTS_075 — pipeline-visibility pulses. Own dedup keys, no cap (windowed
     # to 24h so volume is naturally bounded), gathered defensively.
@@ -1110,19 +1253,25 @@ async def run_alerts(
             visibility.append(pulse)
     except Exception:  # noqa: BLE001 — unattended; never crash the timer
         log.exception("alerts.backup_check_failed")
-    for key, message in visibility:
-        try:
-            await publisher._send_message(chat_id, message)
-        except Exception:  # noqa: BLE001
-            log.exception("alerts.visibility_send_failed", key=key)
-            continue
-        sent.append(key)
+    # NTS_106 §1 — anything that failed to land on an earlier pass is tried
+    # again before anything new, so a recovered channel drains its backlog in
+    # the order it happened rather than the order the next pass discovers.
+    try:
+        retries = pending_deliveries()
+    except Exception:
+        log.exception("alerts.retry_gather_failed")
+        retries = []
+    for key, message in retries:
+        if await deliver(key, message):
+            log.info("alerts.redelivered", key=key)
 
-    if sent:
-        now = datetime.now(tz=timezone.utc)
-        with session_scope() as session:
-            for nid in sent:
-                session.merge(AlertSent(notification_id=nid, sent_at=now))
+    for key, message in visibility:
+        if await deliver(key, message):
+            sent.append(key)
+
+    # The ledger rows are written by ``deliver`` itself, before each send —
+    # a merge here would overwrite ``attempts`` and ``delivered`` with the
+    # defaults and undo exactly the bookkeeping this pass exists to keep.
 
     resolved: list[str] = []
     if send_resolved and gone_ids:

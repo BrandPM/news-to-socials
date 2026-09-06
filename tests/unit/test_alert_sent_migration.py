@@ -45,7 +45,12 @@ def test_migration_012_alert_sent_round_trip(tmp_path: Path) -> None:
             r[1]
             for r in conn.execute("PRAGMA table_info(alert_sent)").fetchall()
         }
-        assert cols == {"notification_id", "sent_at"}
+        # Migration 029 turned this from a dedup ledger into a delivery
+        # ledger (NTS_106 §1): a row now means "we intended to send this", and
+        # ``delivered`` says whether it landed. 012's own two columns are
+        # still here and still carry the same meaning.
+        assert {"notification_id", "sent_at"} <= cols
+        assert {"delivered", "attempts", "last_attempt_at", "message"} <= cols
         # notification_id is the primary key.
         pk = [
             r[1]

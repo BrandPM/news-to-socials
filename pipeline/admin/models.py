@@ -862,6 +862,21 @@ class AlertSent(Base):
     sent_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=_utcnow
     )
+    # NTS_106 §1 / NTS_122 §8 — migration 029 turned this from a *dedup* ledger
+    # into a *delivery* ledger. A row now means "we intended to say this";
+    # ``delivered`` says whether it landed. Before this an alert raised while
+    # Telegram was unreachable was lost silently, which is the one failure mode
+    # a monitoring channel may not have.
+    delivered: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The rendered text, so a retry sends what was meant rather than
+    # re-deriving it from a world that has since moved on.
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class TopicEmbedding(Base):
@@ -1479,4 +1494,40 @@ class DocumentVersion(Base):
         UniqueConstraint("url", "content_hash", name="uq_document_versions_url_hash"),
         Index("ix_document_versions_url", "url"),
         Index("ix_document_versions_fetched", "fetched_at"),
+    )
+
+
+class SeedTopic(Base):
+    """A recall-test subject (NTS_115 artefact 2, NTS_099 §7).
+
+    The 20 topics lived only in the vault, which is precisely why the recall
+    test stayed a manual exercise that never happened: the numbers had nowhere
+    to be recomputed. In a table they are recomputed against the accumulated
+    ``candidates`` every time the screen is opened, which is what Andriy's
+    2026-09-06 directive replaced the shadow week's hand-marking with.
+
+    ``keywords`` is a JSON array matched case-insensitively against a
+    candidate's title and summary. Deliberately not an embedding search: the
+    question is "did this subject reach the funnel at all", and a similarity
+    threshold answers a softer question with a number that looks the same.
+    """
+
+    __tablename__ = "seed_topics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=False
+    )
+    topic: Mapped[str] = mapped_column(Text, nullable=False)
+    keywords: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
+    jurisdiction: Mapped[str | None] = mapped_column(String, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("brand_id_fk", "topic", name="uq_seed_topic_brand"),
     )

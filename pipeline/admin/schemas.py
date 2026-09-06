@@ -525,6 +525,10 @@ class RunOut(BaseModel):
     # NTS_068 — live run progress {sources_total, sources_done, current_source,
     # drafts, errors, stage}. Empty dict when the run predates the column.
     progress: dict[str, Any] = {}
+    # NTS_106 §5 — which contour this run belongs to. NULL on the ~72 pre-v3
+    # rows, which is why it is optional rather than a required literal; the
+    # Monitoring screen groups on it and needs to be able to say "before v3".
+    run_type: str | None = None
 
     @field_validator("source_ids", mode="before")
     @classmethod
@@ -1462,6 +1466,10 @@ class CandidateOut(BaseModel):
     sanity_draft_id: str | None
     publication_slot: date_type | None
     canon_dirty: bool
+    # S7 surfaces both on the review queue before anything is opened: they are
+    # invisible in the prose and expensive to miss (NTS_102 v2 §2, NTS_100 §5).
+    needs_attention: bool = False
+    return_scope: str | None = None
     attempts: int
     last_error: str | None
     supersedes_id: int | None
@@ -1557,6 +1565,47 @@ class CandidateActionIn(BaseModel):
     comment: str | None = Field(default=None, max_length=2000)
     reviewer: str = Field(default="admin", max_length=100)
     time_spent_s: int | None = Field(default=None, ge=0, le=86400)
+
+
+# NTS_100 §5 / NTS_107 — the stages an editor can send an article back to.
+# ``translation:<lang>`` is the one that pays for itself: it re-runs one
+# language instead of a whole article.
+RETURN_SCOPES = ("plan", "text", "blocks", "cover", "sources")
+
+
+class CandidateReturnIn(BaseModel):
+    """An editor's return, with the stage it goes back to (NTS_100 §5).
+
+    The scope is required. A return with no scope regenerates everything,
+    which is both the most expensive answer and the one that discards the
+    editor's actual complaint — they said the *plan* was wrong, not the prose.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str = Field(max_length=40)
+    comment: str = Field(min_length=1, max_length=2000)
+    reviewer: str = Field(default="admin", max_length=100)
+    time_spent_s: int | None = Field(default=None, ge=0, le=86400)
+
+    @field_validator("scope")
+    @classmethod
+    def _known_scope(cls, v: str) -> str:
+        scope = v.strip().lower()
+        if scope in RETURN_SCOPES:
+            return scope
+        if scope.startswith("translation:"):
+            language = scope.split(":", 1)[1]
+            if language in SUPPORTED_LANGUAGE_SET:
+                return scope
+            raise ValueError(
+                f"unknown language in scope {v!r} — expected one of "
+                f"{list(SUPPORTED_LANGUAGES)}"
+            )
+        raise ValueError(
+            f"unknown return scope {v!r} — expected one of {list(RETURN_SCOPES)} "
+            "or translation:<lang>"
+        )
 
 
 class CandidateDocumentIn(BaseModel):
