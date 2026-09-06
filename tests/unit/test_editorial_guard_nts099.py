@@ -53,23 +53,27 @@ from pipeline.selector.editorial_guard import (
 )
 from tests.unit.conftest import seed_icon_brand
 
-# Migration 032's feed set, imported rather than counted by hand: these numbers
-# have to move when the migration does, and a hardcoded total is exactly how a
-# migration starts quietly inserting something else.
-def _load_m032():
+# The feed sets migrations 032 and 036 insert, imported rather than counted by
+# hand: these numbers have to move when the migrations do, and a hardcoded
+# total is exactly how a migration starts quietly inserting something else.
+def _load_migration(filename: str, alias: str):
     import importlib.util
 
     path = (
         Path(__file__).resolve().parents[2]
-        / "pipeline/admin/migrations/versions/032_source_overhaul.py"
+        / "pipeline/admin/migrations/versions"
+        / filename
     )
-    spec = importlib.util.spec_from_file_location("m032_for_tests", path)
+    spec = importlib.util.spec_from_file_location(alias, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-M032 = _load_m032()
+M032 = _load_migration("032_source_overhaul.py", "m032_for_tests")
+M036 = _load_migration("036_channels_for_uncovered_seeds.py", "m036_for_tests")
+# Every source-adding migration after 022, so a new one is added in one place.
+ADDED_SOURCES = M032.NEW_FEEDS + M036.NEW_FEEDS
 
 ADMIN_TOKEN = "tok-nts099"
 AUTH = {"X-Admin-Token": ADMIN_TOKEN}
@@ -1008,7 +1012,7 @@ def test_022_seeds_the_primary_feeds_with_their_registry_classification(
     # Twelve listed feeds (022; EUR-Lex is two saved searches) plus the primary
     # feeds migration 032 added from the NTS_129 P2 source audit.
     assert len(rows) == 13 + sum(
-        1 for _n, _u, _c, role, *_r in M032.NEW_FEEDS if role == "primary_feed"
+        1 for _n, _u, _c, role, *_r in ADDED_SOURCES if role == "primary_feed"
     )
 
     assert by_name["FINMA News DE"][2:6] == (

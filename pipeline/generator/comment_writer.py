@@ -298,6 +298,17 @@ Rewrite this draft to sound more natural and less AI-generated, preserving
 its meaning. Pay special attention to these tells found in the draft:
 {ai_tells}
 
+THE FIVE MOVES — what the draft was built from. Preserve all of them:
+  1. what happened   2. what it changes   3. who is affected, and by what
+  threshold   4. what to do, and by when   5. what we don't know.
+* Move 5 is the closing paragraphs, and it is the one most at risk from this
+  pass: a named gap ("the guidance on valuation dates has not been issued",
+  "the source does not give the de minimis") can LOOK like a generic sentence
+  and is the opposite of one. It is the most credible thing in the piece.
+  Sharpen its wording; never cut it, and never replace it with a summary.
+* Never delete a threshold, a deadline or a date to tighten prose. Those are
+  moves 3 and 4 and they are what the reader came for.
+
 SPECIFICITY (mandatory — highest priority):
 * Every claim must stay specific to THIS story — tied to a concrete fact,
   number, named entity, or mechanism from the draft. Cut or rewrite any
@@ -306,6 +317,8 @@ SPECIFICITY (mandatory — highest priority):
   generic shape: "rising uncertainty creates challenges", "could cause
   serious damage", "requires immediate decisions" — replace each with the
   specific who / what / how-much already present in the draft.
+* This rule does NOT reach move 5. A sentence naming what this document
+  leaves open is specific to this document, whatever it looks like.
 * Voice principles to enforce (from the brand profile):
 {voice_principles}
 
@@ -347,10 +360,12 @@ STRUCTURE REQUIREMENTS (preserve / enforce — markdown, not bold):
     with generic sentences, or with a figure/date/name that is not already in
     the draft, is the exact failure this pass exists to prevent.
   - Never add a section, a fact or a sentence in order to reach a word count.
-* End with a forward-looking close ANCHORED to the article: it must
-  reference a specific named entity, number, or mechanism already in the
-  body and state the concrete shift for the reader's next decision ON THIS
-  topic. The final paragraph must answer: "So what does this mean
+* End with move 5 — the forward-looking close, ANCHORED to the article: it
+  must name what the material leaves open, reference a specific named entity,
+  number, or mechanism already in the body, and state the concrete shift for
+  the reader's next decision ON THIS topic. If the draft has no such close,
+  build one from the gaps its own facts imply; do not invent a new fact to do
+  it. The final paragraph must answer: "So what does this mean
   specifically?" — referencing a concrete fact / number / entity /
   consequence from THIS article. NOT a generic call-to-action or a
   restatement that fits any article. No "in conclusion" restatement.

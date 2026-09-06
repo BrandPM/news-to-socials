@@ -230,10 +230,26 @@ def depth_guidance(
     lines = [
         f"TARGET SHAPE: {depth} — {length}, {structure}.",
         "This target is a guide to what the material can support, NOT a quota. "
-        "The GROUNDING rule above outranks it: if the pack runs out at half "
-        "this length, stop there. Padding to reach a word count is a failure, "
-        "and inventing a figure to fill space is the worst outcome available.",
+        "The GROUNDING rule above outranks it: padding to reach a word count is "
+        "a failure, and inventing a figure to fill space is the worst outcome "
+        "available.",
+        # The other half, added in NTS_129 P2 Ф2. Without it this paragraph
+        # said "stop early" three ways and "reach the target" none, and it sits
+        # exactly where the model reads its length — which is how a 600-900
+        # band was answered with 300 words.
+        "It is not a licence to stop early either. Before you finish, check "
+        "that the five moves are answered: what happened, what it changes, who "
+        "is affected and by what threshold, what to do and by when, and what "
+        "we still don't know. Coming in far under this target almost always "
+        "means one of those is still missing from the text, not from the pack.",
     ]
+    if depth == "brief":
+        lines.append(
+            "This is a BRIEF: the material is thin, and this length is the "
+            "honest shape for it rather than a short article. Write all five "
+            "moves compactly — a brief that drops the gaps and the deadline is "
+            "just a summary."
+        )
     if decision is not None:
         lines.append(
             f"(Depth was computed from the material: {decision.n_facts} facts "

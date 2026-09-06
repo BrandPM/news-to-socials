@@ -50,23 +50,27 @@ _SOURCE_V3_COLUMNS = (
 )
 
 
-# Migration 032's feed set, imported rather than counted by hand: these numbers
-# have to move when the migration does, and a hardcoded total is exactly how a
-# migration starts quietly inserting something else.
-def _load_m032():
+# The feed sets migrations 032 and 036 insert, imported rather than counted by
+# hand: these numbers have to move when the migrations do, and a hardcoded
+# total is exactly how a migration starts quietly inserting something else.
+def _load_migration(filename: str, alias: str):
     import importlib.util
 
     path = (
         Path(__file__).resolve().parents[2]
-        / "pipeline/admin/migrations/versions/032_source_overhaul.py"
+        / "pipeline/admin/migrations/versions"
+        / filename
     )
-    spec = importlib.util.spec_from_file_location("m032_for_tests", path)
+    spec = importlib.util.spec_from_file_location(alias, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-M032 = _load_m032()
+M032 = _load_migration("032_source_overhaul.py", "m032_for_tests")
+M036 = _load_migration("036_channels_for_uncovered_seeds.py", "m036_for_tests")
+# Every source-adding migration after 022, so a new one is added in one place.
+ADDED_SOURCES = M032.NEW_FEEDS + M036.NEW_FEEDS
 
 
 
@@ -458,7 +462,7 @@ def test_migrating_a_populated_database_loses_nothing(alembic_db) -> None:
             # per saved search and it asks for two. 032 adds the feed set the
             # NTS_129 P2 audit verified live, and deactivates rather than
             # deletes the wires that earned nothing — so the count only grows.
-            "sources": before["sources"] + 13 + len(M032.NEW_FEEDS),
+            "sources": before["sources"] + 13 + len(ADDED_SOURCES),
             # 023 — one active editorial_guard rubric per brand.
             "prompts": before["prompts"] + brands,
         }

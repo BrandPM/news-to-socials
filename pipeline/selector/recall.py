@@ -256,3 +256,116 @@ def compute_recall(
         candidates=report.candidates_considered,
     )
     return report
+
+
+# --------------------------------------------------------------------------
+# CLI — ``python -m pipeline.selector.recall --brand icon --markdown``
+# --------------------------------------------------------------------------
+
+
+def render_markdown(report: RecallReport, *, brand: str) -> str:
+    """The report as a table to paste into a session log.
+
+    Markdown rather than JSON because this number is read by a person deciding
+    whether the sourcing work is done, and the per-topic rows are the argument:
+    an ``in_feed`` of 0.45 means nothing on its own, while a list of which
+    twelve subjects arrived and which eight did not says exactly which feed is
+    missing (NTS_129 P2 Ф3).
+    """
+    lines: list[str] = []
+    both = report.as_dict()
+
+    def pct(value: float | None) -> str:
+        return "—" if value is None else f"{value:.0%}"
+
+    lines.append(f"### Recall — {brand}")
+    lines.append("")
+    lines.append(
+        f"Window {report.window_days}d "
+        f"(since {report.since.date().isoformat() if report.since else '—'}), "
+        f"{report.candidates_considered} candidates, "
+        f"{len(report.measurable)}/{len(report.topics)} seed topics measurable."
+    )
+    if both["channel_missing"]:
+        lines.append("")
+        lines.append(
+            f"{both['channel_missing']} topic(s) excluded: no channel exists for "
+            "them yet, so they are a sourcing gap rather than a recall failure."
+        )
+    lines.append("")
+    lines.append(
+        f"| metric | value | target | verdict |\n|---|---|---|---|\n"
+        f"| in_feed | {pct(report.in_feed_rate)} | {TARGET_IN_FEED:.0%} | "
+        f"{'PASS' if both['meets_in_feed'] else 'FAIL'} |\n"
+        f"| accepted/in_feed | {pct(report.accepted_rate)} | "
+        f"{TARGET_ACCEPTED:.0%} | "
+        f"{'PASS' if both['meets_accepted'] else 'FAIL'} |"
+    )
+    lines.append("")
+    lines.append("| topic | juris | seen | acc | rej | top reject reason |")
+    lines.append("|---|---|---|---|---|---|")
+    for topic in sorted(
+        report.topics, key=lambda t: (t.channel_missing, -t.seen, t.topic)
+    ):
+        reasons = sorted(topic.reason_codes.items(), key=lambda kv: -kv[1])
+        top = f"{reasons[0][0]} ×{reasons[0][1]}" if reasons else "—"
+        name = topic.topic if not topic.channel_missing else f"{topic.topic} (no channel)"
+        lines.append(
+            f"| {name} | {topic.jurisdiction or '—'} | {topic.seen} | "
+            f"{topic.accepted} | {topic.rejected} | {top} |"
+        )
+    return "\n".join(lines)
+
+
+def main() -> None:  # pragma: no cover — thin CLI wrapper
+    """``python -m pipeline.selector.recall --brand icon [--markdown] [--days N]``.
+
+    Exits non-zero when either target is missed, so the same command reads as a
+    gate in a script and as a report on a terminal.
+    """
+    import argparse
+    import json as _json
+    import sys
+
+    from sqlalchemy import select
+
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import Brand
+    from pipeline.common.logging import configure_logging
+
+    parser = argparse.ArgumentParser(description="Seed-topic recall over candidates.")
+    parser.add_argument("--brand", default="icon")
+    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument(
+        "--markdown", action="store_true", help="table for a session log"
+    )
+    parser.add_argument("--db", help="path to admin.db (defaults to ADMIN_DB_PATH)")
+    args = parser.parse_args()
+
+    if args.db:
+        import os
+
+        os.environ["ADMIN_DB_PATH"] = args.db
+
+    configure_logging()
+    with get_session_factory()() as session:
+        brand = session.execute(
+            select(Brand).where(Brand.slug == args.brand)
+        ).scalar_one_or_none()
+        if brand is None:
+            print(f"no brand with slug {args.brand!r}", file=sys.stderr)
+            raise SystemExit(2)
+        brand_id = int(brand.id)
+
+    report = compute_recall(brand_id_fk=brand_id, window_days=args.days)
+    if args.markdown:
+        print(render_markdown(report, brand=args.brand))
+    else:
+        print(_json.dumps(report.as_dict(), indent=2, ensure_ascii=False))
+
+    payload = report.as_dict()
+    raise SystemExit(0 if payload["meets_in_feed"] and payload["meets_accepted"] else 1)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

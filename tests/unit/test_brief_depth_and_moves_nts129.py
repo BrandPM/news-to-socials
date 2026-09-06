@@ -162,7 +162,15 @@ def test_a_brief_is_a_shape_to_aim_at_not_an_article_that_fell_short() -> None:
     brief = depth_guidance("brief", TARGETS)
     article = depth_guidance("article", TARGETS)
     assert "300-400" in brief and "600-900" in article
-    assert "Padding to reach a word count is a failure" in brief
+    assert "padding to reach a word count is " in brief.lower()
+    assert "honest shape for it rather than a short article" in brief
+    # …and the completeness half, which belongs on every band. The first Ф3
+    # proof run came in at 246 words against the brief's own 300-400 with move
+    # 5 missing entirely, and this paragraph is where the model reads its
+    # length — saying only "do not pad" here is what made stopping the
+    # dominant instruction.
+    assert "not a licence to stop early" in brief
+    assert "not a licence to stop early" in article
 
 
 # --------------------------------------------------------------------------

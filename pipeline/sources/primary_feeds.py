@@ -44,8 +44,29 @@ log = get_logger(__name__)
 _EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index?q=&forms={forms}"
 _EDGAR_JSON = "https://efts.sec.gov/LATEST/search-index?"
 
-# A publication link on fatf-gafi.org looks like /publications/<topic>/<slug>.
-_FATF_HINTS = ("/publications/", "/documents/", "/recommendations/")
+# What a publication link looks like on a regulator's listing page. Written as
+# a shared vocabulary rather than per-site selectors (NTS_129 P2 Ф1): a CSS
+# selector per source is a maintenance contract with every site's redesign,
+# and there is no column to keep one in. These path segments are what the sites
+# that publish law actually use, and they are checked against the listing
+# page's own host, so a hit is a document on the regulator's own site.
+_DOCUMENT_HINTS: tuple[str, ...] = (
+    "/publication",
+    "/document",
+    "/recommendation",
+    "/announcement",
+    "/circular",
+    "/press",
+    "/news",
+    "/guidance",
+    "/consultation",
+    "/regulation",
+    "/legislation",
+    "/decision",
+    "/notice",
+    "/statement",
+    ".pdf",
+)
 
 
 async def _get(url: str, *, timeout: float = 30.0) -> httpx.Response:
@@ -62,7 +83,19 @@ async def _get(url: str, *, timeout: float = 30.0) -> httpx.Response:
 async def fetch_html_list(
     *, url: str, source_name: str, source_id: str, limit: int = 50
 ) -> list[RawItem]:
-    """Publication links off an HTML listing page (FATF and its shape).
+    """Publication links off an HTML listing page.
+
+    The channel of last resort, for a regulator that publishes law and no feed:
+    the NTS_129 P2 audit found Cyprus, Poland, Ukraine, the UAE and the OECD all
+    in that position, and every one of them is a jurisdiction on Icon's tier
+    list. Written against the *shape* of a regulator listing page — same-host
+    links whose path names a document — rather than a CSS selector per site,
+    because a selector is a standing maintenance contract with somebody else's
+    redesign and there is nowhere to store one per source.
+
+    The trade is precision: this returns some navigation alongside the
+    publications. That is the right way round, because the guard rejects a
+    non-story for a fraction of a cent while a missed directive is invisible.
 
     Raises on a transport error so the intake records a health failure; returns
     an empty list when the page loaded but held nothing recognisable, which the
@@ -70,14 +103,24 @@ async def fetch_html_list(
     2026-08-28).
     """
     from bs4 import BeautifulSoup
+    from urllib.parse import urlparse
 
     resp = await _get(url)
     soup = BeautifulSoup(resp.content, "lxml")
+    listing_host = urlparse(url).netloc.lower()
     items: list[RawItem] = []
     seen: set[str] = set()
     for anchor in soup.find_all("a", href=True):
         href = urljoin(url, str(anchor["href"]).strip())
-        if href in seen or not any(hint in href.lower() for hint in _FATF_HINTS):
+        parsed = urlparse(href)
+        # Same host, because an off-site link on a regulator's listing page is
+        # a reference, not that regulator's publication — and a candidate whose
+        # primary_doc_url points somewhere else fails the document match later
+        # anyway, after paying for it.
+        if parsed.netloc.lower() != listing_host:
+            continue
+        lowered = href.lower()
+        if href in seen or not any(hint in lowered for hint in _DOCUMENT_HINTS):
             continue
         title = anchor.get_text(" ", strip=True)
         # A bare "Read more" or an icon link is navigation, not a publication.
