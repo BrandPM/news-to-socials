@@ -50,6 +50,26 @@ _SOURCE_V3_COLUMNS = (
 )
 
 
+# Migration 032's feed set, imported rather than counted by hand: these numbers
+# have to move when the migration does, and a hardcoded total is exactly how a
+# migration starts quietly inserting something else.
+def _load_m032():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "pipeline/admin/migrations/versions/032_source_overhaul.py"
+    )
+    spec = importlib.util.spec_from_file_location("m032_for_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+M032 = _load_m032()
+
+
+
 @pytest.fixture
 def alembic_db(tmp_path: Path):
     """A scratch admin.db plus a bound alembic runner."""
@@ -435,8 +455,10 @@ def test_migrating_a_populated_database_loses_nothing(alembic_db) -> None:
             **before,
             # 022 — the primary feeds from NTS_115 artefact 1: thirteen rows
             # for its twelve listed feeds, because its EUR-Lex line is one row
-            # per saved search and it asks for two.
-            "sources": before["sources"] + 13,
+            # per saved search and it asks for two. 032 adds the feed set the
+            # NTS_129 P2 audit verified live, and deactivates rather than
+            # deletes the wires that earned nothing — so the count only grows.
+            "sources": before["sources"] + 13 + len(M032.NEW_FEEDS),
             # 023 — one active editorial_guard rubric per brand.
             "prompts": before["prompts"] + brands,
         }

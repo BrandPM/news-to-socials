@@ -97,8 +97,14 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
     (
         "prefilter_deny_title_patterns",
         (
-            "appoints", "hires", "joins", "named as", "wins award", "ranked",
-            "opens office", "rebrand", "outlook", "forecast", "analysts expect",
+            "appoints", "hires", "joins", "named as",
+            "wins award", "ranked", "opens office", "rebrand",
+            "outlook", "forecast", "analysts expect", "names new",
+            "appointed as", "senior hire", "co-head", "steps down",
+            "snags", "rankings", "milestone", "where are they now",
+            "best places to work", "market brief", "morning briefing", "weekly wrap",
+            "week ahead", "what to watch", "webinar", "podcast",
+            "sponsored", "pe-backed", "pe backs", "debut fund",
         ),
         ["appoints", "sponsors"],
     ),

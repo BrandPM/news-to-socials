@@ -24,6 +24,7 @@ Cascade rules:
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 
 from sqlalchemy import (
@@ -240,6 +241,25 @@ class Prompt(Base):
     )
 
 
+# The shipped deny list: NTS_099 §1's eleven, plus the twenty-one the
+# NTS_129 P2 audit added (migration 033 extends an existing row to match).
+# News feeds only — see ``pipeline/selector/prefilter.py``.
+#
+# Built with ``json.dumps`` rather than written out as a literal: the
+# column stores JSON text, and a hand-written literal is one dropped space
+# away from a pattern that silently never matches.
+_DENY_TITLE_PATTERNS_DEFAULT: tuple[str, ...] = (
+    "appoints", "hires", "joins", "named as",
+    "wins award", "ranked", "opens office", "rebrand",
+    "outlook", "forecast", "analysts expect", "names new",
+    "appointed as", "senior hire", "co-head", "steps down",
+    "snags", "rankings", "milestone", "where are they now",
+    "best places to work", "market brief", "morning briefing", "weekly wrap",
+    "week ahead", "what to watch", "webinar", "podcast",
+    "sponsored", "pe-backed", "pe backs", "debut fund",
+)
+_DENY_TITLE_PATTERNS = json.dumps(list(_DENY_TITLE_PATTERNS_DEFAULT))
+
 class PipelineConfig(Base):
     __tablename__ = "pipeline_config"
 
@@ -424,12 +444,8 @@ class PipelineConfig(Base):
     prefilter_deny_title_patterns: Mapped[str] = mapped_column(
         Text,
         nullable=False,
-        default='["appoints", "hires", "joins", "named as", "wins award", '
-        '"ranked", "opens office", "rebrand", "outlook", "forecast", '
-        '"analysts expect"]',
-        server_default='["appoints", "hires", "joins", "named as", "wins award", '
-        '"ranked", "opens office", "rebrand", "outlook", "forecast", '
-        '"analysts expect"]',
+        default=_DENY_TITLE_PATTERNS,
+        server_default=_DENY_TITLE_PATTERNS,
     )
     prefilter_require_summary: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=text("1")

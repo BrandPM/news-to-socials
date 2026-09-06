@@ -53,6 +53,24 @@ from pipeline.selector.editorial_guard import (
 )
 from tests.unit.conftest import seed_icon_brand
 
+# Migration 032's feed set, imported rather than counted by hand: these numbers
+# have to move when the migration does, and a hardcoded total is exactly how a
+# migration starts quietly inserting something else.
+def _load_m032():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "pipeline/admin/migrations/versions/032_source_overhaul.py"
+    )
+    spec = importlib.util.spec_from_file_location("m032_for_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+M032 = _load_m032()
+
 ADMIN_TOKEN = "tok-nts099"
 AUTH = {"X-Admin-Token": ADMIN_TOKEN}
 
@@ -982,11 +1000,16 @@ def test_022_seeds_the_primary_feeds_with_their_registry_classification(
     with sqlite3.connect(db) as conn:
         rows = conn.execute(
             "SELECT name, source_role, source_class, license_class, doc_language, "
-            "fetch_method, active FROM sources WHERE source_role = 'primary_feed' "
+            "fetch_method, active, url FROM sources WHERE source_role = "
+            "'primary_feed' "
             "ORDER BY name"
         ).fetchall()
     by_name = {r[0]: r for r in rows}
-    assert len(rows) == 13  # twelve listed feeds; EUR-Lex is two saved searches
+    # Twelve listed feeds (022; EUR-Lex is two saved searches) plus the primary
+    # feeds migration 032 added from the NTS_129 P2 source audit.
+    assert len(rows) == 13 + sum(
+        1 for _n, _u, _c, role, *_r in M032.NEW_FEEDS if role == "primary_feed"
+    )
 
     assert by_name["FINMA News DE"][2:6] == (
         "regulator",
@@ -1010,10 +1033,16 @@ def test_022_seeds_the_primary_feeds_with_their_registry_classification(
     # ``html_list`` and ``edgar_fts`` joined that list in S5 — migration 027
     # activates the two rows 022 parked. The EUR-Lex saved searches stay off
     # because their URL is a placeholder only Andriy can fill in.
+    # Migration 032 added a third reason to be inactive: a feed that answers but
+    # never with a feed (Deloitte tax@hand 200s with an "Access Denied" body,
+    # FATF 403s any non-browser agent). Parked with the reason recorded rather
+    # than deleted — NTS_108 §1, a 403 is the site's ToS answer.
+    parked = {url for url, _reason in M032.UNREACHABLE_FEEDS}
     for name, row in by_name.items():
         has_fetcher = row[5] in ("rss", "atom", "html_list", "edgar_fts")
         is_placeholder_url = "REPLACE_ME" in name or name.startswith("EUR-Lex")
-        assert bool(row[6]) == (has_fetcher and not is_placeholder_url), name
+        expected = has_fetcher and not is_placeholder_url and row[7] not in parked
+        assert bool(row[6]) == expected, name
 
 
 def test_022_re_applied_keeps_operator_edits_and_inserts_no_duplicates(

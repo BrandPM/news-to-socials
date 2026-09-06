@@ -138,9 +138,18 @@ class ConfigRecord:
     depth_deep_min_facts: int = 10
     monthly_spend_cap_usd: float = 150.0
     max_cost_per_candidate_usd: float = 5.0
+    # Extended from the NTS_129 P2 audit (migration 033): personnel moves,
+    # rankings, macro digests and trade-press deal-flow were the four shapes
+    # the guard kept paying to reject. News feeds only — see prefilter.py.
     prefilter_deny_title_patterns: tuple[str, ...] = (
-        "appoints", "hires", "joins", "named as", "wins award", "ranked",
-        "opens office", "rebrand", "outlook", "forecast", "analysts expect",
+        "appoints", "hires", "joins", "named as",
+        "wins award", "ranked", "opens office", "rebrand",
+        "outlook", "forecast", "analysts expect", "names new",
+        "appointed as", "senior hire", "co-head", "steps down",
+        "snags", "rankings", "milestone", "where are they now",
+        "best places to work", "market brief", "morning briefing", "weekly wrap",
+        "week ahead", "what to watch", "webinar", "podcast",
+        "sponsored", "pe-backed", "pe backs", "debut fund",
     )
     prefilter_require_summary: bool = True
     prefilter_max_age_hours_news: int = 72
