@@ -1205,6 +1205,35 @@ async def produce_candidate(
         if fact_pack_id is not None:
             _attach_fact_pack_to_draft(fact_pack_id, canonical_id)
 
+        # --- the judge, in the real loop at last (NTS_080, S10) -----------
+        # Advisory and after the draft exists, so a dead judge cannot block a
+        # publication. It reads the fact pack as well as the body: NTS_092
+        # established that withholding the pack makes every researched figure
+        # read as invented, and the judge would then flag the pipeline for
+        # doing exactly what it was asked.
+        try:
+            from pipeline.admin.judge import score_draft
+
+            source_text = f"{topic.raw.title}\n{topic.raw.summary or ''}"
+            if fact_pack is not None and not fact_pack.is_empty():
+                source_text = (
+                    f"{source_text}\n\n--- WEB RESEARCH FACT PACK "
+                    f"(also authoritative) ---\n{fact_pack.render()}"
+                )
+            await score_draft(
+                draft_id=canonical_id,
+                lang=Language.en.value,
+                draft_text=f"{en_draft.title}\n\n{en_draft.body}",
+                eval_enabled=bool(getattr(config, "eval_enabled", True)),
+                eval_threshold=float(getattr(config, "eval_threshold", 7.0)),
+                source_text=source_text,
+                voice_profile_yaml=getattr(brand, "voice_profile_yaml", "") or "",
+                brand_id_fk=brand_id_fk,
+                run_id=run_id,
+            )
+        except Exception:
+            log.exception("production.judge_failed", candidate_id=candidate_id)
+
         cap = float(getattr(config, "max_cost_per_candidate_usd", 0.0) or 0.0)
         if exceeds_cost_cap(candidate_id, cap):
             # After the fact by construction — the spend is only knowable once
