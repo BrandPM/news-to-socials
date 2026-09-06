@@ -5,8 +5,9 @@ config surface that nothing read: a value saved in Settings that the next run
 ignored, with no error anywhere. The failure is silent by nature — the run
 succeeds, it just uses a number nobody chose.
 
-So each of the 30 v3 keys — 25 from migration 020, two mode flags from 022,
-and ``production_enabled`` + ``rank_weights`` from 026 — is walked end to end:
+So each of the 35 v3 keys — 25 from migration 020, two mode flags from 022,
+``production_enabled`` + ``rank_weights`` from 026, and the five document
+budgets from 027 — is walked end to end:
 
     migration default → ORM column → ConfigRecord → GET /config
                      → PUT /config → ConfigRecord again
@@ -139,6 +140,12 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
             "w_juris_div": 0.2,
         },
     ),
+    # migration 027 — the primary-document fetch budgets (NTS_101 §4).
+    ("doc_timeout_s", 60, 120),
+    ("doc_max_mb", 25, 60),
+    ("doc_max_tokens_for_composition", 12000, 20000),
+    ("doc_retries", 2, 3),
+    ("doc_match_model", "gpt-4o-mini", "gpt-4o"),
     ("guard_model", "gpt-4o-mini", "gpt-4o"),
 )
 
@@ -227,8 +234,9 @@ def test_every_v3_column_has_a_sentinel() -> None:
         f"unsentinelled column(s): {sorted(v3_columns - covered)}; "
         f"sentinel for a column that no longer exists: {sorted(covered - v3_columns)}"
     )
-    # 25 from migration 020, three mode flags (022 + 026), rank weights (026).
-    assert len(_SENTINELS) == 30
+    # 25 from 020, three mode flags (022 + 026), rank weights (026), and the
+    # five document budgets (027).
+    assert len(_SENTINELS) == 35
 
 
 # --- default reaches the runtime -----------------------------------------

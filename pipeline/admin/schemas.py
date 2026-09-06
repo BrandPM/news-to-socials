@@ -283,6 +283,12 @@ class PipelineConfigOut(BaseModel):
     production_enabled: bool
     # Rank formula weights (NTS_100 §2) — migration 026
     rank_weights: dict[str, float]
+    # Primary document fetch budgets (NTS_101 §4) — migration 027
+    doc_timeout_s: int
+    doc_max_mb: int
+    doc_max_tokens_for_composition: int
+    doc_retries: int
+    doc_match_model: str
     guard_model: str
     updated_at: datetime
 
@@ -383,6 +389,16 @@ class PipelineConfigUpdate(BaseModel):
     v2_generation_enabled: bool | None = None
     production_enabled: bool | None = None
     rank_weights: dict[str, float] | None = None
+    # NTS_101 §4 — the fetch budgets. Bounds are typo guards: 300s is longer
+    # than any regulator takes to serve a PDF, and 200k tokens of document
+    # would not fit a composition prompt at any model.
+    doc_timeout_s: int | None = Field(default=None, ge=5, le=300)
+    doc_max_mb: int | None = Field(default=None, ge=1, le=200)
+    doc_max_tokens_for_composition: int | None = Field(
+        default=None, ge=1000, le=200000
+    )
+    doc_retries: int | None = Field(default=None, ge=0, le=10)
+    doc_match_model: str | None = Field(default=None, min_length=1, max_length=100)
     guard_model: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("brand_timezone")

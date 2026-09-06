@@ -217,14 +217,29 @@ def _persist_embedding(
 
 
 async def _fetch_items(source_record: Any, limit: int) -> list[RawItem]:
-    """Fetch one source. Only feed methods are implemented before S5."""
+    """Fetch one source, by ``fetch_method``.
+
+    ``html_list`` and ``edgar_fts`` arrived in S5 (NTS_101 §1) and are handled
+    by :mod:`pipeline.sources.primary_feeds`. An unknown method still raises
+    rather than returning ``[]``, for the reason S2 gave: the failure belongs
+    in ``source_health_records``, not disguised as an empty feed.
+    """
     fetch_method = getattr(source_record, "fetch_method", None) or "rss"
     if fetch_method not in ("rss", "atom"):
-        # NTS_101 §2-7 lands the document fetchers in S5. Raising here (rather
-        # than returning []) puts the reason in source_health_records instead
-        # of making a missing fetcher look like an empty feed.
-        raise NotImplementedError(
-            f"fetch_method {fetch_method!r} has no fetcher until S5 (NTS_101)"
+        from pipeline.sources.primary_feeds import fetch_by_method
+
+        return list(
+            await fetch_by_method(
+                fetch_method=fetch_method,
+                url=source_record.url,
+                source_name=source_record.name,
+                source_id=(
+                    str(source_record.id)
+                    if source_record.id is not None
+                    else source_record.name
+                ),
+                limit=limit,
+            )
         )
     from pipeline.sources.rss import RssSource
 

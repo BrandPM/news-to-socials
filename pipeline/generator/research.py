@@ -474,6 +474,8 @@ You are a research assistant assembling a FACT PACK for a financial-commentary
 writer. You are NOT writing the article. You are collecting verifiable
 material it can be specific about.
 
+{document_rule}
+
 Use the web_search tool. Search the story itself first, then look for
 corroboration and background from OTHER outlets.
 
@@ -522,6 +524,35 @@ Story to research.
 Title: {title}
 Source URL: {url}
 Summary: {summary}
+{document_block}"""
+
+# NTS_101 §2-7 / NTS_123 S5 — when a primary document was fetched it goes in
+# FIRST and web_search is demoted to context. The reason is named in the
+# directive: research over a headline alone is the main producer of plausible
+# invention, because the model has nothing authoritative to be specific about
+# and the instructions still ask it for specifics.
+_DOCUMENT_RULE_WITH_DOC = """\
+A PRIMARY DOCUMENT is supplied below. It is the authority. Take every figure,
+date, threshold and definition from it, quoting its own wording, and cite it by
+the document URL. Use web_search ONLY to add what the document does not contain
+— reaction, context, prior versions, market detail. If the document and a
+search result disagree, the document wins and the disagreement is not a fact.\
+"""
+
+_DOCUMENT_RULE_NO_DOC = """\
+No primary document was available for this story, so every fact must come from
+a page you actually read via web_search.\
+"""
+
+_DOCUMENT_BLOCK = """\
+
+--- PRIMARY DOCUMENT (authoritative) ---
+URL: {doc_url}
+Read on (as_of): {as_of}
+Sections included: {sections}
+
+{doc_text}
+--- END OF PRIMARY DOCUMENT ---
 """
 
 # Appended on the second attempt only. The first attempt sometimes returns a
@@ -611,19 +642,37 @@ async def _create_response(
     raise last_exc if last_exc is not None else RuntimeError("no web-search tool")
 
 
+@dataclass(frozen=True)
+class PrimaryDocument:
+    """The document the research call reads before it searches (NTS_101 §2-7)."""
+
+    url: str
+    text: str
+    as_of: str = ""
+    sections_used: tuple[str, ...] = ()
+
+
 async def build_fact_pack(
     topic: Topic,
     *,
     budget: ResearchBudget | None = None,
     client: Any = None,
     model: str = RESEARCH_MODEL,
+    document: PrimaryDocument | None = None,
 ) -> FactPack | None:
-    """Research ``topic`` on the web and return a grounded fact pack.
+    """Research ``topic`` and return a grounded fact pack.
 
     Placed between dedup and ``writer_draft``, once per topic (EN canon).
     Up to ``_RESEARCH_ATTEMPTS`` calls: an unusable payload — malformed JSON,
     or a well-formed one with nothing that survives the URL rule — is retried
     once with a nudge. A timeout or an API error is NOT retried.
+
+    ``document`` is the S5 change: when a primary document was fetched it is
+    put in front of the model and ``web_search`` is demoted to filling gaps
+    (NTS_123 S5, "ресёрч получает документ на вход ПЕРЕД web_search"). Research
+    over a headline alone is where the invented specifics came from — the
+    instructions ask for figures and dates, and without a document the only
+    place to get them is memory.
 
     Returns ``None`` when every attempt failed. Never raises: the caller
     drafts from title+summary and counts the article thin.
@@ -640,11 +689,25 @@ async def build_fact_pack(
             return None
         client = AsyncOpenAI(api_key=api_key)
 
-    instructions = _RESEARCH_INSTRUCTIONS.format(max_sources=budget.max_sources)
+    instructions = _RESEARCH_INSTRUCTIONS.format(
+        max_sources=budget.max_sources,
+        document_rule=(
+            _DOCUMENT_RULE_WITH_DOC if document else _DOCUMENT_RULE_NO_DOC
+        ),
+    )
+    document_block = ""
+    if document is not None:
+        document_block = _DOCUMENT_BLOCK.format(
+            doc_url=document.url,
+            as_of=document.as_of or "unknown",
+            sections=", ".join(document.sections_used) or "(whole document)",
+            doc_text=document.text,
+        )
     payload = _RESEARCH_INPUT.format(
         title=topic.raw.title,
         url=str(topic.raw.url),
         summary=(topic.raw.summary or "")[:1000],
+        document_block=document_block,
     )
 
     for attempt in range(1, _RESEARCH_ATTEMPTS + 1):

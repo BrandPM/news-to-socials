@@ -13,6 +13,10 @@ dependencies = [
     "feedparser>=6.0.11",
     "beautifulsoup4>=4.12.0",
     "lxml>=5.1.0",
+    # NTS_101 §4 — text extraction from primary documents. Pure Python, no
+    # system libraries, which matters because the extractor runs on the VPS
+    # under a hardened systemd unit with ProtectSystem=strict.
+    "pypdf>=5.0.0",
     "python-slugify>=8.0.4",
 
     # Data / validation

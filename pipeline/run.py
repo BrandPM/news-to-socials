@@ -405,6 +405,7 @@ async def build_fact_pack_for_topic(
     *,
     research_enabled: bool = True,
     budget: ResearchBudget | None = None,
+    document: Any = None,
 ) -> FactPack | None:
     """Research ``topic`` on the web, ONCE per topic (NTS_092).
 
@@ -419,7 +420,10 @@ async def build_fact_pack_for_topic(
         return None
     from pipeline.generator.research import build_fact_pack  # noqa: PLC0415
 
-    return await build_fact_pack(topic, budget=budget)
+    # ``document`` is the S5 seam (NTS_101 §2-7): the v2 path has none and
+    # passes None, the production path passes the fetched primary document and
+    # research is then grounded in it rather than in a headline.
+    return await build_fact_pack(topic, budget=budget, document=document)
 
 
 def _fact_pack_as_dict(pack: FactPack | None) -> dict[str, object]:

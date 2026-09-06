@@ -46,6 +46,7 @@ of an article (NTS_122).
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -59,7 +60,9 @@ from pipeline.selector.candidate_store import (
     resolve_timezone,
 )
 from pipeline.selector.portfolio_sweep import (
+    expire_exhausted_doc_searches,
     expire_stale_candidates,
+    park_document_missing,
     prune_old_candidates,
     release_to_pending,
     sweep_production_timeouts,
@@ -104,6 +107,8 @@ class ProductionStats:
     drafted: int = 0
     failed: int = 0
     reused_fact_packs: int = 0
+    doc_missing: int = 0
+    doc_found: int = 0
     weekly_budget: int = 0
     taken_this_week: int = 0
     expired: int = 0
@@ -121,6 +126,8 @@ class ProductionStats:
             "drafted": self.drafted,
             "failed": self.failed,
             "reused_fact_packs": self.reused_fact_packs,
+            "doc_missing": self.doc_missing,
+            "doc_found": self.doc_found,
             "weekly_budget": self.weekly_budget,
             "taken_this_week": self.taken_this_week,
             "expired": self.expired,
@@ -220,19 +227,43 @@ def _jurisdictions(raw: str | None) -> tuple[str, ...]:
     return ()
 
 
-def eligible_candidates(
-    *, brand_id_fk: int, now: datetime | None = None
-) -> list[CandidateFacts]:
-    """The ``pending`` rows NTS_100 §1 admits to the formula.
+def _document_retry_is_due(
+    row: Any, *, now: datetime, max_retries: int, hours: int
+) -> bool:
+    """Is a candidate due for (another) document search?
 
-    Not expired, not held by a manager, and — for ``news`` — carrying a
-    document. ``held`` is excluded rather than penalised: a hold is a decision,
-    and a decision the ranker could outvote is not a decision.
+    NTS_101 §7: retry after 48 hours, at most ``doc_retries`` times. Out of
+    retries means the candidate waits for its TTL — or for a manual link from
+    the Portfolio — rather than being searched for on every run forever.
+    """
+    if int(getattr(row, "doc_attempts", 0) or 0) >= max_retries:
+        return False
+    last = getattr(row, "doc_last_search_at", None)
+    if last is None:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    return bool((now - last) >= timedelta(hours=hours))
+
+
+def eligible_candidates(
+    *,
+    brand_id_fk: int,
+    now: datetime | None = None,
+    doc_retries: int = 2,
+) -> list[CandidateFacts]:
+    """The rows NTS_100 §1 admits to the formula.
+
+    Not expired, not held by a manager, and — for ``news`` — either carrying a
+    usable document already or still entitled to a document search
+    (NTS_101 §7). ``held`` is excluded rather than penalised: a hold is a
+    decision, and a decision the ranker could outvote is not a decision.
     """
     from sqlalchemy import select
 
     from pipeline.admin.db import get_session_factory
     from pipeline.admin.models import Candidate
+    from pipeline.sources.document_fetcher import DOC_RETRY_AFTER_HOURS
 
     now = now or datetime.now(tz=UTC)
     with get_session_factory()() as session:
@@ -240,7 +271,10 @@ def eligible_candidates(
             session.execute(
                 select(Candidate).where(
                     Candidate.brand_id_fk == brand_id_fk,
-                    Candidate.status == "pending",
+                    # ``doc_missing`` is not a dead end (NTS_101 §7): a
+                    # regulator publishing the act two days after the
+                    # announcement is the ordinary case, not the exception.
+                    Candidate.status.in_(("pending", "doc_missing")),
                 )
             )
             .scalars()
@@ -257,9 +291,19 @@ def eligible_candidates(
                 if expires < now:
                     continue
             if row.input_kind != "document":
-                if not row.primary_doc_url:
-                    continue
-                if (row.doc_match or "") not in ELIGIBLE_DOC_MATCH:
+                has_document = bool(row.primary_doc_url) and (
+                    row.doc_match or ""
+                ) in ELIGIBLE_DOC_MATCH
+                # No document yet is fine as long as the document stage is
+                # still allowed to look for one. What is not fine is producing
+                # an article from a headline, and that is what the stage
+                # itself refuses.
+                if not has_document and not _document_retry_is_due(
+                    row,
+                    now=now,
+                    max_retries=doc_retries,
+                    hours=DOC_RETRY_AFTER_HOURS,
+                ):
                     continue
             out.append(
                 CandidateFacts(
@@ -392,6 +436,96 @@ def _topic_from_candidate(row: Any, brand_slug: str, *, tag: str | None) -> Topi
     )
 
 
+@dataclass(frozen=True)
+class _CandidateSnapshot:
+    """The candidate fields the document stage reads, detached from the session.
+
+    A plain snapshot because ``resolve_document`` does network work that can
+    take a minute, and holding an ORM row open across it would keep a SQLite
+    write transaction alive for the whole fetch.
+    """
+
+    id: int
+    input_kind: str
+    source_title: str
+    source_summary: str
+    source_url: str | None
+    source_published_at: datetime | None
+    source_id_fk: int | None
+    primary_doc_url: str | None
+    primary_doc_hint: str | None
+    doc_match: str | None
+
+    @classmethod
+    def of(cls, row: Any) -> _CandidateSnapshot:
+        return cls(
+            id=int(row.id),
+            input_kind=row.input_kind,
+            source_title=row.source_title or "",
+            source_summary=row.source_summary or "",
+            source_url=row.source_url,
+            source_published_at=row.source_published_at,
+            source_id_fk=row.source_id_fk,
+            primary_doc_url=row.primary_doc_url,
+            primary_doc_hint=row.primary_doc_hint,
+            doc_match=row.doc_match,
+        )
+
+
+def _record_document_outcome(
+    *, candidate_id: int, outcome: Any, now: datetime
+) -> None:
+    """Count the document search on the candidate, whatever it found.
+
+    Written even on success: ``doc_attempts`` is how many times we went
+    looking, and the retry window (NTS_101 §7) is measured from the last look,
+    not from the last failure.
+    """
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import Candidate
+
+    with get_session_factory()() as session:
+        row = session.get(Candidate, candidate_id)
+        if row is None:
+            return
+        row.doc_attempts = int(row.doc_attempts or 0) + 1
+        row.doc_last_search_at = now.replace(tzinfo=None)
+        if getattr(outcome, "match", None) is not None and not outcome.usable:
+            row.doc_match = outcome.match.column_value
+        session.commit()
+
+
+def _store_document_link(
+    *,
+    candidate_id: int,
+    version_id: int | None,
+    doc_match: str | None,
+    url: str,
+    sections: Sequence[str],
+) -> None:
+    """The last link of the traceability chain (NTS_121 §3, migration 025).
+
+    ``doc_sections_used`` is the one that matters for the editor: it says which
+    parts of a 200-page act the writer actually read, so "the number is not in
+    the document" and "the number is in a section we did not send" stop looking
+    the same.
+    """
+    from pipeline.admin.db import get_session_factory
+    from pipeline.admin.models import Candidate
+
+    with get_session_factory()() as session:
+        row = session.get(Candidate, candidate_id)
+        if row is None:
+            return
+        row.primary_doc_url = url
+        if version_id is not None:
+            row.doc_version_id = str(version_id)
+        if doc_match:
+            row.doc_match = doc_match
+        row.doc_sections_used = json.dumps(list(sections), ensure_ascii=False)
+        session.commit()
+
+
 def _stages_to_run(return_scope: str | None) -> dict[str, bool]:
     """Which stages a regeneration actually re-runs (NTS_100 §5).
 
@@ -443,6 +577,16 @@ def _languages_from_scope(
     return picked
 
 
+class DocumentMissing(RuntimeError):  # noqa: N818 — a verdict, not a crash
+    """No usable primary document. The candidate waits; it does not fail.
+
+    NTS_101 §7 / NTS_123 S5: without a document the article is not written.
+    Raised out of :func:`produce_candidate` and caught by the run, which parks
+    the candidate in ``doc_missing`` rather than counting an attempt against
+    ``max_attempts`` — a regulator being slow is not the pipeline failing.
+    """
+
+
 async def produce_candidate(
     *,
     candidate_id: int,
@@ -456,6 +600,7 @@ async def produce_candidate(
     dry_run: bool,
     tag: str | None,
     stats: ProductionStats,
+    sources: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """One candidate, from ``in_production`` to ``drafted``.
 
@@ -471,7 +616,7 @@ async def produce_candidate(
         load_latest_fact_pack,
         persist_fact_pack,
     )
-    from pipeline.generator.research import ResearchBudget, fact_pack_from_dict
+    from pipeline.generator.research import PrimaryDocument, ResearchBudget, fact_pack_from_dict
     from pipeline.publisher.sanity import SanityPostInput
     from pipeline.run import (
         _attach_fact_pack_to_draft,
@@ -487,6 +632,11 @@ async def produce_candidate(
         exceeds_cost_cap,
         link_candidate_to_draft,
     )
+    from pipeline.sources.document_fetcher import (
+        FetchBudget,
+        resolve_document,
+        select_sections,
+    )
 
     with get_session_factory()() as session:
         row = session.get(Candidate, candidate_id)
@@ -495,9 +645,13 @@ async def produce_candidate(
         topic = _topic_from_candidate(row, brand_slug, tag=tag)
         return_scope = row.return_scope
         primary_doc_url = row.primary_doc_url
+        snapshot = _CandidateSnapshot.of(row)
 
     stages = _stages_to_run(return_scope)
     fanout = _languages_from_scope(languages, return_scope)
+    doc_budget = FetchBudget.from_config(config)
+    primary_document: PrimaryDocument | None = None
+    doc_sections: list[str] = []
 
     # Every paid call from here down is charged to THIS candidate — the
     # production path is the one that knows the id before it spends anything,
@@ -507,6 +661,60 @@ async def produce_candidate(
             brand_id_fk=brand_id_fk, run_id=run_id, candidate_id=candidate_id
         )
     ):
+        # --- the primary document, BEFORE research (NTS_101 §2-7) ---------
+        # Ordered first on purpose. NTS_123 S5 names this as the main cause of
+        # the invented specifics: research asked for figures and dates with
+        # nothing authoritative in front of it, so the only place to get them
+        # was the model's memory. A regeneration keeps the document it already
+        # has — the scope rules say the document is not re-read.
+        if stages["research"]:
+            outcome = await resolve_document(
+                candidate=snapshot,
+                sources=sources,
+                budget=doc_budget,
+                now=datetime.now(tz=UTC),
+            )
+            _record_document_outcome(
+                candidate_id=candidate_id, outcome=outcome, now=datetime.now(tz=UTC)
+            )
+            if not outcome.usable:
+                stats.doc_missing += 1
+                raise DocumentMissing(
+                    f"{outcome.status}: {outcome.reason or 'no document'}"
+                )
+            document = outcome.document
+            assert document is not None  # guarded by outcome.usable
+            selection = select_sections(
+                document.text,
+                hint=snapshot.primary_doc_hint,
+                headline=snapshot.source_title,
+                max_tokens=doc_budget.max_tokens_for_composition,
+            )
+            doc_sections = selection.sections_used
+            primary_document = PrimaryDocument(
+                url=document.url,
+                text=selection.text,
+                as_of=document.as_of.date().isoformat(),
+                sections_used=tuple(doc_sections),
+            )
+            primary_doc_url = document.url
+            _store_document_link(
+                candidate_id=candidate_id,
+                version_id=document.version_id,
+                doc_match=(outcome.match.column_value if outcome.match else None),
+                url=document.url,
+                sections=doc_sections,
+            )
+            log.info(
+                "production.document",
+                candidate_id=candidate_id,
+                url=document.url,
+                how=outcome.how,
+                match=outcome.match.verdict if outcome.match else None,
+                sections=f"{len(doc_sections)}/{selection.sections_total}",
+                cached=document.from_cache,
+            )
+
         # --- research: reuse before buying (NTS_100 §4) -------------------
         stored = load_latest_fact_pack(candidate_id)
         fact_pack = None
@@ -527,6 +735,7 @@ async def produce_candidate(
                 topic,
                 research_enabled=bool(getattr(config, "research_enabled", True)),
                 budget=ResearchBudget.from_config(config),
+                document=primary_document,
             )
             fact_pack_id = persist_fact_pack(
                 brand_id_fk=brand_id_fk,
@@ -535,6 +744,8 @@ async def produce_candidate(
                 pack=_fact_pack_as_dict(fact_pack),
                 sources=tuple(fact_pack.citations) if fact_pack else (),
                 primary_doc_url=primary_doc_url,
+                doc_sections_used=doc_sections or None,
+                doc_text=primary_document.text if primary_document else None,
                 model=fact_pack.model if fact_pack else None,
             )
         if fact_pack is None:
@@ -665,6 +876,8 @@ async def produce_candidate(
         "candidate_id": candidate_id,
         "status": "drafted",
         "draft_id": canonical_id,
+        "doc_url": primary_doc_url,
+        "doc_sections": doc_sections,
         "languages": [lang.value for lang, _ in drafts],
         "title": posts[0].title if posts else None,
         "thin": fact_pack is None,
@@ -782,6 +995,11 @@ async def run_production(
     # would be charged for work that never happened.
     max_attempts = int(getattr(config, "max_attempts", 2))
     stats.expired = expire_stale_candidates(brand_id_fk=brand_id_fk, now=now)
+    stats.expired += expire_exhausted_doc_searches(
+        brand_id_fk=brand_id_fk,
+        doc_retries=int(getattr(config, "doc_retries", 2)),
+        now=now,
+    )
     swept = sweep_production_timeouts(
         brand_id_fk=brand_id_fk,
         timeout_minutes=int(getattr(config, "production_timeout_min", 60)),
@@ -877,7 +1095,11 @@ async def run_production(
         return stats
 
     # --- rank and select -------------------------------------------------
-    facts = eligible_candidates(brand_id_fk=brand_id_fk, now=now)
+    facts = eligible_candidates(
+        brand_id_fk=brand_id_fk,
+        now=now,
+        doc_retries=int(getattr(config, "doc_retries", 2)),
+    )
     stats.eligible = len(facts)
     picks = select_batch(
         facts,
@@ -926,6 +1148,10 @@ async def run_production(
         id_fk=brand_id_fk,
     )
     languages = _languages_for_brand(brand_row)
+    # The registry, read once: the document stage refuses any URL whose domain
+    # is not in it (NTS_101 §2), so it needs the whole source list, not just
+    # the candidate's own row.
+    source_rows = client.get_active_sources()
 
     if dry_run:
         sanity_publisher: Any = _DryRunPublisher()
@@ -995,7 +1221,23 @@ async def run_production(
                 dry_run=dry_run,
                 tag=tag,
                 stats=stats,
+                sources=source_rows,
             )
+        except DocumentMissing as exc:
+            # NTS_101 §7 — not a failure and not an attempt. The candidate goes
+            # to ``doc_missing`` and comes back in 48 hours; charging this to
+            # ``max_attempts`` would retire candidates for a regulator's
+            # publishing schedule.
+            park_document_missing(candidate_id=candidate_id, reason=str(exc))
+            stats.candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "status": "doc_missing",
+                    "reason": str(exc)[:300],
+                }
+            )
+            log_lines.append(f"candidate {candidate_id}: doc_missing — {exc}")
+            continue
         except Exception as exc:
             status = release_to_pending(
                 candidate_id=candidate_id,
@@ -1014,6 +1256,8 @@ async def run_production(
             log_lines.append(f"candidate {candidate_id}: FAILED → {status}")
             continue
         stats.drafted += 1
+        if result.get("doc_url"):
+            stats.doc_found += 1
         stats.candidates.append(result)
         log_lines.append(
             f"candidate {candidate_id}: {result['status']} "

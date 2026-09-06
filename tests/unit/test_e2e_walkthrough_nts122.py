@@ -76,18 +76,38 @@ def test_every_stage_is_reported_and_the_unbuilt_ones_are_named(
 ):
     """The count of unbuilt stages is pinned, and it only ever goes down.
 
-    S4 closed the one ``gap`` (selection), which is why zero remain; the five
-    ``NOT IMPLEMENTED`` stages belong to S5 and S6 and are checked here so a
+    S4 closed the one ``gap`` (selection) and S5 closed the document stage, so
+    the four that remain all belong to S6. The count is pinned here so a
     half-built stage cannot be quietly promoted to ``ok``.
     """
     assert "17 total" in walkthrough_output
     assert "0 gap" in walkthrough_output
-    assert "5 not implemented" in walkthrough_output
-    for owner in ("S5", "S6"):
-        assert f"[{owner}]" in walkthrough_output, f"nothing waits on {owner}"
-    assert "[S4]" not in walkthrough_output, "S4 is done; nothing may wait on it"
+    assert "4 not implemented" in walkthrough_output
+    assert "[S6]" in walkthrough_output, "nothing waits on S6"
+    for done in ("[S4]", "[S5]"):
+        assert done not in walkthrough_output, f"{done} is done; nothing waits on it"
     # Each unbuilt stage says so in words, not by omission.
     assert walkthrough_output.count("nothing —") >= 4
+
+
+def test_the_document_stage_reads_before_research_does(walkthrough_output: str):
+    """S5's ordering as an end-to-end check (NTS_101 §2-7, NTS_123 S5).
+
+    A regression that put research back in front of the document would not
+    change a single unit test — both stages would still pass on their own. It
+    shows up here, in the order and in what research says it was given.
+    """
+    lines = walkthrough_output.splitlines()
+    doc_line = next(i for i, x in enumerate(lines) if "doc fetch + match" in x)
+    research_line = next(i for i, x in enumerate(lines) if "8. research" in x)
+    assert doc_line < research_line
+    assert "doc_match=exact" in walkthrough_output
+    assert "primary document (" in walkthrough_output
+    assert "FIRST, then web_search" in walkthrough_output
+    # The cache and the section list are the two parts an article's provenance
+    # is built from, so both are reported rather than assumed.
+    assert "cache hit on re-read: True" in walkthrough_output
+    assert "document_versions +1" in walkthrough_output
 
 
 def test_the_selection_stage_reports_the_rank_it_computed(walkthrough_output: str):

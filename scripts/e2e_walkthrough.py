@@ -269,6 +269,33 @@ _RESEARCH_JSON = {
 }
 
 
+# The document the fake fetcher serves. Written as a real consultation paper
+# would be — headings, an entry-into-force section, an annex — because the
+# section selector is being exercised, not bypassed.
+_FAKE_DOCUMENT = """\
+CONSULTATION PAPER ESMA35-1872330276-1899
+Published 27 August 2026
+
+1. Executive summary
+ESMA proposes to shorten the assessment clock for crypto-asset service
+provider authorisations from 40 to 25 working days.
+
+Article 3
+The competent authority shall acknowledge receipt within five working days of
+a complete application.
+
+Article 7
+Where the application is incomplete, the clock is suspended and restarts on
+receipt of the missing material.
+
+ENTRY INTO FORCE
+The revised technical standards apply from 1 January 2027.
+
+Annex II
+The fee for a re-submitted application is set at EUR 5 000.
+"""
+
+
 class FakeCompletions:
     """``chat.completions.create`` for the guard, the writer and the judge.
 
@@ -290,6 +317,21 @@ class FakeCompletions:
         if schema_name == "editorial_verdict":
             self._calls.append("guard")
             return _completion(json.dumps(_GUARD_ACCEPT), 1180, 140)
+        # S5 — the doc_match check (NTS_101 §3). Dispatched on its own opening
+        # line, like every other prompt here, so a routing bug cannot hide
+        # behind a fake that answers everything the same way.
+        if "you decide whether a document is the one" in lowered:
+            self._calls.append("doc_match")
+            return _completion(
+                json.dumps(
+                    {
+                        "verdict": "match",
+                        "reason": "the consultation paper the item announces",
+                    }
+                ),
+                900,
+                40,
+            )
         # Matched on the prompts' own opening lines rather than on a loose
         # keyword: "editor" and "translate" both appear in more than one of
         # them, and a fake that answers the wrong prompt hides a routing bug.
@@ -651,6 +693,7 @@ def table_counts() -> dict[str, int]:
     from pipeline.admin.models import (
         Candidate,
         CostRecord,
+        DocumentVersion,
         DraftApproval,
         FactPack,
         ReviewDecision,
@@ -662,6 +705,7 @@ def table_counts() -> dict[str, int]:
     models = {
         "candidates": Candidate,
         "cost_records": CostRecord,
+        "document_versions": DocumentVersion,
         "draft_approvals": DraftApproval,
         "fact_packs": FactPack,
         "review_decisions": ReviewDecision,
@@ -721,12 +765,12 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
     from pipeline.common.models import Language, Topic
     from pipeline.production import batch_key
     from pipeline.selector import candidate_lifecycle as lifecycle
-    from pipeline.selector.candidate_lifecycle import begin_production
     from pipeline.selector.candidate_dedup import (
         CandidateDedupConfig,
         check_post_guard,
         check_pre_guard,
     )
+    from pipeline.selector.candidate_lifecycle import begin_production
     from pipeline.selector.candidate_store import (
         CandidateInput,
         claim_pending,
@@ -1050,26 +1094,96 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
         )
 
         # ---- 7. doc fetch + match -------------------------------------
+        # S5 closed this. The HTTP fetch is faked (the walkthrough spends
+        # nothing and reaches no network), but the registry gate, the cache,
+        # the match check and the section selector all run for real.
+        from pipeline import production as production_mod
+        from pipeline.admin.db import get_session_factory
+        from pipeline.admin.models import Candidate as CandidateRow
+        from pipeline.sources import document_fetcher as doc_mod
+
+        before = table_counts()
+        doc_budget = doc_mod.FetchBudget.from_config(config)
+        source_rows = client.get_active_sources()
+
+        async def _fake_fetch(url, *, budget, source_class=None, cache_ttl_days=None, now=None):
+            """Stands in for the network only. Everything after it is real."""
+            cached = doc_mod.cached_version(url, ttl_days=cache_ttl_days, now=now)
+            if cached is not None:
+                return cached
+            doc = doc_mod.ExtractedDocument(
+                url=url,
+                text=_FAKE_DOCUMENT,
+                content_hash="e2e-" + str(abs(hash(url)) % 10**12),
+                content_type="text/html",
+                byte_size=len(_FAKE_DOCUMENT),
+                fetched_at=now,
+                title="Consultation paper ESMA35-1872330276-1899",
+                doc_language=doc_mod.guess_language(_FAKE_DOCUMENT),
+                http_status=200,
+                section_count=len(doc_mod.split_sections(_FAKE_DOCUMENT)),
+            )
+            doc.version_id = doc_mod.store_version(doc, source_class=source_class)
+            return doc
+
+        real_fetch = doc_mod.fetch_document
+        doc_mod.fetch_document = _fake_fetch  # type: ignore[assignment]
+        try:
+            with get_session_factory()() as session:
+                snapshot = production_mod._CandidateSnapshot.of(
+                    session.get(CandidateRow, candidate_id)
+                )
+            doc_outcome = await doc_mod.resolve_document(
+                candidate=snapshot,
+                sources=source_rows,
+                budget=doc_budget,
+                now=now,
+            )
+            selection = (
+                doc_mod.select_sections(
+                    doc_outcome.document.text,
+                    hint=verdict.primary_doc_hint,
+                    headline=first.title,
+                    max_tokens=doc_budget.max_tokens_for_composition,
+                )
+                if doc_outcome.usable and doc_outcome.document is not None
+                else None
+            )
+            # A second read of the same URL, to show the cache doing its job
+            # inside the TTL rather than asserting it in a comment.
+            cache_probe = doc_mod.cached_version(
+                str(first.url),
+                ttl_days=getattr(source_rows[0], "cache_ttl_days", None) or 14,
+                now=now,
+            )
+        finally:
+            doc_mod.fetch_document = real_fetch  # type: ignore[assignment]
+
+        outcome["doc_sections"] = selection.sections_used if selection else []
         ledger.add(
             Stage(
                 name="doc fetch + match",
-                status=NOT_IMPLEMENTED,
-                owner="S5",
                 inputs=(
                     f"candidate #{candidate_id}: "
                     f"primary_doc_url={first.url}, "
                     f"doc_hint={verdict.primary_doc_hint!r}, "
-                    f"doc_language_expected="
-                    f"{verdict.doc_language_expected!r}"
+                    f"registered domains={len(doc_mod.registered_domains(source_rows))}"
                 ),
-                outputs="nothing — no fetcher exists",
+                outputs=(
+                    f"doc_match={doc_outcome.match.column_value if doc_outcome.match else None} "
+                    f"via {doc_outcome.how}; "
+                    f"sections {len(selection.sections_used) if selection else 0}/"
+                    f"{selection.sections_total if selection else 0} "
+                    f"({', '.join((selection.sections_used if selection else [])[:3])}); "
+                    f"cache hit on re-read: {cache_probe is not None}"
+                ),
+                db_writes=diff_counts(before, table_counts()),
                 note=(
-                    "NTS_101 §2-7: two paths to the document, Firecrawl + PDF "
-                    "extraction, doc_match, section extraction into "
-                    "doc_sections_used, the cache with as_of, doc_missing with "
-                    "retries. The columns are in place (025 added "
-                    "doc_sections_used); the only writer today is the manual "
-                    "link from the Portfolio screen (doc_match='manual')"
+                    "NTS_101 §2-7. The registry gate refuses any domain not in "
+                    "`sources`; the version cache is keyed by URL and never "
+                    "overwritten, so `as_of` keeps meaning the same thing; the "
+                    "section labels are what tell the editor which parts of a "
+                    "200-page act the writer actually read"
                 ),
             )
         )
@@ -1086,6 +1200,21 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
             relevance_score=8.0,
             candidate_id=candidate_id,
         )
+        # S5 — the document goes in FIRST and web_search only fills the gaps
+        # (NTS_101 §2-7). Passing None here would let the ordering regress
+        # without any stage in this report changing.
+        from pipeline.generator.research import PrimaryDocument
+
+        primary_document = (
+            PrimaryDocument(
+                url=doc_outcome.document.url,
+                text=selection.text if selection else doc_outcome.document.text,
+                as_of=doc_outcome.document.as_of.date().isoformat(),
+                sections_used=tuple(selection.sections_used if selection else ()),
+            )
+            if doc_outcome.usable and doc_outcome.document is not None
+            else None
+        )
         fact_pack = await build_fact_pack(
             topic,
             budget=ResearchBudget(
@@ -1096,6 +1225,7 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
                 ),
             ),
             client=FakeOpenAI(),
+            document=primary_document,
         )
         from pipeline.run import _fact_pack_as_dict
 
@@ -1105,13 +1235,23 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
             topic_id=topic.id,
             pack=_fact_pack_as_dict(fact_pack),
             sources=tuple(fact_pack.citations) if fact_pack else (),
+            primary_doc_url=primary_document.url if primary_document else None,
+            doc_sections_used=(
+                list(primary_document.sections_used) if primary_document else None
+            ),
+            doc_text=primary_document.text if primary_document else None,
             model=fact_pack.model if fact_pack else None,
         )
         outcome["fact_pack_id"] = fact_pack_id
         ledger.add(
             Stage(
                 name="research",
-                inputs="topic title + summary + url; web_search tool",
+                inputs=(
+                    "primary document ("
+                    f"{len(primary_document.text) if primary_document else 0} chars, "
+                    f"as_of {primary_document.as_of if primary_document else '—'}"
+                    ") FIRST, then web_search for context"
+                ),
                 outputs=(
                     f"fact pack: {fact_pack.fact_count} facts, "
                     f"{len(fact_pack.citations)} citations, "
@@ -1121,11 +1261,12 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
                 ),
                 db_writes=diff_counts(before, table_counts()),
                 note=(
-                    "NTS_096 part A now persists the pack on every call, "
-                    "candidate id included — before this the pack was "
-                    "discarded and reconstructing provenance cost a new paid "
-                    "research call. Parts B (traceability block on the card) "
-                    "and C (attribution check) are still open"
+                    "S5 changed the order: the document is the authority and "
+                    "web_search only adds what it does not contain. The pack "
+                    "is persisted on every call with the document URL and the "
+                    "sections it was built from (NTS_096 part A). Parts B "
+                    "(traceability block on the card) and C (attribution "
+                    "check) are still open"
                 ),
             )
         )

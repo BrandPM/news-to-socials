@@ -1005,10 +1005,13 @@ def test_022_seeds_the_primary_feeds_with_their_registry_classification(
         "professional_alert",
         "professional_commentary",
     )
-    # Everything with a fetcher is active; the four without one are not, so the
-    # Sources screen does not fill with daily failures for unimplemented code.
+    # Everything with a fetcher is active; the rest are not, so the Sources
+    # screen does not fill with daily failures for code that does not exist.
+    # ``html_list`` and ``edgar_fts`` joined that list in S5 — migration 027
+    # activates the two rows 022 parked. The EUR-Lex saved searches stay off
+    # because their URL is a placeholder only Andriy can fill in.
     for name, row in by_name.items():
-        has_fetcher = row[5] in ("rss", "atom")
+        has_fetcher = row[5] in ("rss", "atom", "html_list", "edgar_fts")
         is_placeholder_url = "REPLACE_ME" in name or name.startswith("EUR-Lex")
         assert bool(row[6]) == (has_fetcher and not is_placeholder_url), name
 

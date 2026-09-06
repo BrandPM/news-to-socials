@@ -497,6 +497,27 @@ class PipelineConfig(Base):
         Text, nullable=False, default="gpt-4o-mini", server_default="gpt-4o-mini"
     )
 
+    # --- Primary document fetch budgets (NTS_101 §4) — migration 027.
+    # In the config rather than in code because they are the knobs an operator
+    # turns when a regulator's site is slow or a directive is enormous, and
+    # because ``doc_max_tokens_for_composition`` is the one number that decides
+    # how much of a 200-page document reaches the writer.
+    doc_timeout_s: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60, server_default="60"
+    )
+    doc_max_mb: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=25, server_default="25"
+    )
+    doc_max_tokens_for_composition: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=12000, server_default="12000"
+    )
+    doc_retries: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, server_default="2"
+    )
+    doc_match_model: Mapped[str] = mapped_column(
+        Text, nullable=False, default="gpt-4o-mini", server_default="gpt-4o-mini"
+    )
+
     # JSON array stored as TEXT — admin code is the only writer, so a
     # dedicated JSON column type would only add migration friction.
     banned_phrases: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -1116,6 +1137,15 @@ class Candidate(Base):
     # Required from ``drafted`` onward — the link to the Sanity draft.
     sanity_draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
     publication_slot: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # NTS_101 §7 — the document search may legitimately miss on the first try:
+    # a regulator publishes the act a day or two after announcing it. Two
+    # retries, 48h apart, then the candidate expires with ``no_document``.
+    doc_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    doc_last_search_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     # Which daily production batch took this candidate (NTS_100 §3.3) — the
     # (brand, date) key from ``production_batches``. Provenance, not a lock:
     # the "one batch per day" guarantee is the UNIQUE constraint on that table.
@@ -1352,4 +1382,52 @@ class ProductionBatch(Base):
         UniqueConstraint(
             "brand_id_fk", "batch_date", name="uq_production_batch_day"
         ),
+    )
+
+
+class DocumentVersion(Base):
+    """One fetched version of one primary document (NTS_101 §5).
+
+    Keyed by URL, versioned by ``content_hash``, and **never overwritten**. An
+    article cites the version it was written from, and ``as_of`` (NTS_108 §2-3)
+    is the timestamp of that version — a cache that updated a row in place
+    would silently re-date every article that ever quoted it.
+
+    ``extracted_text`` and not the source bytes, on purpose (NTS_096 §Риски):
+    nothing downstream reads a PDF, and storing them would grow the database by
+    the size of every directive the pipeline ever opened.
+
+    ``tool_version`` records which extractor produced the text. Two extractors
+    disagree about tables and hyphenation, so provenance that does not name the
+    tool is provenance that stops being reproducible at the next upgrade.
+    """
+
+    __tablename__ = "document_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    extracted_text: Mapped[str] = mapped_column(Text, nullable=False)
+    doc_language: Mapped[str | None] = mapped_column(String, nullable=True)
+    byte_size: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    content_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    tool_version: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    source_class: Mapped[str | None] = mapped_column(String, nullable=True)
+    section_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("url", "content_hash", name="uq_document_versions_url_hash"),
+        Index("ix_document_versions_url", "url"),
+        Index("ix_document_versions_fetched", "fetched_at"),
     )

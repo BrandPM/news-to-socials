@@ -62,6 +62,10 @@ class SourceRecord:
     license_class: str = "news_paywalled"
     doc_language: str | None = None
     fetch_method: str | None = None
+    # NTS_101 §1/§5 — how long a document off this source may be served from
+    # the cache. ``None`` means "always refetch": an unclassified source is one
+    # nobody has decided about, and the safe reading is that its content moves.
+    cache_ttl_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,12 @@ class ConfigRecord:
     # above on the fallback path: a runtime that cannot read admin.db must not
     # decide on its own to start producing.
     production_enabled: bool = False
+    # --- Primary document fetch budgets (NTS_101 §4) — migration 027.
+    doc_timeout_s: int = 60
+    doc_max_mb: int = 25
+    doc_max_tokens_for_composition: int = 12000
+    doc_retries: int = 2
+    doc_match_model: str = "gpt-4o-mini"
     # NTS_100 §2 — the rank formula's seven weights, parsed here like the other
     # JSON-as-TEXT keys so the selector never sees a string.
     rank_weights: Mapping[str, float] = MappingProxyType(
@@ -342,6 +352,18 @@ def _v3_keys(row: Any) -> dict[str, Any]:
         ),
         "production_enabled": bool(
             getattr(row, "production_enabled", d.production_enabled)
+        ),
+        "doc_timeout_s": _int_or(
+            getattr(row, "doc_timeout_s", None), d.doc_timeout_s
+        ),
+        "doc_max_mb": _int_or(getattr(row, "doc_max_mb", None), d.doc_max_mb),
+        "doc_max_tokens_for_composition": _int_or(
+            getattr(row, "doc_max_tokens_for_composition", None),
+            d.doc_max_tokens_for_composition,
+        ),
+        "doc_retries": _int_or(getattr(row, "doc_retries", None), d.doc_retries),
+        "doc_match_model": _str_or(
+            getattr(row, "doc_match_model", None), d.doc_match_model
         ),
         # A weight the operator zeroed is a weight the operator zeroed, so the
         # per-key fallback is only for keys the JSON does not mention at all.
@@ -550,6 +572,7 @@ class AdminConfigClient:
                 ),
                 doc_language=getattr(r, "doc_language", None),
                 fetch_method=getattr(r, "fetch_method", None),
+                cache_ttl_days=getattr(r, "cache_ttl_days", None),
             )
             for r in rows
         ]

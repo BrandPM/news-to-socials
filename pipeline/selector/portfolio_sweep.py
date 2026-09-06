@@ -208,6 +208,79 @@ def prune_old_candidates(
     return counts
 
 
+def park_document_missing(
+    *,
+    candidate_id: int,
+    reason: str,
+    now: datetime | None = None,
+) -> bool:
+    """The document was not found: ``doc_missing``, and **no attempt counted**.
+
+    NTS_101 §7. A regulator publishing the act two days after announcing it is
+    the ordinary case, and charging that to ``max_attempts`` would retire
+    candidates for somebody else's publishing schedule. ``doc_attempts`` — a
+    separate counter with its own ceiling — is incremented by the document
+    stage itself, whether it found something or not.
+    """
+    from pipeline.admin.models import Candidate
+
+    now = now or datetime.now(tz=UTC)
+    with _session_factory()() as session:
+        row = session.get(Candidate, candidate_id)
+        if row is None:
+            return False
+        row.status = "doc_missing"
+        row.last_error = reason[:2000]
+        session.commit()
+    log.info(
+        "portfolio_sweep.doc_missing",
+        candidate_id=candidate_id,
+        reason=reason[:200],
+    )
+    return True
+
+
+def expire_exhausted_doc_searches(
+    *, brand_id_fk: int, doc_retries: int, now: datetime | None = None
+) -> int:
+    """``doc_missing`` with no retries left → ``expired`` (NTS_101 §7).
+
+    The spec is blunt about it: out of retries means ``expired`` with
+    ``reason_code=no_document``, and no article is written from a retelling.
+    The candidate is not deleted and its reason is legible on the board, so a
+    class of source that never yields its document shows up as a pattern rather
+    than as an empty portfolio.
+    """
+    from sqlalchemy import update
+
+    from pipeline.admin.models import Candidate
+
+    now = now or datetime.now(tz=UTC)
+    with _session_factory()() as session:
+        result = session.execute(
+            update(Candidate)
+            .where(
+                Candidate.brand_id_fk == brand_id_fk,
+                Candidate.status == "doc_missing",
+                Candidate.doc_attempts >= max(1, int(doc_retries)),
+            )
+            .values(
+                status="expired",
+                reason_code="no_document",
+                reason="no primary document after the retry budget (NTS_101 §7)",
+            )
+        )
+        session.commit()
+        count = int(result.rowcount or 0)  # type: ignore[attr-defined]
+    if count:
+        log.info(
+            "portfolio_sweep.doc_search_exhausted",
+            brand_id=brand_id_fk,
+            count=count,
+        )
+    return count
+
+
 def release_to_pending(
     *,
     candidate_id: int,
@@ -281,6 +354,11 @@ def run_sweep(
         max_attempts=int(getattr(config, "max_attempts", 2)),
         now=now,
     )
+    no_document = expire_exhausted_doc_searches(
+        brand_id_fk=brand_row.id,
+        doc_retries=int(getattr(config, "doc_retries", 2)),
+        now=now,
+    )
     pruned = prune_old_candidates(
         brand_id_fk=brand_row.id,
         retention_days_rejected=int(getattr(config, "retention_days_rejected", 30)),
@@ -288,6 +366,7 @@ def run_sweep(
     )
     stats = {
         "expired": expired,
+        "no_document": no_document,
         "released": swept["released"],
         "failed": swept["failed"],
         "pruned_rejected": pruned["rejected"],

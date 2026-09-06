@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -120,6 +121,7 @@ def _candidate(
     expires_at: datetime | None = None,
     selected_at: datetime | None = None,
     attempts: int = 0,
+    doc_attempts: int = 0,
     return_scope: str | None = None,
 ) -> int:
     with admin_db.get_session_factory()() as session:
@@ -143,6 +145,7 @@ def _candidate(
             status=status,
             manual_action=manual_action,
             attempts=attempts,
+            doc_attempts=doc_attempts,
             return_scope=return_scope,
             created_at=(created_at or NOW).replace(tzinfo=None),
             expires_at=(expires_at or NOW + timedelta(days=14)).replace(tzinfo=None),
@@ -178,11 +181,14 @@ class _Writer:
         self.drafted: list[str] = []
         self.translated: list[str] = []
         self.research_calls = 0
+        self.documents_seen: list[Any] = []
 
-    async def fact_pack(self, topic, *, research_enabled=True, budget=None):
-        from pipeline.generator.research import Fact, FactPack as Pack
+    async def fact_pack(self, topic, *, research_enabled=True, budget=None, document=None):
+        from pipeline.generator.research import Fact
+        from pipeline.generator.research import FactPack as Pack
 
         self.research_calls += 1
+        self.documents_seen.append(document)
         return Pack(
             source_facts=[
                 Fact(text="The threshold rises to EUR 5m", url="https://reg.test/doc")
@@ -213,8 +219,8 @@ class _Writer:
             brand_id=brand.slug,
             language=language,
             title=f"{language.value.upper()} {topic.raw.title}",
-            body="## Заголовок\n\nПеревод.",
-            key_takeaway="Вывод.",
+            body="## Heading\n\nTranslated body.",
+            key_takeaway="Takeaway.",
         )
 
 
@@ -230,13 +236,56 @@ class _Publisher:
         return "image-test"
 
 
+class _Documents:
+    """Stands in for the S5 document stage. Records what it was asked for."""
+
+    def __init__(self, *, usable: bool = True) -> None:
+        self.usable = usable
+        self.calls: list[int] = []
+
+    async def resolve(self, *, candidate, sources, budget, now=None, **kw):
+        from pipeline.sources.document_fetcher import (
+            DocMatch,
+            DocumentOutcome,
+            ExtractedDocument,
+        )
+
+        self.calls.append(int(candidate.id))
+        if not self.usable:
+            return DocumentOutcome(
+                status="doc_missing", how="registry", reason="nothing on file"
+            )
+        return DocumentOutcome(
+            status="ok",
+            document=ExtractedDocument(
+                url="https://reg.test/doc",
+                text="ARTICLE 1\nThe threshold rises to EUR 5m.\n\n"
+                "ENTRY INTO FORCE\nApplies from 1 January 2027.",
+                content_hash="abc",
+                content_type="text/html",
+                byte_size=100,
+                fetched_at=NOW,
+                version_id=7,
+            ),
+            match=DocMatch("match", "the feed item is the document", "exact"),
+            how="item_url",
+        )
+
+
 @pytest.fixture
 def wired(monkeypatch):
-    """Patch the generation seams and the Sanity publisher."""
+    """Patch the generation seams, the document stage and the Sanity publisher."""
     writer = _Writer()
     publisher = _Publisher()
+    documents = _Documents()
     import pipeline.production as production
     import pipeline.run as run_mod
+    import pipeline.sources.document_fetcher as doc_mod
+
+    # S5: production fetches the primary document before research. Stubbed at
+    # the module boundary, because what these tests are about is the rhythm —
+    # the fetcher has its own suite.
+    monkeypatch.setattr(doc_mod, "resolve_document", documents.resolve)
 
     monkeypatch.setattr(run_mod, "build_fact_pack_for_topic", writer.fact_pack)
     monkeypatch.setattr(run_mod, "generate_draft_for_language", writer.draft)
@@ -256,7 +305,7 @@ def wired(monkeypatch):
         sanity_mod, "SanityPublisher", lambda client=None: publisher
     )
     monkeypatch.setattr(sanity_mod, "SanityClient", lambda **kw: object())
-    return writer, publisher
+    return writer, publisher, documents
 
 
 # --------------------------------------------------------------------------
@@ -364,8 +413,9 @@ def test_the_second_topic_in_a_category_is_penalised():
 
 
 def test_a_strong_topic_beats_the_diversity_penalty():
-    """"Одна сильная тема с rank выше штрафа берётся, слабая ради раскладки —
-    нет." A filter could not express this; a penalty can."""
+    """NTS_100 §2: a strong topic whose rank clears the penalty is taken; a
+    weak one taken only to make the week look varied is not. A filter could not
+    express that difference; a penalty can."""
     strong_same_category = _facts(2, confidence=1.0, depth_prior="deep")
     weak_other_category = _facts(
         3, confidence=0.2, depth_prior="note", service_category="wealth"
@@ -427,19 +477,40 @@ def test_a_held_candidate_never_reaches_the_formula(db):
     assert ids == [open_one]
 
 
-def test_a_news_lead_without_a_document_is_not_eligible(db):
-    """The standing rule of NTS_123: no article from a retelling. Before S5
-    nothing writes ``doc_match``, so this is what keeps news leads waiting."""
+def test_a_news_lead_out_of_document_retries_is_not_eligible(db):
+    """The standing rule of NTS_123: no article from a retelling.
+
+    S5 makes a news lead *without* a document eligible — for the document
+    search, which is the stage that refuses to go on when it finds nothing
+    (NTS_101 §2, §7). What stops being eligible is a lead that has used its
+    retry budget: searching for it on every run forever would be spend with a
+    known answer.
+    """
     from pipeline.production import eligible_candidates
 
-    _candidate(db, input_kind="news", doc_match=None)
-    _candidate(db, input_kind="news", primary_doc_url=None)
+    exhausted = _candidate(db, input_kind="news", doc_match=None, doc_attempts=2)
+    searchable = _candidate(db, input_kind="news", primary_doc_url=None)
     with_document = _candidate(db, input_kind="news", doc_match="exact")
     always_eligible = _candidate(db, input_kind="document")
     ids = sorted(
-        c.candidate_id for c in eligible_candidates(brand_id_fk=db, now=NOW)
+        c.candidate_id
+        for c in eligible_candidates(brand_id_fk=db, now=NOW, doc_retries=2)
     )
-    assert ids == sorted([with_document, always_eligible])
+    assert ids == sorted([searchable, with_document, always_eligible])
+    assert exhausted not in ids
+
+
+def test_a_document_kind_candidate_never_waits_on_the_search(db):
+    """NTS_101 §2 — the feed item IS the document, so there is nothing to find
+    and nothing to check; a retry budget must not gate it."""
+    from pipeline.production import eligible_candidates
+
+    cid = _candidate(db, input_kind="document", doc_attempts=9)
+    ids = [
+        c.candidate_id
+        for c in eligible_candidates(brand_id_fk=db, now=NOW, doc_retries=2)
+    ]
+    assert ids == [cid]
 
 
 def test_an_expired_candidate_is_not_eligible(db):
@@ -594,10 +665,10 @@ async def test_a_failure_on_translation_returns_the_candidate_and_keeps_the_pack
     db, monkeypatch, wired
 ):
     """DoD 4 — the retry must not buy the same research twice."""
-    from pipeline.production import run_production
     import pipeline.run as run_mod
+    from pipeline.production import run_production
 
-    writer, _publisher = wired
+    writer, _publisher, _documents = wired
     cid = _candidate(db)
     monkeypatch.setattr(run_mod, "translate_draft_for_language", _boom)
 
@@ -627,9 +698,9 @@ async def _boom(*args, **kwargs):
 
 async def test_the_second_failure_is_terminal_and_alertable(db, monkeypatch, wired):
     """DoD 5 — ``attempts >= max_attempts`` → ``failed`` + alert."""
+    import pipeline.run as run_mod
     from pipeline.monitoring.alerts import _gather_production_events
     from pipeline.production import run_production
-    import pipeline.run as run_mod
 
     cid = _candidate(db)
     monkeypatch.setattr(run_mod, "generate_draft_for_language", _boom)
@@ -665,8 +736,12 @@ async def test_a_failed_candidate_is_not_picked_up_again(db, monkeypatch, wired)
 
 
 async def test_a_translation_return_reruns_only_that_language(db, wired):
-    from pipeline.production import produce_candidate, run_production  # noqa: F401
-    from pipeline.production import _languages_from_scope, _stages_to_run
+    from pipeline.production import (  # noqa: F401
+        _languages_from_scope,
+        _stages_to_run,
+        produce_candidate,
+        run_production,
+    )
 
     stages = _stages_to_run("translation:uk")
     assert stages == {
@@ -686,7 +761,7 @@ async def test_a_returned_candidate_regenerates_only_the_returned_language(
 ):
     from pipeline.production import produce_candidate
 
-    writer, publisher = wired
+    writer, publisher, _documents = wired
     cid = _candidate(db, status="returned", return_scope="translation:uk")
     with admin_db.get_session_factory()() as session:
         # A pack from the first pass, so the regeneration has one to reuse.
@@ -927,9 +1002,13 @@ def test_the_sweep_writes_a_ttl_run_row(db):
 async def test_a_production_run_drafts_four_siblings_in_one_transaction(db, wired):
     from pipeline.production import run_production
 
-    writer, publisher = wired
+    writer, publisher, documents = wired
     cid = _candidate(db)
     stats = await run_production(brand_slug="icon", tag="e2e-test")
+
+    # S5: the document is fetched before research, and research sees it.
+    assert documents.calls == [cid]
+    assert writer.documents_seen and writer.documents_seen[0] is not None
 
     assert stats.drafted == 1
     # One transaction, every language in it (NTS_100 §4).
@@ -951,9 +1030,9 @@ async def test_a_production_run_drafts_four_siblings_in_one_transaction(db, wire
 
 async def test_every_paid_row_is_charged_to_the_candidate(db, wired, monkeypatch):
     """The production path knows the candidate before it spends (NTS_121 §6)."""
+    import pipeline.run as run_mod
     from pipeline.admin.cost_recorder import record_cost
     from pipeline.production import run_production
-    import pipeline.run as run_mod
 
     cid = _candidate(db)
 

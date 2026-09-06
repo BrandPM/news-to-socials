@@ -806,9 +806,15 @@ async def test_an_empty_feed_is_recorded_as_a_failed_fetch(brand, monkeypatch) -
 async def test_a_source_with_no_fetcher_fails_that_source_only(
     brand, monkeypatch
 ) -> None:
-    """S5 lands ``html_list``/``edgar_fts``. Until then the run records a health
-    failure and keeps going: one unimplemented fetcher must not cost the day's
-    whole funnel."""
+    """A source whose fetcher blows up fails that source only.
+
+    Before S5 this was written against ``html_list``, which had no fetcher at
+    all; S5 gave it one, and ``ck_sources_fetch_method`` bounds the column to
+    four values, so "no fetcher" is no longer a state the database can hold.
+    The property that mattered is unchanged and still pinned: one unreadable
+    source must not cost the day's whole funnel, and the reason must land in
+    ``source_health_records`` rather than resembling an empty feed.
+    """
     with admin_db.get_session_factory()() as session:
         from sqlalchemy import select
 
@@ -818,7 +824,11 @@ async def test_a_source_with_no_fetcher_fails_that_source_only(
         source.fetch_method = "html_list"
         session.commit()
 
+    async def _listing_is_down(url, *, timeout=30.0):
+        raise ConnectionError("listing page unreachable")
+
     harness = _Harness()
+    monkeypatch.setattr("pipeline.sources.primary_feeds._get", _listing_is_down)
     monkeypatch.setattr(
         "pipeline.selector.editorial_guard._call_guard_model", harness.guard
     )
@@ -830,7 +840,7 @@ async def test_a_source_with_no_fetcher_fails_that_source_only(
     with admin_db.get_session_factory()() as session:
         health = session.scalars(select(SourceHealthRecord)).all()
         run = session.scalars(select(Run).order_by(Run.id.desc())).first()
-    assert any("html_list" in (r.error_msg or "") for r in health)
+    assert any("unreachable" in (r.error_msg or "") for r in health)
     # A run with a dead source is not a clean success.
     assert run.status == "failed"
 
