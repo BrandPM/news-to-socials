@@ -976,7 +976,8 @@ async def produce_candidate(
         # pairs.
         decision = compute_depth_final(
             fact_pack,
-            article_min_facts=int(getattr(config, "depth_article_min_facts", 4)),
+            brief_min_facts=int(getattr(config, "depth_brief_min_facts", 4)),
+            article_min_facts=int(getattr(config, "depth_article_min_facts", 10)),
             deep_min_facts=int(getattr(config, "depth_deep_min_facts", 10)),
         )
         targets = dict(getattr(config, "depth_length_targets", {}) or {})

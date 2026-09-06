@@ -134,7 +134,11 @@ def test_019_reseeds_the_active_rows_with_the_current_constants(alembic_db):
     # replaced by the live constant — which the equality above already states.
     assert "{depth_guidance}" in draft_content
     assert "250-400" not in draft_content
-    assert "NTS_092" in draft_version
+    # The label is whatever the LAST re-seed in the chain set, not 019's: 035
+    # relabels the row to v3.0 after 019 has replaced its content (NTS_129 P2
+    # Ф2). What 019 owns is the content equality asserted above; asserting its
+    # own version string here would just pin the newest migration's name.
+    assert draft_version.startswith("v3.0")
     assert "{fact_pack}" in draft_notes  # the manual for whoever edits it next
 
     polish_content, _v, _n = _active(db_path, "writer_polish")

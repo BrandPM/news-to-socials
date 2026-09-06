@@ -265,6 +265,7 @@ class PipelineConfigOut(BaseModel):
     # Guard axes
     jurisdiction_tiers: dict[str, list[str]]
     # Depth
+    depth_brief_min_facts: int
     depth_article_min_facts: int
     depth_deep_min_facts: int
     # Spend kill-switch
@@ -388,6 +389,7 @@ class PipelineConfigUpdate(BaseModel):
     dedup_threshold_published: float | None = Field(default=None, ge=0.5, le=0.99)
     dedup_window_published_days: int | None = Field(default=None, ge=1, le=365)
     jurisdiction_tiers: dict[str, list[str]] | None = None
+    depth_brief_min_facts: int | None = Field(default=None, ge=1, le=100)
     depth_article_min_facts: int | None = Field(default=None, ge=1, le=100)
     depth_deep_min_facts: int | None = Field(default=None, ge=1, le=200)
     monthly_spend_cap_usd: float | None = Field(default=None, ge=0.0, le=100000.0)
@@ -1388,6 +1390,9 @@ CandidateEventStage = Literal[
     "other",
 ]
 CandidateDepth = Literal["note", "article", "deep"]
+# ``depth_final`` only -- see ``CANDIDATE_DEPTHS_FINAL`` in models.py for
+# why the guard's prior does not gain the fourth value.
+CandidateDepthFinal = Literal["note", "brief", "article", "deep"]
 CandidateStatus = Literal[
     "pending",
     "selected",
@@ -1450,7 +1455,7 @@ class CandidateOut(BaseModel):
     jurisdictions: list[str]
     event_stage: CandidateEventStage | None
     depth_prior: CandidateDepth | None
-    depth_final: CandidateDepth | None
+    depth_final: CandidateDepthFinal | None
     source_id: int | None = Field(validation_alias="source_id_fk")
     source_name: str | None
     source_class: str | None

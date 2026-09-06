@@ -65,7 +65,9 @@ _EFFECTIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
-DEPTHS = ("note", "article", "deep")
+# ``brief`` sits between ``note`` and ``article`` (NTS_129 P2 Ф2): the band
+# for material that is real but thin. Ordered shallowest first.
+DEPTHS = ("note", "brief", "article", "deep")
 
 # NTS_102 v2 §1b — a chart needs a real series, not two points and optimism.
 CHART_MIN_POINTS = 4
@@ -135,16 +137,26 @@ def comparable_groups(facts: Sequence[Any]) -> dict[str, list[Any]]:
 def compute_depth_final(
     pack: Any,
     *,
-    article_min_facts: int = 4,
+    brief_min_facts: int = 4,
+    article_min_facts: int = 10,
     deep_min_facts: int = 10,
 ) -> DepthDecision:
-    """The depth the *material* supports (NTS_102 v2 §1).
+    """The depth the *material* supports (NTS_102 v2 §1, NTS_129 P2 Ф2).
 
     ``deep`` additionally requires two comparable pairs, because ``deep`` is
     the only band that asks for a data block and a block without comparable
     numbers cannot be built. Demoting here rather than discovering it later is
     what stops a "deep" article being padded to 1 200 words with nothing to
     put in the table it promised.
+
+    ``brief`` exists for the same reason one band down. The article floor was
+    four facts, and four facts do not support 600-900 words: the observed
+    result was a 600-900 target answered with ~300 words that read as if the
+    piece had been cut off. The model was choosing between padding and
+    stopping and choosing correctly — the target was simply wrong for the
+    material. So the article floor is now ``deep_min_facts``-scale (ten), and
+    300-400 words is a *shape* the writer aims at rather than a length it
+    falls short of.
     """
     facts = list(getattr(pack, "source_facts", []) or []) + list(
         getattr(pack, "context", []) or []
@@ -172,6 +184,15 @@ def compute_depth_final(
         )
     if n_facts >= article_min_facts:
         return DepthDecision("article", n_facts, n_pairs, has_dates, "enough for an article")
+    if n_facts >= brief_min_facts:
+        return DepthDecision(
+            "brief",
+            n_facts,
+            n_pairs,
+            has_dates,
+            f"{n_facts} fact(s) — real material, but not {article_min_facts} "
+            "for an article",
+        )
     return DepthDecision(
         "note", n_facts, n_pairs, has_dates, f"only {n_facts} countable fact(s)"
     )
@@ -192,6 +213,9 @@ def depth_guidance(
     high = band[1] if len(band) > 1 else None
     structure = {
         "note": "no subheadings, or one",
+        # A brief still carries the moves; it carries them in one or two
+        # sections instead of four, and drops the ones the pack cannot fill.
+        "brief": "1-2 H2 sections",
         "article": "3-4 H2 sections",
         "deep": "5-7 H2 sections; a data block is appropriate if the pack has "
         "comparable numbers",
@@ -224,22 +248,45 @@ def depth_guidance(
 
 
 _PLAN_INSTRUCTIONS = """\
-You are planning an expert commentary. You are NOT writing it.
+You are planning an expert commentary for readers who hold structures,
+residencies, accounts and deals in the jurisdictions this story touches. You
+are NOT writing it.
 
 Return JSON only:
 {{"sections": [{{"heading": "<substantive H2, describing actual content>",
+                "move": "<happened|changes|affected|todo|unknown>",
                 "purpose": "<what this section establishes, one line>",
                 "facts": ["<fact text you will use here, copied from the pack>"],
                 "document_sections": ["<label of the document section it rests on>"],
                 "block": "<keyFigures|statTable|chart|none>"}}],
  "lede": "<the specific consequence the opening two sentences state>",
  "close": "<the concrete shift the final paragraph names, anchored to a fact>",
+ "unknowns": ["<a question this material leaves open, named specifically>"],
  "omitted": ["<material you are deliberately leaving out, and why>"]}}
+
+THE FIVE MOVES — plan the article as these, in this order:
+1. happened  — the act/decision/filing itself: issuer, instrument, date.
+2. changes   — the delta against the position before it: old rule vs new,
+               old threshold vs new.
+3. affected  — WHO, by the actual test: asset value, turnover, ownership
+               percentage, residency days, entity type, jurisdiction list.
+               "Large holders" is not a threshold; "above EUR 5 million" is.
+4. todo      — the concrete next step and the DATE that binds it: filing
+               date, entry into force, end of transition, consultation close.
+5. unknown   — what the material leaves open. Goes in ``unknowns``, not in a
+               section, unless the material is rich enough to earn its own.
 
 RULES
 * Plan only what the material supports. {shape}
 * Every section must be able to name at least one concrete fact from the pack
-  or the document. A section you cannot fill is a section you must not plan.
+  or the document. A section you cannot fill is a section you must not plan —
+  put the question it raises in ``unknowns`` instead.
+* Moves 3 and 4 are the ones the reader came for. If the pack holds a
+  threshold or a deadline, there MUST be a section carrying it. Leaving a
+  threshold unassigned is the most expensive mistake available here: the
+  writer only writes what this plan assigns.
+* Two moves may share one section, and a move with nothing behind it is
+  dropped — but say so in ``unknowns`` rather than silently omitting it.
 * ``block`` is "none" unless the pack holds at least two comparable numbers
   that belong in that section — a table of one number is not a table.
 * Headings describe content ("The repricing of mezzanine credit"), never
@@ -267,6 +314,11 @@ class Plan:
     sections: list[dict[str, Any]] = field(default_factory=list)
     lede: str = ""
     close: str = ""
+    # NTS_129 P2 F2 — move 5. Carried on the plan rather than left to the
+    # writer to invent, because a named gap has to come from the material: a
+    # model asked at drafting time to say what it does not know will produce
+    # something plausible-sounding instead of something true.
+    unknowns: list[str] = field(default_factory=list)
     omitted: list[str] = field(default_factory=list)
     raw: str = ""
 
@@ -284,7 +336,9 @@ class Plan:
         if self.lede:
             lines.append(f"LEDE: {self.lede}")
         for index, section in enumerate(self.sections, start=1):
-            lines.append(f"{index}. ## {section.get('heading', '')}")
+            move = section.get("move")
+            suffix = f"   [move: {move}]" if move else ""
+            lines.append(f"{index}. ## {section.get('heading', '')}{suffix}")
             if section.get("purpose"):
                 lines.append(f"   purpose: {section['purpose']}")
             for fact in section.get("facts", [])[:6]:
@@ -297,6 +351,11 @@ class Plan:
                 lines.append(f"   data block: {section['block']}")
         if self.close:
             lines.append(f"CLOSE: {self.close}")
+        if self.unknowns:
+            lines.append(
+                "WHAT WE DON'T KNOW (move 5 — write these as the closing "
+                "paragraphs): " + "; ".join(self.unknowns[:4])
+            )
         if self.omitted:
             lines.append("DELIBERATELY OMITTED: " + "; ".join(self.omitted[:4]))
         return "\n".join(lines)
@@ -306,6 +365,7 @@ class Plan:
             "sections": self.sections,
             "lede": self.lede,
             "close": self.close,
+            "unknowns": self.unknowns,
             "omitted": self.omitted,
         }
 
@@ -318,6 +378,7 @@ class Plan:
             sections=sections,
             lede=str(raw.get("lede") or ""),
             close=str(raw.get("close") or ""),
+            unknowns=[str(x) for x in list(raw.get("unknowns") or [])],
             omitted=[str(x) for x in list(raw.get("omitted") or [])],
         )
 

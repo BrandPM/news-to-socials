@@ -134,7 +134,8 @@ class ConfigRecord:
             ),
         }
     )
-    depth_article_min_facts: int = 4
+    depth_brief_min_facts: int = 4
+    depth_article_min_facts: int = 10
     depth_deep_min_facts: int = 10
     monthly_spend_cap_usd: float = 150.0
     max_cost_per_candidate_usd: float = 5.0
@@ -176,7 +177,12 @@ class ConfigRecord:
     # --- Composition (NTS_102 v2, NTS_095, NTS_108 §1) — migration 028.
     data_blocks_enabled: bool = False
     depth_length_targets: Mapping[str, tuple[int, int | None]] = MappingProxyType(
-        {"note": (300, 450), "article": (600, 900), "deep": (1200, None)}
+        {
+            "note": (300, 450),
+            "brief": (300, 400),
+            "article": (600, 900),
+            "deep": (1200, None),
+        }
     )
     max_quote_words: Mapping[str, int] = MappingProxyType(
         {"professional_commentary": 15, "corporate_pr": 25, "news_paywalled": 0}
@@ -337,6 +343,9 @@ def _v3_keys(row: Any) -> dict[str, Any]:
         ),
         "jurisdiction_tiers": MappingProxyType(
             {str(k): tuple(v) for k, v in dict(tiers).items()}
+        ),
+        "depth_brief_min_facts": _int_or(
+            getattr(row, "depth_brief_min_facts", None), d.depth_brief_min_facts
         ),
         "depth_article_min_facts": _int_or(
             getattr(row, "depth_article_min_facts", None), d.depth_article_min_facts

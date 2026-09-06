@@ -115,14 +115,29 @@ def _language_name(language: str | Language) -> str:
     return _LANGUAGE_NAMES.get(code, code)
 
 
+# NTS_129 P2 F2. The article is now built from FIVE MOVES -- what happened,
+# what it changes, who is affected (with thresholds), what to do (with
+# deadlines), what we don't know -- each of which has to rest on a fact from
+# the pack. The previous version asked for "an original expert commentary on
+# a news peg", which is a genre, not a structure, and gave the model nothing
+# to check completeness against.
+#
+# It also carried five separate instructions to write SHORTER against one
+# length target, which is the other half of why regulator material came out
+# at ~300 words against a 600-900 band: stopping was the only rule the model
+# was told twice. The LENGTH block below still forbids padding -- grounding
+# outranks length, and that must not change -- but it now says what running
+# short actually means: a move that is still unanswered.
 _DRAFT_PROMPT = """\
 OUTPUT LANGUAGE: {language_name}. Write the title, body, and key
 takeaway in {language_name} only. Do not switch to English unless
 quoting directly from the source (≤15 words per quote).
 
-You write an original expert commentary from the brand below on the news peg.
-This is NOT a rewrite. The news peg is just an excuse to share the brand's
-informed perspective.
+You are writing for people who will ACT on this: they hold structures,
+residencies, accounts and deals in the jurisdictions below, and they read this
+to find out whether anything they own just changed. Not a rewrite of the news,
+and not a general essay about the theme — an answer to "does this reach me,
+and by when".
 
 Brand voice profile (YAML):
 {voice_profile_yaml}
@@ -148,42 +163,95 @@ padding it; do not invent a section that is not here:
 {plan}
 
 Language: {language}
-Audience: people in the brand's target segment, NOT general public.
 {depth_guidance}
 
 GROUNDING (mandatory — outranks EVERY other rule below, including length):
 * Every number, percentage, currency amount, date, effective date, threshold,
   named person, named company, named regulator and named jurisdiction you
-  write MUST already appear in the RESEARCH FACT PACK or in the news peg
-  above. There is no third source. Your own knowledge is NOT a source.
+  write MUST already appear in the RESEARCH FACT PACK, the PRIMARY DOCUMENT
+  or the news peg above. There is no fourth source.
+  Your own knowledge is NOT a source.
 * Never invent one. Never extrapolate one ("if X rose 10%, then Y…"). Never
   "sensibly round" one to a tidier number, and never convert one into a unit
   or currency the source did not use. Copy the figure as it is given.
 * Never attribute a claim to an outlet, regulator, court or person that the
   fact pack does not attribute to them.
-* If the fact pack is thin — or says NO RESEARCH AVAILABLE — write a SHORTER
-  article, well under the target length. A short, fully grounded piece is
-  CORRECT output. A piece padded to hit its target is a failure, and an
-  invented figure is the worst outcome available to you: worse than
-  publishing nothing.
-* The length is a target, never an instruction to keep writing. Stop when the
-  grounded material runs out.
+* An invented figure is the worst outcome available to you — worse than
+  publishing nothing. A gap you NAME is not a failure; see WHAT WE DON'T KNOW.
+
+THE FIVE MOVES (mandatory — this is the article's structure):
+
+The piece is built from the material, in this order. Each move must rest on at
+least one concrete fact from the pack or the document — a move you cannot
+ground is a move you must NOT write in prose; it goes to move 5 instead.
+
+1. WHAT HAPPENED. The act, decision, ruling or filing itself: who issued it,
+   what instrument it is, and on what date. Name the document.
+2. WHAT IT CHANGES. The delta against the position before it — the old rule
+   and the new one, the old threshold and the new one. If the pack gives you
+   only the new state, say that this is the new state and do not guess at the
+   old.
+3. WHO IS AFFECTED — with the thresholds that decide it. This is the move the
+   reader came for. Give the actual test: the asset value, the turnover, the
+   ownership percentage, the residency days, the entity type, the jurisdiction
+   list. "Large holders" is not a threshold; "holdings above EUR 5 million" is.
+   If the instrument sets a de minimis or an exemption, it belongs here.
+4. WHAT TO DO — with the dates that bind it. The concrete next step and the
+   deadline attached to it: the filing date, the entry into force, the end of
+   the transition period, the consultation close. A step with no date is worth
+   less than half as much, so give the date when the material has one.
+5. WHAT WE DON'T KNOW — this is also the forward-looking close. Two or three
+   sentences, in prose, ending the piece: the questions this document leaves
+   open, the guidance not yet issued, the figure the source did not give.
+   Naming a gap is the most credible thing in the article — it is what
+   separates an expert reading from a summary, and it is where every move you
+   could not ground goes. It must be ANCHORED to this article: reference a
+   specific named entity, number or mechanism already in the body, and answer
+   "So what does this mean specifically?" for the reader's next decision ON
+   THIS topic. Do NOT write "time will tell" or "it remains to be seen"; name
+   the specific missing thing. No generic call-to-action, no "in conclusion"
+   wrap-up, no tidy restatement that would fit any article.
+
+HOW THE MOVES BECOME SECTIONS:
+* Write the H2 sections (`## Heading`) the PLAN names — the plan has already
+  assigned facts to each. The moves are the logic, not a set of five mandatory
+  headings: two moves may share a section, and on thin material a move may
+  reduce to a sentence. Never pad a section to reach a count; if the grounded
+  material only supports two sections, write two.
+* Move 5 always appears, as the closing paragraphs. It has no heading of its
+  own unless the plan gives it one.
+* Heading names must be substantive and describe the actual content
+  ("## The EUR 5m threshold and who clears it"), never the position
+  ("## What this means", "## Key takeaways").
+* Open with a 1-2 sentence lede that names the specific consequence, not a
+  general framing. No heading on the lede.
+
+LENGTH — read this together with GROUNDING:
+* The target above is what the material should support, not a quota. Do not
+  pad, do not repeat, do not restate the lede at the end.
+* But do not stop early either. Running out of things to say before the target
+  usually means a move above is still unanswered — go back to moves 2, 3 and 4
+  and check that the thresholds, the deltas and the dates in the pack are
+  actually IN the text. An unused concrete fact is the most common reason a
+  piece comes out short.
+* If the pack genuinely holds nothing more, close with move 5 and stop. A
+  short, fully grounded piece is CORRECT output, and a piece padded to hit its
+  target is a failure.
 
 SPECIFICITY (mandatory — second only to GROUNDING):
 * Every claim must be specific to THIS story — tied to a concrete fact,
-  number, named entity, or mechanism from the news peg above.
+  number, named entity, or mechanism from the material above.
 * BAN any sentence that could be pasted into an article on a completely
   different topic: vague intensifiers and generic risk/urgency statements.
   Examples of the BANNED generic shape: "rising uncertainty creates
   challenges", "could cause serious damage", "requires immediate decisions".
   Replace each with the specific who / what / how-much from this story.
-* One concrete number or named entity per paragraph — not vague
-  intensifiers. Lead with a specific consequence, not a general framing.
+* One concrete number or named entity per paragraph — not vague intensifiers.
 
 NO REPETITION & DENSITY (mandatory):
 * No sentence may restate a previous one. Every paragraph must add NEW
   specifics. Delete any sentence that carries no new information — but
-  tighten, do not gut: keep the lede + H2 structure and a comparable length.
+  tighten, do not gut: keep the lede + H2 structure and the five moves.
 
 AUDIENCE LINK (mandatory):
 * Connect the story to the brand's target segment using `topics_relevant`
@@ -194,30 +262,13 @@ AUDIENCE LINK (mandatory):
 USING THE FACT PACK (mandatory):
 * Spend the pack. A fact sitting unused in the pack is a paragraph of filler
   you wrote instead. Work the concrete ones — amounts, dates, thresholds,
-  mechanisms — into the body rather than gesturing at them.
+  mechanisms — into moves 2, 3 and 4 rather than gesturing at them.
 * Do NOT print the URLs, and do NOT add a sources/references section. The
   citations exist so an editor can trace every figure; the reader sees prose.
 * Attribute where it earns credibility ("the regulator's 26 August notice",
   "Reuters put the figure at…") — using the attribution the pack gives.
 * ``angle_hints`` are leads for YOUR analysis, not facts. Nothing in them may
   become a number, a date or a name.
-
-STRUCTURE REQUIREMENTS (mandatory — markdown headings, not bold):
-* Open with a 1-2 sentence lede paragraph that names the specific
-  consequence, NOT a general framing. No heading on the lede.
-* Then the H2 sections (`## Heading`) the PLAN names — one per distinct idea,
-  each carrying its own facts from the pack and the document. Never pad a
-  section to reach a count: if the grounded material only supports two
-  sections, write two and a shorter piece. Heading names must be substantive
-  and describe the actual content (e.g. "## The repricing of mezzanine
-  credit", NOT "## What this means" or "## Key takeaways").
-* End with a forward-looking close that is ANCHORED to the article: it must
-  reference a specific named entity, number, or mechanism already mentioned
-  in the body, and state the concrete shift it creates for the reader's next
-  decision ON THIS topic. The final paragraph must answer: "So what does
-  this mean specifically?" — referencing a concrete fact / number / entity /
-  consequence from THIS article. Do NOT end on a generic call-to-action or a
-  tidy restatement that would fit any article. No "in conclusion"-style wrap-up.
 * Source quotes ≤ 15 words. The piece is commentary, not a rewrite.
 
 Rules:

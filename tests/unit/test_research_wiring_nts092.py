@@ -278,18 +278,38 @@ def test_draft_prompt_has_an_unambiguous_grounding_block():
     assert "Never invent one." in _DRAFT_PROMPT
     assert "Never extrapolate one" in _DRAFT_PROMPT
     assert '"sensibly round"' in _DRAFT_PROMPT
-    # only two permitted sources, and memory is not one of them
-    assert "RESEARCH FACT PACK or in the news peg" in flat
-    assert "There is no third source." in _DRAFT_PROMPT
+    # The permitted sources, and memory is not one of them. NTS_129 P2 Ф2 made
+    # this THREE: the primary document was already authoritative in the prompt
+    # ("where it and anything else disagree, IT wins") while the grounding
+    # block still listed only the pack and the peg. A writer that read a
+    # threshold off the directive it was handed was violating the letter of a
+    # rule written before documents were fetched at all.
+    assert "RESEARCH FACT PACK, the PRIMARY DOCUMENT or the news peg" in flat
+    assert "There is no fourth source." in _DRAFT_PROMPT
     assert "Your own knowledge is NOT a source." in _DRAFT_PROMPT
 
 
 def test_thin_pack_means_a_shorter_article_not_a_padded_one():
-    """The one instruction that keeps 600-800 from becoming a filler licence."""
+    """The instruction that keeps the length band from becoming a filler licence.
+
+    NTS_129 P2 Ф2 rewrote the other side of this without weakening it. v2.0
+    carried FIVE separate write-shorter instructions against ONE length target,
+    and the measured result was ~300 words on regulator material against a
+    600-900 band: stopping was the only rule the model was told twice, so it
+    stopped. Two of those five are gone.
+
+    What must not move, and is asserted here: padding is still a failure, and
+    grounding still outranks length. What is new is the other half — running
+    short now has a stated cause (an unanswered move) instead of being the
+    default virtue.
+    """
     flat = _flat(_DRAFT_PROMPT)
-    assert "write a SHORTER article" in flat
-    assert "A piece padded to hit its target is a failure" in flat
-    assert "never an instruction to keep writing" in flat
+    assert "a piece padded to hit its target is a failure" in flat.lower()
+    assert "short, fully grounded piece is CORRECT output" in flat
+    assert "outranks EVERY other rule below, including length" in flat
+    # …and the completeness half, which is what Ф2 added.
+    assert "do not stop early either" in flat
+    assert "a move above is still unanswered" in flat
     # polish must not undo it by padding back up to range
     assert "STAYS short" in _POLISH_PROMPT
     assert "in order to reach a word count" in _flat(_POLISH_PROMPT)

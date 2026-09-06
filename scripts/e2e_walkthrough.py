@@ -1349,7 +1349,8 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
         before = table_counts()
         depth_decision = comp_mod.compute_depth_final(
             fact_pack,
-            article_min_facts=int(getattr(config, "depth_article_min_facts", 4)),
+            brief_min_facts=int(getattr(config, "depth_brief_min_facts", 4)),
+            article_min_facts=int(getattr(config, "depth_article_min_facts", 10)),
             deep_min_facts=int(getattr(config, "depth_deep_min_facts", 10)),
         )
         targets = dict(getattr(config, "depth_length_targets", {}) or {})
@@ -1383,7 +1384,8 @@ async def walkthrough(ledger: Ledger, *, now: datetime) -> dict[str, Any]:
                 inputs=(
                     f"fact pack ({fact_pack.fact_count if fact_pack else 0} facts) "
                     f"+ primary document; thresholds "
-                    f"{getattr(config, 'depth_article_min_facts', 4)}/"
+                    f"{getattr(config, 'depth_brief_min_facts', 4)}/"
+                    f"{getattr(config, 'depth_article_min_facts', 10)}/"
                     f"{getattr(config, 'depth_deep_min_facts', 10)}"
                 ),
                 outputs=(

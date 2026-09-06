@@ -88,7 +88,10 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
         {"tier1": ["CH", "SG"], "tier2": ["US"]},
     ),
     # --- depth (NTS_102 v2)
-    ("depth_article_min_facts", 4, 6),
+    # NTS_129 P2 Ф2 — the article floor moved from 4 to 10 and ``brief`` took
+    # the space underneath it. Four facts never supported 600-900 words.
+    ("depth_brief_min_facts", 4, 3),
+    ("depth_article_min_facts", 10, 6),
     ("depth_deep_min_facts", 10, 14),
     # --- spend kill-switch (NTS_106 §3)
     ("monthly_spend_cap_usd", 150.0, 220.0),
@@ -159,7 +162,12 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
     ("data_blocks_enabled", False, True),
     (
         "depth_length_targets",
-        {"note": (300, 450), "article": (600, 900), "deep": (1200, None)},
+        {
+            "note": (300, 450),
+            "brief": (300, 400),
+            "article": (600, 900),
+            "deep": (1200, None),
+        },
         {"note": [200, 300], "article": [700, 1000], "deep": [1500, None]},
     ),
     (
@@ -264,8 +272,8 @@ def test_every_v3_column_has_a_sentinel() -> None:
     )
     # 25 from 020, three mode flags (022 + 026), rank weights (026), the five
     # document budgets (027) the four composition
-    # keys (028) and the cover mode (030).
-    assert len(_SENTINELS) == 40
+    # keys (028), the cover mode (030) and the brief depth floor (034).
+    assert len(_SENTINELS) == 41
 
 
 # --- default reaches the runtime -----------------------------------------

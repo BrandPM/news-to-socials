@@ -260,6 +260,17 @@ _DENY_TITLE_PATTERNS_DEFAULT: tuple[str, ...] = (
 )
 _DENY_TITLE_PATTERNS = json.dumps(list(_DENY_TITLE_PATTERNS_DEFAULT))
 
+# Word bands per depth. ``brief`` (NTS_129 P2 F2) is the honest shape for a
+# thin-but-real fact pack -- see ``depth_brief_min_facts`` on the config.
+_DEPTH_LENGTH_TARGETS = json.dumps(
+    {
+        "note": [300, 450],
+        "brief": [300, 400],
+        "article": [600, 900],
+        "deep": [1200, None],
+    }
+)
+
 class PipelineConfig(Base):
     __tablename__ = "pipeline_config"
 
@@ -422,8 +433,17 @@ class PipelineConfig(Base):
     )
 
     # --- Depth thresholds (NTS_102 v2) — fact count decides depth_final.
-    depth_article_min_facts: Mapped[int] = mapped_column(
+    # NTS_129 P2 Ф2 raised the article floor from 4 to 10 and put ``brief``
+    # underneath it. Four facts never supported 600-900 words; asking for them
+    # anyway is what produced 300-word articles that read as if they had been
+    # cut off, because the model was choosing between padding and stopping and
+    # correctly chose stopping. A 300-400 word brief is the honest shape for
+    # that material, and it is a shape rather than a failure.
+    depth_brief_min_facts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=4, server_default="4"
+    )
+    depth_article_min_facts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10, server_default="10"
     )
     depth_deep_min_facts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=10, server_default="10"
@@ -527,8 +547,8 @@ class PipelineConfig(Base):
     depth_length_targets: Mapped[str] = mapped_column(
         Text,
         nullable=False,
-        default='{"note": [300, 450], "article": [600, 900], "deep": [1200, null]}',
-        server_default='{"note": [300, 450], "article": [600, 900], "deep": [1200, null]}',
+        default=_DEPTH_LENGTH_TARGETS,
+        server_default=_DEPTH_LENGTH_TARGETS,
     )
     # NTS_108 §1 — the quote ceiling per licence class, enforced by the
     # attribution check as ``quote_too_long``. A class not listed here has no
@@ -1064,7 +1084,13 @@ CANDIDATE_EVENT_STAGES = (
     "list_update",
     "other",
 )
+# The guard's vocabulary, and what ``depth_prior`` may hold.
 CANDIDATE_DEPTHS = ("note", "article", "deep")
+# ``depth_final`` may additionally hold ``brief`` (NTS_129 P2 F2). The two sets
+# differ on purpose: ``depth_prior`` is the guard's guess from a headline,
+# which cannot count facts, and ``brief`` is defined by a fact count. Widening
+# the guard's enum to match would invite a prior nothing can compute.
+CANDIDATE_DEPTHS_FINAL = ("note", "brief", "article", "deep")
 # NTS_098 §2. Terminal: published, expired, failed, superseded, rejected.
 CANDIDATE_STATUSES = (
     "pending",
@@ -1271,7 +1297,7 @@ class Candidate(Base):
             name="ck_candidates_depth_prior",
         ),
         CheckConstraint(
-            _check_in("depth_final", CANDIDATE_DEPTHS),
+            _check_in("depth_final", CANDIDATE_DEPTHS_FINAL),
             name="ck_candidates_depth_final",
         ),
         CheckConstraint(
