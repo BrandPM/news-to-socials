@@ -22,8 +22,10 @@ faithful to "воспроизводимый одной командой" and the
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -57,8 +59,16 @@ def test_the_chain_completes_through_the_slot(walkthrough_output: str):
     # The whole point of the NTS_121 link work: the candidate reaches
     # ``published``, and reaches it *through* a slot rather than around one.
     assert "status=published" in walkthrough_output
-    assert "slot=2026-08-31" in walkthrough_output
     assert "link_candidate_to_draft → True" in walkthrough_output
+    # The slot is whatever the next Monday or Thursday is when the walkthrough
+    # runs, so it is checked by shape: a real date, on a configured slot day,
+    # not in the past. Naming one date made this fail every week after the one
+    # it was written in.
+    match = re.search(r"slot=(\d{4}-\d{2}-\d{2})", walkthrough_output)
+    assert match, "the walkthrough never printed a slot"
+    slot = date.fromisoformat(match.group(1))
+    assert slot.weekday() in (0, 3), f"{slot} is neither Monday nor Thursday"
+    assert slot >= date.today()
 
 
 def test_every_stage_is_reported_and_five_are_still_unbuilt(

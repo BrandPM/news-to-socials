@@ -548,7 +548,15 @@ def test_approving_a_linked_draft_publishes_the_candidate_and_logs_the_decision(
         cand = session.get(Candidate, cid)
         # ready → published, with the slot assigned on the way through.
         assert cand.status == "published"
-        assert cand.publication_slot == date(2026, 8, 31)
+        # Computed, not named: the approve goes through the API and therefore
+        # through the real clock, so a literal date here would only hold for
+        # the week it was written in.
+        assert cand.publication_slot == lifecycle.next_publication_slot(
+            slots=json.loads(SLOTS),
+            timezone_name="Europe/Madrid",
+            now=datetime.now(tz=UTC),
+            taken={},
+        )
         assert cand.published_at is not None
         decision = session.query(ReviewDecision).one()
         assert decision.action == "approve"

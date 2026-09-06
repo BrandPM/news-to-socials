@@ -50,7 +50,11 @@ from pipeline.monitoring.alerts import format_intake_heartbeat
 from pipeline.selector.editorial_guard import _GUARD_PROMPT, GuardDeferred
 from tests.unit.conftest import seed_icon_brand
 
-NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+# Relative to the real clock on purpose. The prefilter drops items older than
+# ``prefilter_max_age_hours_news`` (72h) measured against ``datetime.now``, so a
+# frozen literal here turns every intake test into a time bomb: it passes for
+# three days, then fails for reasons that have nothing to do with intake.
+NOW = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
 
 _TAXONOMY = (
     ("structuring", "Structuring & Tax", "Residence, CRS/DAC/CARF, UBO", "/t"),
