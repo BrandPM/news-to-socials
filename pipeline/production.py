@@ -400,20 +400,15 @@ def taken_this_week(
 # --------------------------------------------------------------------------
 
 
-def _topic_from_candidate(row: Any, brand_slug: str, *, tag: str | None) -> Topic:
+def _topic_from_candidate(row: Any, brand_slug: str) -> Topic:
     """A ``Topic`` the v2 generation seams accept, carrying the candidate id.
 
     ``candidate_id`` is the seam NTS_121 §3 names: it is what lets
-    ``link_candidate_to_draft`` fire at the one moment both ids exist. ``tag``
-    prefixes the title for an operator-marked run (the e2e proof), and it goes
-    on the *title* rather than a side channel so the mark reaches the slug and
-    is visible in the Studio.
+    ``link_candidate_to_draft`` fire at the one moment both ids exist.
     """
     from pipeline.intake import _topic_id_for
 
     title = row.source_title or "(untitled)"
-    if tag:
-        title = f"[{tag}] {title}"
     url: str = str(row.primary_doc_url or row.source_url or "https://example.invalid/")
     return Topic(
         id=_topic_id_for(row.source_url or row.primary_doc_url, row.source_title or ""),
@@ -847,7 +842,7 @@ async def produce_candidate(
         row = session.get(Candidate, candidate_id)
         if row is None:
             raise LookupError(f"candidate {candidate_id} vanished mid-run")
-        topic = _topic_from_candidate(row, brand_slug, tag=tag)
+        topic = _topic_from_candidate(row, brand_slug)
         return_scope = row.return_scope
         primary_doc_url = row.primary_doc_url
         snapshot = _CandidateSnapshot.of(row)
@@ -1146,9 +1141,13 @@ async def produce_candidate(
             for language, draft in drafts
         ]
 
+        # ``--tag`` marks the DRAFT's title, not the news peg's: the article
+        # title is written by the model from the peg, so tagging the peg put
+        # the mark somewhere the operator never sees. On the title it reaches
+        # the slug too, which is how a test article is found and deleted later.
         posts = [
             SanityPostInput(
-                title=draft.title,
+                title=f"[{tag}] {draft.title}" if tag else draft.title,
                 body_markdown=draft.body,
                 language=language,
                 category=category,
