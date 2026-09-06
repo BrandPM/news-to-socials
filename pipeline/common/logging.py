@@ -13,6 +13,7 @@ import sys
 import structlog
 
 from .config import get_settings
+from .redaction import NOISY_HTTP_LOGGERS, RedactingFilter, redact_processor
 
 
 def configure_logging() -> None:
@@ -26,6 +27,20 @@ def configure_logging() -> None:
         level=level,
     )
 
+    # NTS_129 P2 Ф0.2 — httpx logs one INFO line per request with the full URL,
+    # and the Telegram Bot API carries the bot token in the path. Every alert
+    # the monitor sent wrote that token into journalctl. Two layers: the noisy
+    # loggers are raised to WARNING so the line is not emitted, and a filter
+    # masks anything that still gets through (someone lowering the level to
+    # debug a request should not re-open the leak).
+    redacting = RedactingFilter()
+    for name in NOISY_HTTP_LOGGERS:
+        noisy = logging.getLogger(name)
+        noisy.setLevel(max(level, logging.WARNING))
+        noisy.addFilter(redacting)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redacting)
+
     is_tty = sys.stdout.isatty()
     renderer: structlog.types.Processor = (
         structlog.dev.ConsoleRenderer() if is_tty else structlog.processors.JSONRenderer()
@@ -35,6 +50,9 @@ def configure_logging() -> None:
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
+            # Before the renderer, and over values rather than the rendered
+            # line, so it holds for both JSON and console output.
+            redact_processor,
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
