@@ -139,8 +139,27 @@ def test_019_reseeds_the_active_rows_with_the_current_constants(alembic_db):
 
     polish_content, _v, _n = _active(db_path, "writer_polish")
     assert polish_content == _POLISH_PROMPT
-    assert "600-800 words" in polish_content
-    assert "3-5 H2 sections" in polish_content
+    # 019's own length wording was superseded twice: S6 moved the draft's
+    # target into {depth_guidance}, and migration 031 did the same for polish
+    # after the first real run showed the two stages enforcing different
+    # numbers. What 019 is tested for here is the RESYNC — that the stale row
+    # was replaced by the live constant — which the equality above states.
+    assert "{depth_guidance}" in polish_content
+    assert "the H2 sections (`## Heading`) the draft already has" in polish_content
+
+
+# writer_polish's required set as of migration 019 — before S6/031 added the
+# computed length target. Frozen here so the test below keeps asserting what it
+# was written to assert.
+_REQUIRED_PLACEHOLDERS_AT_019 = {
+    "ai_tells",
+    "banned_phrases",
+    "good_examples",
+    "voice_principles",
+    "topics_relevant",
+    "draft_json",
+    "language_name",
+}
 
 
 def test_019_reseeds_polish_even_though_its_placeholders_did_not_change(alembic_db):
@@ -153,8 +172,14 @@ def test_019_reseeds_polish_even_though_its_placeholders_did_not_change(alembic_
 
     stale_polish, _v, _n = _active(db_path, "writer_polish")
     fields = {n for _, n, _, _ in string.Formatter().parse(stale_polish) if n}
-    assert _REQUIRED_PLACEHOLDERS["writer_polish"] <= fields, (
-        "the stale row must be VALID for this test to mean anything"
+    # The premise of this test at the time 019 was written: the stale row was
+    # VALID, so the placeholder safety net could not catch it, and only the
+    # reseed could. Migration 031 has since added {depth_guidance} to the
+    # required set, so today the row would also fail validation — the belt now
+    # has braces. The reseed is still what this test checks, and the original
+    # premise is recorded rather than deleted: it is why 019 exists at all.
+    assert _REQUIRED_PLACEHOLDERS_AT_019 <= fields, (
+        "the stale row must have been valid at 019 for this test to mean anything"
     )
     assert "2-3 H2" in stale_polish
 

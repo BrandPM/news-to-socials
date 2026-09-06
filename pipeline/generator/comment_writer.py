@@ -282,16 +282,17 @@ GROUNDING (mandatory — outranks EVERY other rule here, including length):
 
 STRUCTURE REQUIREMENTS (preserve / enforce — markdown, not bold):
 * The piece must open with a 1-2 sentence lede paragraph (no heading).
-* Then 3-5 H2 sections (`## Heading`). Substantive heading names that
-  describe the section content, e.g. "## The repricing of mezzanine
-  credit" — NEVER "## What this means", "## Conclusion", "## Key
+* Then the H2 sections (`## Heading`) the draft already has. Substantive
+  heading names that describe the section content, e.g. "## The repricing of
+  mezzanine credit" — NEVER "## What this means", "## Conclusion", "## Key
   takeaways", "## Overview", or other content-free labels.
-* LENGTH — the target is 600-800 words:
+* LENGTH — the same target the draft was written to:
+{depth_guidance}
   - A draft already in that range keeps its length. Do NOT compress it.
     Tighten sentence by sentence; do not delete sections to hit a shorter
     number.
-  - A draft SHORTER than 600 words STAYS short. It is short because the
-    research behind it was thin, and that is the correct outcome. Padding it
+  - A draft SHORTER than the target STAYS short. It is short because the
+    material behind it was thin, and that is the correct outcome. Padding it
     with generic sentences, or with a figure/date/name that is not already in
     the draft, is the exact failure this pass exists to prevent.
   - Never add a section, a fact or a sentence in order to reach a word count.
@@ -503,6 +504,12 @@ _REQUIRED_PLACEHOLDERS: dict[str, set[str]] = {
         "topics_relevant",
         "draft_json",
         "language_name",
+        # S6 follow-up. The polish pass used to enforce "600-800 words" while
+        # the drafter was given a target computed from the material, so the two
+        # stages could disagree — a `note` written to 300-450 was polished
+        # against 600-800, and a `deep` piece with no ceiling was polished
+        # against one. Migration 031 reseeds the live rows.
+        "depth_guidance",
     },
     "writer_translate": {
         "draft_json",
@@ -542,6 +549,7 @@ _ALLOWED_PLACEHOLDERS: dict[str, set[str]] = {
         "topics_relevant",
         "draft_json",
         "language_name",
+        "depth_guidance",
     },
     "writer_translate": {
         "draft_json",
@@ -887,6 +895,7 @@ class CommentWriter:
             language,
             voice_principles,
             topics_relevant,
+            depth_guidance=depth_guidance,
         )
 
         # --- Banned-phrase retry (one extra pass, cap to avoid runaways) ---
@@ -1069,6 +1078,7 @@ class CommentWriter:
         language: Language = Language.en,
         voice_principles: list[str] | None = None,
         topics_relevant: list[str] | None = None,
+        depth_guidance: str = "",
     ) -> _DraftJSON:
         kwargs = {
             "ai_tells": ", ".join(ai_tells) if ai_tells else "no specific tells noted",
@@ -1080,6 +1090,10 @@ class CommentWriter:
             or "  (none specified)",
             "draft_json": draft.model_dump_json(),
             "language_name": _language_name(language),
+            # The same target the draft was written to, so the two stages
+            # cannot disagree about length.
+            "depth_guidance": depth_guidance
+            or "  around 600-900 words. This is a guide, not a quota.",
         }
         template = self._resolve_template("writer_polish", _POLISH_PROMPT, kwargs)
         prompt = template.format(**kwargs)

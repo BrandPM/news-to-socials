@@ -344,11 +344,22 @@ async def run_judge(
     if brand_id_fk is not None:
         from pipeline.admin.config_client import AdminConfigClient  # noqa: PLC0415
 
+        from pipeline.admin.cost_recorder import get_context  # noqa: PLC0415
+
         try:
             AdminConfigClient.record_cost(
                 brand_id_fk=brand_id_fk,
                 run_id=run_id,
                 draft_id=draft_id,
+                # The judge writes its row directly rather than through
+                # ``record_cost``, because it is given brand and run
+                # explicitly. That skipped the ambient candidate id, and the
+                # first real production run showed it: two of thirteen cost
+                # rows landed unattributed, which makes
+                # ``max_cost_per_candidate_usd`` wrong by the price of the
+                # judge. Reading the context here keeps the v2 path unchanged
+                # (no context → None) and completes the v3 one.
+                candidate_id_fk=get_context().candidate_id,
                 provider="openai",
                 operation="draft_eval",
                 model=model,

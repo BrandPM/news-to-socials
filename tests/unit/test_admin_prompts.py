@@ -55,7 +55,9 @@ _VALID_BODIES = {
         "Polish this draft so it sounds like Icon, in {language_name}. "
         "Tells:{ai_tells} Banned:{banned_phrases} Good:{good_examples} "
         "Principles:{voice_principles} Topics:{topics_relevant} "
-        "Draft:{draft_json}"
+        # Migration 031 — the polish pass reads the same computed length
+        # target the draft was written to.
+        "Draft:{draft_json} Shape:{depth_guidance}"
     ),
     "writer_draft": (
         "Draft in {language_name} from {title} / {summary}. "

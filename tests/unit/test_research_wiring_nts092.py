@@ -234,15 +234,15 @@ async def test_write_does_not_research_on_its_own():
 )
 def test_both_en_prompts_carry_the_new_length(name, prompt):
     """Both, not one: polish compresses the draft back otherwise."""
-    if name == "writer_draft":
-        # S6 moved the length out of the prompt entirely (NTS_102): the target
-        # is computed from the material and rendered into {depth_guidance},
-        # because "a number in a prompt does not know what the article is
-        # about". What must survive is the *priority* — grounding outranks
-        # length — which is asserted below and in
-        # ``test_thin_pack_means_a_shorter_article_not_a_padded_one``.
+    # S6 moved the length out of BOTH prompts (NTS_102): the target is computed
+    # from the material and rendered into {depth_guidance}, because "a number in
+    # a prompt does not know what the article is about". The polish pass joined
+    # the draft in migration 031, after the first real run showed the two stages
+    # enforcing different numbers. What must survive is the *priority* —
+    # grounding outranks length.
+    if name in ("writer_draft", "writer_polish"):
         assert "{depth_guidance}" in prompt
-        assert "The length is a target, never an instruction to keep writing" in prompt
+        assert "GROUNDING" in prompt
         return
     assert "600-800 words" in prompt, f"{name} missing the new length"
     assert "250-400" not in prompt, f"{name} still carries the old length"
@@ -253,12 +253,17 @@ def test_both_en_prompts_carry_the_new_length(name, prompt):
 )
 def test_h2_count_was_recalibrated_for_the_longer_piece(name, prompt):
     """2-3 headings was calibrated for 350 words and is too sparse for 700."""
+    # Also moved: the section count comes from the plan (NTS_102 §"План перед
+    # текстом"). The draft writes the plan's sections; the polish pass keeps
+    # the ones the draft has. Both keep the anti-padding rule the count existed
+    # to protect.
     if name == "writer_draft":
-        # Also moved: the section count now comes from the plan (NTS_102 §"План
-        # перед текстом"), so the prompt asks for the plan's sections and keeps
-        # the anti-padding rule that the count existed to protect.
         assert "the H2 sections (`## Heading`) the PLAN names" in prompt
         assert "section to reach a count" in prompt
+        return
+    if name == "writer_polish":
+        assert "the H2 sections (`## Heading`) the draft already has" in prompt
+        assert "in order to reach a word count" in prompt
         return
     assert "3-5 H2 sections" in prompt, f"{name} H2 count not recalibrated"
     assert "2-3 H2" not in prompt, f"{name} still asks for 2-3 H2"
