@@ -49,9 +49,21 @@ def _run(*args: str) -> str:
     return result.stdout
 
 
+# The day the walkthrough was started, captured BEFORE the subprocess runs.
+#
+# The slot it picks is "the next Monday or Thursday", which can be today. Read
+# ``date.today()`` after the run instead and a suite that happens to cross
+# midnight sees a slot one day in the past and fails — observed once, at
+# 2026-09-06 23:59. Captured before the run, the assertion still says what it
+# means (the walkthrough never schedules a slot earlier than the moment it
+# started) and no longer depends on when the suite is run.
+_STARTED_ON: list[date] = []
+
+
 @pytest.fixture(scope="module")
 def walkthrough_output(tmp_path_factory) -> str:
     db = tmp_path_factory.mktemp("e2e") / "walkthrough.db"
+    _STARTED_ON.append(date.today())
     return _run("--db", str(db), "--markdown")
 
 
@@ -68,7 +80,7 @@ def test_the_chain_completes_through_the_slot(walkthrough_output: str):
     assert match, "the walkthrough never printed a slot"
     slot = date.fromisoformat(match.group(1))
     assert slot.weekday() in (0, 3), f"{slot} is neither Monday nor Thursday"
-    assert slot >= date.today()
+    assert slot >= _STARTED_ON[0]
 
 
 def test_every_stage_runs_and_none_is_left_unbuilt(walkthrough_output: str):
