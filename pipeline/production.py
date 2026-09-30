@@ -90,6 +90,9 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 # no article from a retelling, only from a document.
 ELIGIBLE_DOC_MATCH: tuple[str, ...] = ("exact", "probable", "manual")
 
+# NTS_131 P3 Ф4 — see the plan call in ``produce_candidate``.
+PLAN_MODEL = "gpt-4o"
+
 # Where the run stops looking for a slot to warn about (NTS_100 §3.5).
 THIN_PORTFOLIO_LEAD_DAYS = 3
 
@@ -882,6 +885,12 @@ async def _attribute_until_clean(
             sources=_repair_sources(fact_pack, document_text),
         )
         report = await _check(en_draft)
+        log.info(
+            "production.stage_words",
+            candidate_id=candidate_id,
+            stage=f"repair_{repairs}",
+            words=len(en_draft.body.split()),
+        )
     return report, en_draft, repairs
 
 
@@ -1136,7 +1145,10 @@ async def produce_candidate(
                 document_url=primary_document.url if primary_document else "",
                 depth=decision.depth,
                 targets=targets,
-                model=str(getattr(config, "attribution_model", "gpt-4o-mini")),
+                # NTS_131 P3 Ф4 — the plan decides which facts the article
+                # carries; on gpt-4o-mini it assigned 6 of 38. The plan is one
+                # call per article, so it gets the model the content deserves.
+                model=PLAN_MODEL,
             )
             if fact_pack_id is not None:
                 _store_plan(fact_pack_id, plan.as_dict())
@@ -1390,6 +1402,7 @@ async def run_production(
     cost_cap_usd: float | None = None,
     tag: str | None = None,
     triggered_by: str = "cron",
+    only: Sequence[int] | None = None,
 ) -> ProductionStats:
     """Run contour 2 once for one brand (NTS_100 §3).
 
@@ -1591,6 +1604,12 @@ async def run_production(
         now=now,
         doc_retries=int(getattr(config, "doc_retries", 2)),
     )
+    if only:
+        # An operator naming the clusters to produce (NTS_131 P3 Ф3). Still
+        # through eligibility and the budget: naming a candidate does not
+        # make a document-less one writable.
+        wanted = {int(c) for c in only}
+        facts = [f for f in facts if int(f.candidate_id) in wanted]
     stats.eligible = len(facts)
     picks = select_batch(
         facts,
@@ -1824,6 +1843,9 @@ def main(
         None, "--tag", help="mark the drafts' titles/slugs, e.g. for an e2e proof"
     ),
     triggered_by: str = typer.Option("cron", "--triggered-by"),
+    candidate: list[int] = typer.Option(
+        [], "--candidate", help="produce only these candidate ids (repeatable)"
+    ),
 ) -> None:
     """Run contour 2 (selection + production) once."""
     import asyncio
@@ -1850,6 +1872,7 @@ def main(
                 cost_cap_usd=cost_cap_usd,
                 tag=tag,
                 triggered_by=triggered_by,
+                only=candidate or None,
             )
         )
     except ProductionDisabled as exc:

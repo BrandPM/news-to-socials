@@ -533,6 +533,49 @@ _BANNED_PHRASE_RETRY_THRESHOLD = 2
 # At the old 2 600 the reply was truncated mid-body and landed in ``_parse``'s
 # "(parse failed)" path — a silent quality floor imposed by a constant.
 _DRAFT_MAX_TOKENS = 8000
+
+# NTS_131 P3 Ф4 — the draft is where the length is decided. Measured on the
+# same pack and the same plan (FINMA / Julius Baer, 20 assigned facts, deep
+# 900-1300): gpt-4o-mini 396 words, gpt-4o 359-466 over four tries with every
+# prompt-side lever pulled (section shape, per-section targets), gpt-5.5
+# 1 242 — and the only one of the three that wrote the sources' disagreement
+# as a disagreement. A reasoning model plans a long answer before writing it;
+# the chat models answer the JSON envelope at their default length. About
+# USD 0.15 a draft.
+DRAFT_MODEL = "gpt-5.5"
+# Reasoning models reject ``max_tokens`` and ``temperature``, and their
+# completion budget has to cover the hidden reasoning as well as the answer.
+_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+# NTS_131 P3 Ф4 — measured: a 1 349-word draft came back from the polish at
+# 771. The polish exists to fix voice and AI tells, not to decide length; the
+# length was decided by the plan and the draft. So the polish is told the
+# number, and a polish that still cuts more than this share is not used.
+POLISH_MIN_KEEP = 0.8
+
+
+def _length_lock(body: str) -> str:
+    words = len((body or "").split())
+    if words < 200:
+        return ""
+    return (
+        "\n\nLENGTH LOCK (overrides any instruction above about tightening): "
+        f"the draft body is {words} words. Return a body of "
+        f"{int(words * 0.9)}-{int(words * 1.05)} words. Fix wording sentence by "
+        "sentence; do not merge, drop or summarise sections or paragraphs, and "
+        "keep every figure, date and named source the draft carries.\n"
+    )
+
+
+def _is_reasoning(model: str) -> bool:
+    return model.startswith(_REASONING_PREFIXES)
+
+
+def _limit_kwargs(model: str, max_tokens: int) -> dict[str, Any]:
+    if _is_reasoning(model):
+        return {"max_completion_tokens": max_tokens + 8000, "reasoning_effort": "medium"}
+    return {"max_tokens": max_tokens}
 _POLISH_MAX_TOKENS = 8000
 _TRANSLATE_MAX_TOKENS = 12000
 
@@ -844,7 +887,7 @@ class CommentWriter:
     def __init__(
         self,
         client: AsyncOpenAI | None = None,
-        draft_model: str = "gpt-4o-mini",
+        draft_model: str = DRAFT_MODEL,
         polish_model: str = "gpt-4o",
         brand_id_fk: int | None = None,
     ) -> None:
@@ -952,6 +995,10 @@ class CommentWriter:
             primary_document=primary_document,
         )
 
+        # NTS_131 P3 Ф4 — word count per stage, so "the article came out short"
+        # names the stage that shortened it instead of starting a guess.
+        log.info("comment_writer.stage_words", topic=topic.id, stage="draft", words=len(draft.body.split()))
+
         # --- Anti-AI check ---
         score, tells = score_ai_tells(draft.body)
         log.info("comment_writer.draft_ai_score", topic=topic.id, score=score, tells=tells)
@@ -967,6 +1014,21 @@ class CommentWriter:
             topics_relevant,
             depth_guidance=depth_guidance,
         )
+
+        draft_words = len(draft.body.split())
+        polished_words = len(polished.body.split())
+        log.info("comment_writer.stage_words", topic=topic.id, stage="polish", words=polished_words)
+        if draft_words >= 200 and polished_words < POLISH_MIN_KEEP * draft_words:
+            # The polish summarised instead of polishing. The draft is the
+            # stronger model's text and already went through the same
+            # grounding rules; the banned-phrase pass below still runs on it.
+            log.warning(
+                "comment_writer.polish_discarded",
+                topic=topic.id,
+                draft_words=draft_words,
+                polished_words=polished_words,
+            )
+            polished = draft
 
         # --- Banned-phrase retry (one extra pass, cap to avoid runaways) ---
         hits = find_banned_phrase_hits(polished.body, banned_phrases)
@@ -1131,7 +1193,7 @@ class CommentWriter:
         prompt = template.format(**kwargs)
         resp = await self.client.chat.completions.create(
             model=self.draft_model,
-            max_tokens=_DRAFT_MAX_TOKENS,
+            **_limit_kwargs(self.draft_model, _DRAFT_MAX_TOKENS),
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
@@ -1166,7 +1228,7 @@ class CommentWriter:
             or "  around 600-900 words. This is a guide, not a quota.",
         }
         template = self._resolve_template("writer_polish", _POLISH_PROMPT, kwargs)
-        prompt = template.format(**kwargs)
+        prompt = template.format(**kwargs) + _length_lock(draft.body)
         resp = await self.client.chat.completions.create(
             model=self.polish_model,
             max_tokens=_POLISH_MAX_TOKENS,

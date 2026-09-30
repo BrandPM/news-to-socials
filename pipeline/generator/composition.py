@@ -267,6 +267,27 @@ def depth_guidance(
         "we still don't know. Coming in far under this target almost always "
         "means one of those is still missing from the text, not from the pack.",
     ]
+    if depth in ("article", "deep"):
+        # NTS_131 P3 Ф4. Measured on the first live cluster: 38 facts, 18 of
+        # them assigned by the plan, and every section came back as ONE
+        # paragraph of ~60 words — 344 words against 900-1300. No move was
+        # missing; every move was a summary of itself. So the unit that is
+        # specified is the section, and what fills it is named: the facts, the
+        # mechanism, the consequence — none of which needs a figure the pack
+        # does not hold.
+        n_sections = 4 if depth == "article" else 6
+        per_section = max(120, low // n_sections)
+        lines.append(
+            f"SECTION SHAPE: each H2 section runs 2-3 paragraphs, roughly "
+            f"{per_section}-{per_section + 80} words. In each: (a) every fact the "
+            "plan assigns to it, each in its own sentence with its figure or date; "
+            "(b) the mechanism — who must do what, from when, under which rule or "
+            "article; (c) the consequence for a reader who holds assets, accounts, "
+            "structures or residence in that jurisdiction. (b) and (c) are built "
+            "from the facts already in the section — they explain them, they do "
+            "not add new figures. A section that is one paragraph long on this "
+            "material is an unfinished section."
+        )
     if depth == "brief":
         lines.append(
             "This is a BRIEF: the material is thin, and this length is the "
@@ -317,6 +338,15 @@ THE FIVE MOVES — plan the article as these, in this order:
 5. unknown   — what the material leaves open. Goes in ``unknowns``, not in a
                section, unless the material is rich enough to earn its own.
 
+FACT BUDGET — {fact_budget}
+The writer writes ONLY the facts this plan assigns, so a plan that assigns
+six facts produces a 300-word article however rich the pack is. Assign every
+concrete fact the reader needs — thresholds, amounts, dates, deadlines, named
+instruments, who must do what — copying each fact's text from the pack.
+Facts corroborated by several documents and facts behind a DISCREPANCY are
+the first to assign; a discrepancy is planned as a sentence that names both
+sides.
+
 RULES
 * Plan only what the material supports. {shape}
 * Every section must be able to name at least one concrete fact from the pack
@@ -366,6 +396,16 @@ class Plan:
     def is_empty(self) -> bool:
         return not self.sections
 
+    def assigned_facts(self) -> int:
+        """Distinct facts the plan hands the writer (NTS_131 P3 Ф4)."""
+        seen: set[str] = set()
+        for section in self.sections:
+            for fact in section.get("facts", []) or []:
+                key = str(fact).strip().lower()
+                if key:
+                    seen.add(key)
+        return len(seen)
+
     def render(self) -> str:
         """The plan as the draft prompt sees it."""
         if self.is_empty():
@@ -382,7 +422,7 @@ class Plan:
             lines.append(f"{index}. ## {section.get('heading', '')}{suffix}")
             if section.get("purpose"):
                 lines.append(f"   purpose: {section['purpose']}")
-            for fact in section.get("facts", [])[:6]:
+            for fact in section.get("facts", [])[:8]:
                 lines.append(f"   - {fact}")
             if section.get("document_sections"):
                 lines.append(
@@ -463,32 +503,91 @@ async def build_plan(
         else "PRIMARY DOCUMENT: none available."
     )
     shape = depth_guidance(depth, dict(targets or {}))
+    n_pack = int(getattr(fact_pack, "fact_count", 0) or 0)
+    low, high = plan_fact_budget(depth, n_pack)
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": _PLAN_INSTRUCTIONS.format(
+                shape=shape,
+                fact_budget=(
+                    f"assign {low}-{high} distinct facts across the sections, "
+                    "3-6 per section"
+                    if low
+                    else "assign every concrete fact the pack holds"
+                ),
+            ),
+        },
+        {
+            "role": "user",
+            "content": _PLAN_INPUT.format(
+                title=title,
+                summary=(summary or "")[:1000],
+                document=document_block,
+                fact_pack=(fact_pack.render() if fact_pack is not None else "(none)"),
+            ),
+        },
+    ]
+    plan = await _plan_call(client, model=model, messages=messages)
+    if plan is None:
+        return Plan()
+    # NTS_131 P3 Ф4 — the collapse was here: the first live cluster had 38
+    # facts and the plan assigned 6. One re-ask, with the count, when the
+    # plan under-spends a pack that could fill it.
+    assigned = plan.assigned_facts()
+    if low and assigned < low:
+        log.info("composition.plan_thin", assigned=assigned, budget=low, pack=n_pack)
+        messages += [
+            {"role": "assistant", "content": plan.raw},
+            {
+                "role": "user",
+                "content": (
+                    f"This plan assigns {assigned} facts; the pack holds {n_pack} "
+                    f"and the budget is {low}-{high}. Re-plan with at least {low} "
+                    "distinct facts copied from the pack, 3-6 per section, "
+                    "covering the thresholds, dates and obligations first. Same "
+                    "JSON shape."
+                ),
+            },
+        ]
+        replanned = await _plan_call(client, model=model, messages=messages)
+        if replanned is not None and replanned.assigned_facts() > assigned:
+            plan = replanned
+    log.info(
+        "composition.plan",
+        sections=len(plan.sections),
+        assigned_facts=plan.assigned_facts(),
+        blocks=[s.get("block") for s in plan.sections if s.get("block", "none") != "none"],
+        omitted=len(plan.omitted),
+    )
+    return plan
+
+
+def plan_fact_budget(depth: str, n_pack: int) -> tuple[int, int]:
+    """How many facts the plan should assign, capped by what the pack holds."""
+    band = {"note": (0, 0), "brief": (5, 8), "article": (12, 16), "deep": (16, 22)}
+    low, high = band.get(depth, (12, 16))
+    if not low:
+        return 0, 0
+    return min(low, n_pack), min(high, n_pack)
+
+
+async def _plan_call(
+    client: Any, *, model: str, messages: list[dict[str, str]]
+) -> Plan | None:
+    from ..admin.cost_recorder import record_cost
+    from ..common.pricing import openai_cost
+
     try:
         resp = await client.chat.completions.create(
             model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": _PLAN_INSTRUCTIONS.format(shape=shape),
-                },
-                {
-                    "role": "user",
-                    "content": _PLAN_INPUT.format(
-                        title=title,
-                        summary=(summary or "")[:1000],
-                        document=document_block,
-                        fact_pack=(
-                            fact_pack.render() if fact_pack is not None else "(none)"
-                        ),
-                    ),
-                },
-            ],
+            messages=messages,
             temperature=0.2,
             response_format={"type": "json_object"},
         )
     except Exception as exc:
         log.warning("composition.plan_failed", err=str(exc)[:200])
-        return Plan()
+        return None
 
     usage = getattr(resp, "usage", None)
     if usage is not None:
@@ -510,14 +609,8 @@ async def build_plan(
         plan = Plan.from_dict(json.loads(raw))
     except Exception:
         log.warning("composition.plan_unparseable", raw=raw[:200])
-        return Plan()
+        return None
     plan.raw = raw
-    log.info(
-        "composition.plan",
-        sections=len(plan.sections),
-        blocks=[s.get("block") for s in plan.sections if s.get("block", "none") != "none"],
-        omitted=len(plan.omitted),
-    )
     return plan
 
 
@@ -543,6 +636,19 @@ entity, quotation and every statement about who did what — return one verdict:
   call that confirmed. Read the subject-predicate-object, not the digits.
 * "uncovered" — the claim is not in any source given to you. Not necessarily
   wrong; not supported.
+
+Two kinds of sentence need care (NTS_131 P3):
+* A NAMED GAP — "the notice does not say whether…", "FINMA has not yet
+  published…", "it is not known when…" — is a claim ABOUT the sources. It is
+  "confirmed" when the sources indeed do not state that thing, and
+  "distorted" when they do state it. It is never "uncovered" merely for
+  expressing uncertainty.
+* A DATE or TENSE is part of the claim. "Must write down by the end of 2023"
+  when the source says the loans "were fully written down by the end of 2023"
+  is distorted: an obligation where the source reports a completed fact.
+Interpretation that asserts no fact of its own ("this raises the cost of the
+route") is not a claim; skip it. Anything stated as fact — a consequence, an
+obligation, who did what — is a claim and gets a verdict.
 
 Also flag, on the claims where they apply:
 * "person_detail": the sentence gives a named individual's tenure, past

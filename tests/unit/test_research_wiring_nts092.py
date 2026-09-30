@@ -373,7 +373,9 @@ async def test_the_raised_ceilings_are_what_the_api_is_called_with():
     writer, client = _writer()
     await writer.write(_topic(), "banned_phrases: []\n", Language.en, fact_pack=_pack())
     calls = client.chat.completions.create.await_args_list
-    assert calls[0].kwargs["max_tokens"] == _DRAFT_MAX_TOKENS
+    # The draft runs on a reasoning model since NTS_131 P3 Ф4, whose budget is
+    # ``max_completion_tokens`` and has to cover the hidden reasoning too.
+    assert calls[0].kwargs["max_completion_tokens"] >= _DRAFT_MAX_TOKENS
     assert calls[1].kwargs["max_tokens"] == _POLISH_MAX_TOKENS
 
 

@@ -1017,3 +1017,324 @@ async def build_fact_pack(
         discrepancies=len(pack.discrepancies),
     )
     return pack
+
+
+# --------------------------------------------------------------------------
+# NTS_131 P3 Ф2 — the pack across an event cluster
+# --------------------------------------------------------------------------
+#
+# One research call over five documents returned ten facts on the first live
+# cluster (FINMA / Julius Baer, 30 Sep): the model read the first document,
+# skimmed the rest and stopped at the single-document volume it knows. So a
+# cluster is read the way an analyst reads it — one document at a time, every
+# figure from each — and only then merged. Two consequences that matter more
+# than the count:
+#
+# * **The URL is set by the code, not by the model.** Each extraction call sees
+#   exactly one document, so every fact it returns belongs to that document's
+#   URL. Traceability stops depending on the model copying a URL correctly.
+# * **Agreement and disagreement are decided on facts, not on documents.** The
+#   merge call sees numbered facts, answers in ids, and the code assembles
+#   ``corroborated_by`` and ``discrepancies`` from those ids — the model never
+#   gets to restate a figure on the way.
+
+_EXTRACT_INSTRUCTIONS = """\
+You extract facts from ONE document for a financial-commentary writer. You
+are not summarising and not writing.
+
+Return every concrete fact the document states about the event: amounts,
+percentages, thresholds, dates and deadlines, periods, counts, named
+instruments and articles, named parties and what each did or must do, and the
+mechanism (who must do what, by when, under which rule). Use the document's
+own wording for definitions and thresholds. Never add anything the document
+does not say, and never compute, convert or round a figure. Write every fact
+in English, whatever the document's language; keep figures, currencies and
+names exactly as the document gives them.
+
+Return JSON only:
+{"facts": [{"text": "<one self-contained sentence stating the fact>",
+            "date": "<YYYY-MM-DD the fact refers to, if any, else \\"\\">",
+            "value": "<the bare figure, e.g. 250000000 or 15 — empty if none>",
+            "unit": "<CHF, EUR, %, days, … — empty if none>",
+            "label": "<2-5 word name for the figure, e.g. 'Capital add-on' — empty if no value>",
+            "comparable_group": "<short label shared by figures that measure the
+             same thing on a different period, jurisdiction or party, e.g.
+             'transfer tax rate' — empty if none>"}]}
+
+Up to {max_facts} facts; fewer when the document holds fewer. A fact without a
+figure, a date or a named party/instrument is not a fact — leave it out.
+"""
+
+_EXTRACT_INPUT = """\
+EVENT: {title}
+
+DOCUMENT ({role}) — {publisher}
+URL: {url}
+
+{text}
+"""
+
+_MERGE_INSTRUCTIONS = """\
+You are given numbered facts extracted from several documents about ONE
+event. Decide, by id only:
+
+* "same": groups of ids that state the SAME fact (same figure, same date,
+  same subject). The first id in each group is the one kept.
+* "conflicts": pairs or groups of ids that state DIFFERENT things about the
+  same point — a different date, amount, scope or reading. Name the point.
+* "angle_hints": up to 5 non-obvious consequences for high-net-worth
+  individuals, family offices and their advisers. These are leads for the
+  writer's analysis, not facts; they may not contain a figure or date that
+  is not in the facts.
+
+Return JSON only:
+{"same": [["F3", "F11"]],
+ "conflicts": [{"point": "<what they disagree about>", "ids": ["F2", "F9"]}],
+ "angle_hints": ["..."]}
+"""
+
+
+async def _json_call(
+    client: Any, *, model: str, system: str, user: str, max_tokens: int, operation: str
+) -> dict[str, Any] | None:
+    from ..admin.cost_recorder import record_cost  # noqa: PLC0415
+    from ..common.pricing import openai_cost  # noqa: PLC0415
+
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:  # noqa: BLE001 — one document never sinks the pack
+        log.warning("research.cluster_call_failed", op=operation, err=str(exc)[:200])
+        return None
+    usage = getattr(resp, "usage", None)
+    record_cost(
+        provider="openai",
+        operation=operation,
+        model=model,
+        tokens_in=getattr(usage, "prompt_tokens", None),
+        tokens_out=getattr(usage, "completion_tokens", None),
+        cost_usd=openai_cost(
+            model,
+            getattr(usage, "prompt_tokens", 0) or 0,
+            getattr(usage, "completion_tokens", 0) or 0,
+        ),
+    )
+    try:
+        data = json.loads(resp.choices[0].message.content or "{}")
+    except (ValueError, TypeError, AttributeError, IndexError):
+        log.warning("research.cluster_unparseable", op=operation)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+@dataclass(frozen=True)
+class _Extracted:
+    fact: Fact
+    official: bool
+
+
+async def _extract_one(
+    client: Any,
+    *,
+    model: str,
+    title: str,
+    url: str,
+    publisher: str,
+    role: str,
+    text: str,
+    as_of: str,
+    max_facts: int,
+) -> list[_Extracted]:
+    data = await _json_call(
+        client,
+        model=model,
+        system=_EXTRACT_INSTRUCTIONS.replace("{max_facts}", str(max_facts)),
+        user=_EXTRACT_INPUT.format(
+            title=title, role=role, publisher=publisher or "(unknown)", url=url, text=text
+        ),
+        max_tokens=3000,
+        operation="research_extract",
+    )
+    out: list[_Extracted] = []
+    seen: set[str] = set()
+    for entry in list((data or {}).get("facts") or [])[:max_facts]:
+        if not isinstance(entry, dict):
+            continue
+        text_ = _clean_text(entry.get("text"), _MAX_FACT_CHARS)
+        if not text_ or text_.lower() in seen:
+            continue
+        seen.add(text_.lower())
+        out.append(
+            _Extracted(
+                Fact(
+                    text=text_,
+                    url=url,  # set here, never taken from the model
+                    publisher=_clean_text(publisher, 80),
+                    date=_clean_text(entry.get("date"), 40) or as_of,
+                    comparable_group=_clean_text(entry.get("comparable_group"), 60),
+                    value=_clean_text(entry.get("value"), 40),
+                    unit=_clean_text(entry.get("unit"), 24),
+                    label=_short_label(entry.get("label")),
+                ),
+                official=role != "secondary",
+            )
+        )
+    return out
+
+
+def _merge(
+    extracted: list[_Extracted], answer: dict[str, Any] | None
+) -> tuple[list[Fact], list[Fact], list[Discrepancy], list[str]]:
+    """Assemble the pack from the merge call's ids. Unknown ids are ignored."""
+    ids = {f"F{i}": item for i, item in enumerate(extracted, start=1)}
+    answer = answer or {}
+    dropped: set[str] = set()
+    corroboration: dict[str, list[str]] = {}
+    for group in list(answer.get("same") or []):
+        members = [m for m in (group or []) if isinstance(m, str) and m in ids]
+        if len(members) < 2:
+            continue
+        # Prefer an official document's wording as the one kept.
+        members.sort(key=lambda m: (not ids[m].official, int(m[1:])))
+        keep, rest = members[0], members[1:]
+        urls = [ids[m].fact.url for m in rest if ids[m].fact.url != ids[keep].fact.url]
+        corroboration.setdefault(keep, []).extend(urls)
+        dropped.update(rest)
+    discrepancies: list[Discrepancy] = []
+    for conflict in list(answer.get("conflicts") or [])[:6]:
+        if not isinstance(conflict, dict):
+            continue
+        members = [m for m in (conflict.get("ids") or []) if isinstance(m, str) and m in ids]
+        urls = {ids[m].fact.url for m in members}
+        if len(members) < 2 or len(urls) < 2:
+            continue
+        discrepancies.append(
+            Discrepancy(
+                point=_clean_text(conflict.get("point"), 200) or "differing accounts",
+                claims=tuple(
+                    (ids[m].fact.publisher, ids[m].fact.text, ids[m].fact.url)
+                    for m in members
+                ),
+            )
+        )
+    source_facts: list[Fact] = []
+    context: list[Fact] = []
+    for key, item in ids.items():
+        if key in dropped:
+            continue
+        fact = item.fact
+        extra = tuple(dict.fromkeys(corroboration.get(key, ())))
+        if extra:
+            from dataclasses import replace  # noqa: PLC0415
+
+            fact = replace(fact, corroborated_by=extra)
+        (source_facts if item.official else context).append(fact)
+    hints = [
+        h
+        for h in (_clean_text(x, _MAX_HINT_CHARS) for x in list(answer.get("angle_hints") or [])[:_MAX_ANGLE_HINTS])
+        if h
+    ]
+    return source_facts, context, discrepancies, hints
+
+
+async def build_cluster_fact_pack(
+    topic: Topic,
+    *,
+    document: PrimaryDocument,
+    cluster: Sequence[Any],
+    client: Any = None,
+    model: str = RESEARCH_MODEL,
+    max_facts_per_document: int = 14,
+) -> FactPack | None:
+    """The fact pack across an event cluster: extract per document, then merge.
+
+    ``None`` only when nothing at all could be extracted — the caller then
+    falls back to the single-call research path, which is what ran before.
+    """
+    if client is None:
+        from openai import AsyncOpenAI  # noqa: PLC0415
+
+        from ..common.config import get_settings  # noqa: PLC0415
+
+        api_key = get_settings().openai_api_key
+        if not api_key:
+            return None
+        client = AsyncOpenAI(api_key=api_key)
+
+    docs: list[tuple[str, str, str, str, str]] = [
+        (document.url, "", "primary", document.text, document.as_of)
+    ]
+    docs += [
+        (
+            getattr(c, "url", ""),
+            getattr(c, "publisher", "") or "",
+            getattr(c, "role", "secondary") or "secondary",
+            getattr(c, "text", "") or "",
+            getattr(c, "as_of", "") or "",
+        )
+        for c in cluster
+        if getattr(c, "text", "")
+    ]
+    batches = await asyncio.gather(
+        *(
+            _extract_one(
+                client,
+                model=model,
+                title=topic.raw.title,
+                url=url,
+                publisher=publisher or topic.raw.source_name,
+                role=role,
+                text=text,
+                as_of="",
+                max_facts=max_facts_per_document,
+            )
+            for url, publisher, role, text, _as_of in docs
+        )
+    )
+    extracted = [item for batch in batches for item in batch]
+    if not extracted:
+        log.warning("research.cluster_empty", topic=topic.id, documents=len(docs))
+        return None
+
+    listing = "\n".join(
+        f"F{i} [{item.fact.publisher or item.fact.url}] {item.fact.text}"
+        for i, item in enumerate(extracted, start=1)
+    )
+    answer = await _json_call(
+        client,
+        model=model,
+        system=_MERGE_INSTRUCTIONS,
+        user=f"EVENT: {topic.raw.title}\n\n{listing}",
+        max_tokens=1500,
+        operation="research_merge",
+    )
+    source_facts, context, discrepancies, hints = _merge(extracted, answer)
+    citations = list(dict.fromkeys(f.url for f in [*source_facts, *context]))
+    pack = FactPack(
+        source_facts=source_facts,
+        context=context,
+        angle_hints=hints,
+        citations=citations,
+        model=model,
+        searches=0,
+        discrepancies=discrepancies,
+    )
+    log.info(
+        "research.cluster_ok",
+        topic=topic.id,
+        documents=len(docs),
+        extracted=len(extracted),
+        source_facts=len(source_facts),
+        context=len(context),
+        corroborated=sum(1 for f in [*source_facts, *context] if f.corroborated_by),
+        discrepancies=len(discrepancies),
+    )
+    return pack

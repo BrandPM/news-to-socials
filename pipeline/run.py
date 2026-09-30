@@ -425,6 +425,12 @@ async def build_fact_pack_for_topic(
     # research is then grounded in it rather than in a headline.
     # ``cluster`` (NTS_131 P3 Ф2): the event's other documents; the pack is
     # built across all of them.
+    if cluster and document is not None:
+        from pipeline.generator.research import build_cluster_fact_pack  # noqa: PLC0415
+
+        pack = await build_cluster_fact_pack(topic, document=document, cluster=cluster)
+        if pack is not None:
+            return pack
     return await build_fact_pack(
         topic, budget=budget, document=document, cluster=cluster
     )
