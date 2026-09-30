@@ -113,6 +113,9 @@ class IntakeStats:
     reason_codes: dict[str, int] = field(default_factory=dict)
     dedup_windows: dict[str, int] = field(default_factory=dict)
     cap_overflow: int = 0
+    # NTS_131 P3 Ф2 — items joined to a live candidate's event cluster
+    # instead of being dropped as duplicates or becoming candidates of their own.
+    clustered: int = 0
     superseded: int = 0
     embed_failures: int = 0
     source_errors: int = 0
@@ -156,6 +159,7 @@ class IntakeStats:
             "reason_codes": self.reason_codes,
             "dedup_windows": self.dedup_windows,
             "cap_overflow": self.cap_overflow,
+            "clustered": self.clustered,
             "superseded": self.superseded,
             "embed_failures": self.embed_failures,
             "source_errors": self.source_errors,
@@ -184,6 +188,47 @@ def _topic_id_for(url: str | None, title: str) -> str:
     """
     basis = (url or title or "").encode("utf-8")
     return hashlib.sha1(basis).hexdigest()[:16]
+
+
+def _join_cluster(
+    *,
+    anchor: int,
+    item: Any,
+    url: str,
+    source_record: Any,
+    input_kind: str,
+    similarity: float,
+    stats: Any,
+    config: Any,
+) -> bool:
+    """Attach an item to ``anchor``'s event cluster (NTS_131 P3 Ф2).
+
+    ``True`` when the item was attached — the caller then creates no candidate
+    of its own. ``False`` (cluster full, URL already held, a DB error) means
+    the item continues as it would have before clusters existed.
+    """
+    from pipeline.selector.event_cluster import add_source
+
+    try:
+        added = add_source(
+            anchor_candidate_id=anchor,
+            url=url,
+            title=item.title,
+            publisher=getattr(source_record, "name", "") or "",
+            summary=(item.summary or "")[:1000],
+            role="primary" if input_kind == "document" else "secondary",
+            origin="intake_dedup",
+            similarity=similarity,
+            source_id_fk=getattr(source_record, "id", None),
+            published_at=getattr(item, "published_at", None),
+            max_sources=int(getattr(config, "cluster_max_sources", 5) or 0),
+        )
+    except Exception as exc:
+        log.warning("intake.cluster_join_failed", anchor=anchor, err=str(exc)[:200])
+        return False
+    if added:
+        stats.clustered += 1
+    return added
 
 
 def _persist_embedding(
@@ -447,6 +492,7 @@ async def run_intake(
                         seen=seen,
                         rules=rules,
                         dedup_config=dedup_config,
+                        config=config,
                         caps=caps,
                         template=template,
                         services_block=services_block,
@@ -507,6 +553,7 @@ async def _process_item(
     brand_timezone: str | None,
     now: datetime,
     embed,
+    config: Any = None,
 ) -> int | None:
     """Judge and store one feed item. Returns the candidate id it wrote.
 
@@ -650,9 +697,47 @@ async def _process_item(
                 matched=post.matched_candidate_id,
                 sim=round(post.similarity, 3),
             )
+            # NTS_131 P3 Ф2 — a second outlet on the same event is material,
+            # not waste. It joins the live candidate's cluster; before this it
+            # was dropped here and the article was written from one document.
+            if post.window == "live" and post.matched_candidate_id is not None:
+                _join_cluster(
+                    anchor=post.matched_candidate_id,
+                    item=item,
+                    url=url,
+                    source_record=source_record,
+                    input_kind=input_kind,
+                    similarity=post.similarity,
+                    stats=stats,
+                    config=config,
+                )
             return None
         if post.action == "supersede":
             supersedes_id = post.matched_candidate_id
+        elif post.action == "create":
+            # Not a near-duplicate — but possibly the same event reported
+            # differently: similar enough, and sharing identifiers.
+            from pipeline.selector.event_cluster import find_anchor
+
+            anchor = find_anchor(
+                brand_id_fk=brand_id_fk,
+                embedding=embedding,
+                text=f"{item.title} {item.summary or ''}",
+                live_threshold=dedup_config.threshold_live,
+                cluster_threshold=float(getattr(config, "cluster_threshold", 0.80)),
+            )
+            if anchor is not None:
+                if _join_cluster(
+                    anchor=anchor[0],
+                    item=item,
+                    url=url,
+                    source_record=source_record,
+                    input_kind=input_kind,
+                    similarity=anchor[1],
+                    stats=stats,
+                    config=config,
+                ):
+                    return None
 
     # --- daily cap (NTS_099 §5). Stored, not discarded.
     cap_overflow = False

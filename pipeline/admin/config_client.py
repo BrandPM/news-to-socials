@@ -136,7 +136,12 @@ class ConfigRecord:
     )
     depth_brief_min_facts: int = 4
     depth_article_min_facts: int = 10
-    depth_deep_min_facts: int = 10
+    depth_deep_min_facts: int = 11
+    # NTS_131 P3 Ф2 — deep from an event cluster; joining a cluster.
+    depth_deep_min_pairs: int = 1
+    depth_deep_min_sources: int = 2
+    cluster_threshold: float = 0.80
+    cluster_max_sources: int = 5
     monthly_spend_cap_usd: float = 150.0
     max_cost_per_candidate_usd: float = 5.0
     # Extended from the NTS_129 P2 audit (migration 033): personnel moves,
@@ -181,7 +186,7 @@ class ConfigRecord:
             "note": (300, 450),
             "brief": (300, 400),
             "article": (600, 900),
-            "deep": (1200, None),
+            "deep": (900, 1300),
         }
     )
     max_quote_words: Mapping[str, int] = MappingProxyType(
@@ -352,6 +357,18 @@ def _v3_keys(row: Any) -> dict[str, Any]:
         ),
         "depth_deep_min_facts": _int_or(
             getattr(row, "depth_deep_min_facts", None), d.depth_deep_min_facts
+        ),
+        "depth_deep_min_pairs": _int_or(
+            getattr(row, "depth_deep_min_pairs", None), d.depth_deep_min_pairs
+        ),
+        "depth_deep_min_sources": _int_or(
+            getattr(row, "depth_deep_min_sources", None), d.depth_deep_min_sources
+        ),
+        "cluster_threshold": _float_or(
+            getattr(row, "cluster_threshold", None), d.cluster_threshold
+        ),
+        "cluster_max_sources": _int_or(
+            getattr(row, "cluster_max_sources", None), d.cluster_max_sources
         ),
         "monthly_spend_cap_usd": _float_or(
             getattr(row, "monthly_spend_cap_usd", None), d.monthly_spend_cap_usd

@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -370,6 +370,9 @@ class SanityPostInput:
     # derived from the source RSS pubDate at draft creation. Drives the
     # published ``publishedAt`` on approve. None → publish falls back to now.
     display_date: str | None = None
+    # NTS_131 P3 Ф2 — every document the article rests on: the primary one,
+    # the event cluster, the research context. ``[{url,title,publisher,role}]``.
+    sources: Sequence[Mapping[str, str]] = ()
 
 
 class SanityPublisher:
@@ -447,6 +450,19 @@ class SanityPublisher:
             "topicId": post.topic_id,
             "generatedBy": "pipeline",
         }
+        if post.sources:
+            doc["sources"] = [
+                {
+                    "_key": hashlib.sha1(str(src.get("url", "")).encode()).hexdigest()[:12],
+                    "_type": "sourceRef",
+                    "url": str(src.get("url", "")),
+                    "title": str(src.get("title", "") or "")[:300],
+                    "publisher": str(src.get("publisher", "") or "")[:120],
+                    "role": str(src.get("role", "") or ""),
+                }
+                for src in post.sources
+                if src.get("url")
+            ]
 
         toc = extract_toc_from_body(body_pt)
         if toc:

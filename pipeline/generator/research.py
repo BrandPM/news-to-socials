@@ -47,7 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -164,11 +164,44 @@ class Fact:
     # figure, because reassembly is where a correct number becomes a wrong claim.
     value: str = ""
     unit: str = ""
+    # NTS_131 P3 Ф2 §6 — a 2-5 word caption for the figure. ``text`` is a whole
+    # sentence, and a whole sentence under a 34px number is what made the
+    # keyFigures cards unreadable. Written by research, the only step that
+    # knows what the number measures.
+    label: str = ""
+    # NTS_131 P3 Ф2 §2 — other cluster documents that state the same fact.
+    # A fact two sources agree on is confirmed; the writer may say so.
+    corroborated_by: tuple[str, ...] = ()
 
     def render(self) -> str:
         meta = " — ".join(x for x in (self.publisher, self.date) if x)
         tail = f"{self.url} — {meta}" if meta else self.url
-        return f"{self.text} ({tail})"
+        also = (
+            f" [also stated by: {', '.join(self.corroborated_by)}]"
+            if self.corroborated_by
+            else ""
+        )
+        return f"{self.text} ({tail}){also}"
+
+
+@dataclass(frozen=True)
+class Discrepancy:
+    """Two cluster sources that say different things about one point.
+
+    Kept as its own list rather than as two facts, because two contradicting
+    facts side by side read to the writer as two facts — and the article then
+    states both as true. A discrepancy is written as a discrepancy:
+    "X reports A, Y reports B".
+    """
+
+    point: str
+    claims: tuple[tuple[str, str, str], ...]  # (publisher, says, url)
+
+    def render(self) -> str:
+        sides = "; ".join(
+            f"{pub or url} says: {says} ({url})" for pub, says, url in self.claims
+        )
+        return f"{self.point} — {sides}"
 
 
 @dataclass(frozen=True)
@@ -187,6 +220,17 @@ class FactPack:
     citations: list[str] = field(default_factory=list)
     model: str = RESEARCH_MODEL
     searches: int = 0
+    discrepancies: list[Discrepancy] = field(default_factory=list)
+
+    @property
+    def source_urls(self) -> list[str]:
+        """Distinct documents the facts rest on — the cluster's breadth."""
+        seen: list[str] = []
+        for fact in [*self.source_facts, *self.context]:
+            for url in (fact.url, *fact.corroborated_by):
+                if url and url not in seen:
+                    seen.append(url)
+        return seen
 
     @property
     def fact_count(self) -> int:
@@ -214,6 +258,14 @@ class FactPack:
             lines.extend(f"  - {f.render()}" for f in self.context)
         else:
             lines.append("  (none)")
+        if self.discrepancies:
+            lines.append("")
+            lines.append(
+                "DISCREPANCIES (the sources disagree — write each one as a "
+                "disagreement, \"X reports A, while Y reports B\"; never pick "
+                "one side silently and never state both as fact):"
+            )
+            lines.extend(f"  - {d.render()}" for d in self.discrepancies)
         if self.angle_hints:
             lines.append("")
             lines.append("ANGLE HINTS (non-obvious for this readership):")
@@ -252,12 +304,23 @@ def fact_pack_from_dict(
             # have dropped.
             if not text or not url:
                 continue
+            # Every field the live path keeps, restored. Before NTS_131 only
+            # text/url/publisher/date came back, so a reused pack had lost the
+            # values and groups — and a retry could never reach ``deep`` or
+            # build a block that the first attempt could have.
             out.append(
                 Fact(
                     text=text,
                     url=url,
                     publisher=str(item.get("publisher") or ""),
                     date=str(item.get("date") or ""),
+                    comparable_group=str(item.get("comparable_group") or ""),
+                    value=str(item.get("value") or ""),
+                    unit=str(item.get("unit") or ""),
+                    label=str(item.get("label") or ""),
+                    corroborated_by=tuple(
+                        str(u) for u in list(item.get("corroborated_by") or []) if u
+                    ),
                 )
             )
         return out
@@ -268,6 +331,7 @@ def fact_pack_from_dict(
         angle_hints=[str(h) for h in list(stored.get("angle_hints") or [])],
         citations=[str(u) for u in list(stored.get("citations") or [])],
         searches=int(stored.get("searches") or 0),
+        discrepancies=_discrepancies(stored.get("discrepancies")),
     )
     return None if pack.is_empty() else pack
 
@@ -334,6 +398,50 @@ def _clean_text(value: Any, limit: int) -> str:
     return re.sub(r"\s+", " ", value).strip()[:limit]
 
 
+_MAX_LABEL_WORDS = 5
+
+
+def _short_label(value: Any) -> str:
+    """The 2-5 word caption, capitalised; longer answers are cut, not kept.
+
+    Capitalised here rather than in the renderer: the model writes captions in
+    lower case about half the time, and every consumer of the label would
+    otherwise have to remember to fix it.
+    """
+    text = _clean_text(value, 60).rstrip(".:;,")
+    if not text:
+        return ""
+    words = text.split()[:_MAX_LABEL_WORDS]
+    label = " ".join(words)
+    return label[:1].upper() + label[1:]
+
+
+def _discrepancies(raw: Any) -> list[Discrepancy]:
+    """``[{point, claims: [{publisher, says, url}]}]`` → discrepancies.
+
+    A side without a resolvable URL is dropped, and a discrepancy left with
+    fewer than two sides is not a discrepancy — the same URL rule as facts.
+    """
+    out: list[Discrepancy] = []
+    if not isinstance(raw, list):
+        return out
+    for entry in raw[:6]:
+        if not isinstance(entry, dict):
+            continue
+        point = _clean_text(entry.get("point"), 200)
+        sides: list[tuple[str, str, str]] = []
+        for side in list(entry.get("claims") or [])[:4]:
+            if not isinstance(side, dict):
+                continue
+            url = str(side.get("url") or "").strip()
+            says = _clean_text(side.get("says"), 300)
+            if says and is_resolvable_url(url):
+                sides.append((_clean_text(side.get("publisher"), 80), says, url))
+        if point and len(sides) >= 2:
+            out.append(Discrepancy(point=point, claims=tuple(sides)))
+    return out
+
+
 def _clean_facts(raw: Any, *, limit: int, bucket: str) -> tuple[list[Fact], int]:
     """Coerce a raw ``[{text,url,publisher,date}, ...]`` list into ``Fact``s.
 
@@ -376,6 +484,12 @@ def _clean_facts(raw: Any, *, limit: int, bucket: str) -> tuple[list[Fact], int]
                 comparable_group=_clean_text(entry.get("comparable_group"), 60),
                 value=_clean_text(entry.get("value"), 40),
                 unit=_clean_text(entry.get("unit"), 24),
+                label=_short_label(entry.get("label")),
+                corroborated_by=tuple(
+                    str(u).strip()
+                    for u in list(entry.get("corroborated_by") or [])[:4]
+                    if is_resolvable_url(u) and str(u).strip() != url
+                ),
             )
         )
         if len(out) >= limit:
@@ -389,6 +503,7 @@ def parse_fact_pack(
     budget: ResearchBudget,
     model: str = RESEARCH_MODEL,
     searches: int = 0,
+    documents: int = 1,
 ) -> FactPack | None:
     """Parse the model's JSON into a :class:`FactPack`, or ``None``.
 
@@ -414,11 +529,19 @@ def parse_fact_pack(
         log.warning("research.parse_failed", reason="not_an_object")
         return None
 
+    # A cluster of several documents holds more facts than one press release;
+    # capping it at the single-document limit would throw the cluster away
+    # again one stage later (NTS_131 P3 Ф2).
+    clustered = documents > 1
     source_facts, dropped_src = _clean_facts(
-        data.get("source_facts"), limit=budget.max_sources * 3, bucket="source_facts"
+        data.get("source_facts"),
+        limit=budget.max_sources * (5 if clustered else 3),
+        bucket="source_facts",
     )
     context, dropped_ctx = _clean_facts(
-        data.get("context"), limit=budget.max_sources, bucket="context"
+        data.get("context"),
+        limit=budget.max_sources * (2 if clustered else 1),
+        bucket="context",
     )
     dropped = dropped_src + dropped_ctx
 
@@ -476,6 +599,7 @@ def parse_fact_pack(
         citations=citations,
         model=model,
         searches=searches,
+        discrepancies=_discrepancies(data.get("discrepancies")),
     )
 
 
@@ -519,7 +643,11 @@ Return ONLY a JSON object, no prose and no code fence:
       "unit": "<EUR, %, days, … — empty if none>",
       "comparable_group": "<short label shared by facts that measure the SAME
        thing on a different jurisdiction, period or threshold, e.g.
-       'reporting threshold' — empty when this fact is comparable to nothing>"}}
+       'reporting threshold' — empty when this fact is comparable to nothing>",
+      "label": "<2-5 word caption for the figure, e.g. 'Maximum OFSI penalty'
+       — a name for the number, NOT a sentence; empty if the fact has no value>",
+      "corroborated_by": ["<URL of another supplied document stating the same
+       fact — empty list if only one document states it>"]}}
   ],
   "context": [
     {{"text": "<corroborating or background fact from another outlet>",
@@ -531,11 +659,15 @@ Return ONLY a JSON object, no prose and no code fence:
 and their advisers — second-order consequences, who is exposed, what changes \
 in practice>"
   ],
+  "discrepancies": [
+    {{"point": "<what the sources disagree about>",
+      "claims": [{{"publisher": "<who>", "says": "<what they say>", "url": "<URL>"}},
+                 {{"publisher": "<who>", "says": "<what they say>", "url": "<URL>"}}]}}
+  ],
   "citations": ["<every URL you used>"]
 }}
 
-Aim for 4-8 source_facts and 2-4 context entries when the material supports
-it. Return fewer rather than padding with vague statements.
+{volume_rule}
 
 ``comparable_group`` is what lets the article build a table or a chart later,
 so label honestly: two thresholds in different jurisdictions share a group,
@@ -550,7 +682,42 @@ Story to research.
 Title: {title}
 Source URL: {url}
 Summary: {summary}
-{document_block}"""
+{document_block}{cluster_block}"""
+
+_VOLUME_SINGLE = """\
+Aim for 4-8 source_facts and 2-4 context entries when the material supports
+it. Return fewer rather than padding with vague statements."""
+
+# NTS_131 P3 Ф2 — the pack is built across the whole event cluster. The volume
+# rule is what makes that real: with the single-document wording ("aim for
+# 4-8") the model stops at eight facts whether it was given one document or
+# five, and the cluster is thrown away inside the call.
+_VOLUME_CLUSTER = """\
+You were given {n_docs} documents about ONE event. Extract from ALL of them:
+aim for 12-20 source_facts in total when the documents hold them — every
+threshold, amount, percentage, date, deadline, named instrument and named
+party, from whichever document states it. Put each fact under the URL of the
+document that states it. When two documents state the same fact, list it ONCE
+and put the other document's URL in ``corroborated_by``. When two documents
+say DIFFERENT things about the same point (a different date, figure, scope or
+reading), do not pick one: record it in ``discrepancies``. Return fewer rather
+than padding with vague statements."""
+
+_CLUSTER_BLOCK = """\
+
+--- FURTHER DOCUMENTS ABOUT THE SAME EVENT (read all of them) ---
+{docs}
+--- END OF FURTHER DOCUMENTS ---
+"""
+
+_CLUSTER_DOC = """\
+[{n}] {role} — {publisher}
+URL: {url}
+Title: {title}
+Read on: {as_of}
+
+{text}
+"""
 
 # NTS_101 §2-7 / NTS_123 S5 — when a primary document was fetched it goes in
 # FIRST and web_search is demoted to context. The reason is named in the
@@ -563,6 +730,18 @@ date, threshold and definition from it, quoting its own wording, and cite it by
 the document URL. Use web_search ONLY to add what the document does not contain
 — reaction, context, prior versions, market detail. If the document and a
 search result disagree, the document wins and the disagreement is not a fact.\
+"""
+
+_DOCUMENT_RULE_CLUSTER = """\
+A PRIMARY DOCUMENT and FURTHER DOCUMENTS about the same event are supplied
+below. They are your material; read every one of them before you search. The
+primary document is the authority on what the act itself says — its figures,
+dates, thresholds and definitions, in its own wording. The further documents
+add what it does not say: other regulators' positions, practitioners' reading,
+the numbers the press release left out. Cite each fact by the URL of the
+document it came from. Use web_search ONLY for what none of the documents
+contains. Where a further document contradicts the primary one, record a
+discrepancy; do not resolve it yourself.\
 """
 
 _DOCUMENT_RULE_NO_DOC = """\
@@ -685,6 +864,7 @@ async def build_fact_pack(
     client: Any = None,
     model: str = RESEARCH_MODEL,
     document: PrimaryDocument | None = None,
+    cluster: Sequence[Any] = (),
 ) -> FactPack | None:
     """Research ``topic`` and return a grounded fact pack.
 
@@ -715,10 +895,21 @@ async def build_fact_pack(
             return None
         client = AsyncOpenAI(api_key=api_key)
 
+    # ``cluster`` is the event's other documents (NTS_131 P3 Ф2) — objects
+    # with url/publisher/role/title/text/as_of, i.e. ``ClusterDocument``.
+    cluster = [c for c in cluster if getattr(c, "text", "")]
+    n_docs = len(cluster) + (1 if document is not None else 0)
+    if cluster and document is not None:
+        rule = _DOCUMENT_RULE_CLUSTER
+    elif document is not None:
+        rule = _DOCUMENT_RULE_WITH_DOC
+    else:
+        rule = _DOCUMENT_RULE_NO_DOC
     instructions = _RESEARCH_INSTRUCTIONS.format(
         max_sources=budget.max_sources,
-        document_rule=(
-            _DOCUMENT_RULE_WITH_DOC if document else _DOCUMENT_RULE_NO_DOC
+        document_rule=rule,
+        volume_rule=(
+            _VOLUME_CLUSTER.format(n_docs=n_docs) if n_docs > 1 else _VOLUME_SINGLE
         ),
     )
     document_block = ""
@@ -729,11 +920,30 @@ async def build_fact_pack(
             sections=", ".join(document.sections_used) or "(whole document)",
             doc_text=document.text,
         )
+    cluster_block = ""
+    if cluster:
+        cluster_block = _CLUSTER_BLOCK.format(
+            docs="\n".join(
+                _CLUSTER_DOC.format(
+                    n=i,
+                    role=(
+                        "OFFICIAL" if getattr(c, "role", "") == "primary" else "COMMENTARY / PRESS"
+                    ),
+                    publisher=getattr(c, "publisher", "") or "(unknown)",
+                    url=getattr(c, "url", ""),
+                    title=getattr(c, "title", "") or "",
+                    as_of=getattr(c, "as_of", "") or "unknown",
+                    text=getattr(c, "text", ""),
+                )
+                for i, c in enumerate(cluster, start=1)
+            )
+        )
     payload = _RESEARCH_INPUT.format(
         title=topic.raw.title,
         url=str(topic.raw.url),
         summary=(topic.raw.summary or "")[:1000],
         document_block=document_block,
+        cluster_block=cluster_block,
     )
 
     for attempt in range(1, _RESEARCH_ATTEMPTS + 1):
@@ -778,6 +988,7 @@ async def build_fact_pack(
             budget=budget,
             model=model,
             searches=searches,
+            documents=n_docs,
         )
         if pack is not None:
             break
@@ -802,5 +1013,7 @@ async def build_fact_pack(
         context=len(pack.context),
         citations=len(pack.citations),
         searches=searches,
+        documents=n_docs,
+        discrepancies=len(pack.discrepancies),
     )
     return pack

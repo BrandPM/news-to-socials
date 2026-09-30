@@ -779,6 +779,122 @@ class DocumentMissing(RuntimeError):  # noqa: N818 — a verdict, not a crash
     """
 
 
+def _source_material(primary: Any, cluster_docs: Sequence[Any]) -> str:
+    """The primary document and every cluster document, labelled by URL."""
+    parts: list[str] = []
+    if primary is not None:
+        parts.append(f"[PRIMARY] {primary.url}\n{primary.text}")
+    for doc in cluster_docs:
+        parts.append(
+            f"[{'OFFICIAL' if doc.role == 'primary' else 'COMMENTARY'}] "
+            f"{doc.publisher or ''} {doc.url}\n{doc.text}"
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+def _article_sources(
+    *,
+    primary_url: str,
+    primary_title: str,
+    cluster_docs: Sequence[Any],
+    fact_pack: Any,
+) -> list[dict[str, str]]:
+    """``sources[]`` for the Sanity doc: every document the article rests on.
+
+    The primary document, then the cluster documents that were read, then any
+    other URL a fact in the pack was taken from (web-search context). Ordered
+    and de-duplicated, so the editor reads the provenance in order of weight.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(url: str, title: str, publisher: str, role: str) -> None:
+        if url and url not in seen:
+            seen.add(url)
+            out.append(
+                {"url": url, "title": title, "publisher": publisher, "role": role}
+            )
+
+    _add(primary_url, primary_title, "", "primary")
+    for doc in cluster_docs:
+        _add(doc.url, doc.title, doc.publisher, doc.role)
+    if fact_pack is not None:
+        by_url = {
+            f.url: f.publisher
+            for f in [*fact_pack.source_facts, *fact_pack.context]
+        }
+        for url in getattr(fact_pack, "source_urls", []) or []:
+            _add(url, "", by_url.get(url, ""), "context")
+    return out
+
+
+# NTS_131 P3 Ф1 — "цикл исправления до нуля непокрытых, максимум 2 итерации".
+ATTRIBUTION_MAX_REPAIRS = 2
+
+
+async def _attribute_until_clean(
+    *,
+    en_draft: Any,
+    brand: Any,
+    fact_pack: Any,
+    document_text: str,
+    license_class: str | None,
+    config: Any,
+    candidate_id: int,
+) -> tuple[Any, Any, int]:
+    """Check, repair, re-check — until clean or out of cycles.
+
+    Returns ``(report, draft, repair_cycles)``. The report is always the one
+    for the draft that is returned, so what the review card shows is what the
+    editor reads. An unchecked report (the check itself failed) stops the loop
+    at once: repairing against a verdict that does not exist is a rewrite with
+    no instruction.
+    """
+    from pipeline.generator.composition import check_attribution
+
+    model = str(getattr(config, "attribution_model", "gpt-4o-mini"))
+
+    async def _check(draft: Any) -> Any:
+        return await check_attribution(
+            body=f"{draft.title}\n\n{draft.body}",
+            fact_pack=fact_pack,
+            document_text=document_text,
+            license_class=license_class,
+            max_quote_words=getattr(config, "max_quote_words", {}),
+            model=model,
+        )
+
+    report = await _check(en_draft)
+    repairs = 0
+    while report.checked and report.needs_fix and repairs < ATTRIBUTION_MAX_REPAIRS:
+        repairs += 1
+        log.info(
+            "production.attribution_repair",
+            candidate_id=candidate_id,
+            cycle=repairs,
+            **report.counts(),
+        )
+        writer = _writer_for(brand)
+        en_draft = await writer.repair_attribution(
+            en_draft,
+            report.fix_instructions(),
+            Language.en,
+            sources=_repair_sources(fact_pack, document_text),
+        )
+        report = await _check(en_draft)
+    return report, en_draft, repairs
+
+
+def _repair_sources(fact_pack: Any, document_text: str) -> str:
+    """What the repair may rewrite onto: the pack, then the documents."""
+    parts: list[str] = []
+    if fact_pack is not None and not fact_pack.is_empty():
+        parts.append("FACT PACK\n" + fact_pack.render())
+    if document_text:
+        parts.append("DOCUMENTS\n" + document_text[:30000])
+    return "\n\n".join(parts)
+
+
 async def produce_candidate(
     *,
     candidate_id: int,
@@ -808,7 +924,6 @@ async def produce_candidate(
         Plan,
         build_data_blocks,
         build_plan,
-        check_attribution,
         compute_depth_final,
         depth_guidance,
     )
@@ -865,6 +980,8 @@ async def produce_candidate(
     doc_budget = FetchBudget.from_config(config)
     primary_document: PrimaryDocument | None = None
     doc_sections: list[str] = []
+    # NTS_131 P3 Ф2 — the event's other documents, read with the primary one.
+    cluster_docs: list[Any] = []
 
     # Every paid call from here down is charged to THIS candidate — the
     # production path is the one that knows the id before it spends anything,
@@ -928,6 +1045,19 @@ async def produce_candidate(
                 cached=document.from_cache,
             )
 
+            # --- the rest of the event cluster (NTS_131 P3 Ф2) ------------
+            # The anchor's document is the requirement; the cluster is what
+            # turns six facts into fifteen. A source that cannot be read is
+            # skipped, never fatal.
+            from pipeline.selector.event_cluster import gather_documents
+
+            cluster_docs = await gather_documents(
+                anchor_candidate_id=candidate_id,
+                headline=snapshot.source_title,
+                budget=doc_budget,
+                max_sources=int(getattr(config, "cluster_max_sources", 5) or 0),
+            )
+
         # --- research: reuse before buying (NTS_100 §4) -------------------
         stored = load_latest_fact_pack(candidate_id)
         fact_pack = None
@@ -944,11 +1074,15 @@ async def produce_candidate(
                     facts=fact_pack.fact_count,
                 )
         if fact_pack is None and stages["research"]:
+            research_kwargs: dict[str, Any] = {}
+            if cluster_docs:
+                research_kwargs["cluster"] = cluster_docs
             fact_pack = await build_fact_pack_for_topic(
                 topic,
                 research_enabled=bool(getattr(config, "research_enabled", True)),
                 budget=ResearchBudget.from_config(config),
                 document=primary_document,
+                **research_kwargs,
             )
             fact_pack_id = persist_fact_pack(
                 brand_id_fk=brand_id_fk,
@@ -978,7 +1112,9 @@ async def produce_candidate(
             fact_pack,
             brief_min_facts=int(getattr(config, "depth_brief_min_facts", 4)),
             article_min_facts=int(getattr(config, "depth_article_min_facts", 10)),
-            deep_min_facts=int(getattr(config, "depth_deep_min_facts", 10)),
+            deep_min_facts=int(getattr(config, "depth_deep_min_facts", 11)),
+            deep_min_pairs=int(getattr(config, "depth_deep_min_pairs", 1)),
+            deep_min_sources=int(getattr(config, "depth_deep_min_sources", 2)),
         )
         targets = dict(getattr(config, "depth_length_targets", {}) or {})
         guidance = depth_guidance(decision.depth, targets, decision)
@@ -1039,6 +1175,10 @@ async def produce_candidate(
         )
         display_date_iso = display_date_val.isoformat()
 
+        # Everything the article may rest on, for the attribution check and
+        # its repair: the primary document first, then the cluster.
+        source_material = _source_material(primary_document, cluster_docs)
+
         # --- the EN canon, from the plan (NTS_102 v2) ---------------------
         en_draft = await generate_draft_for_language(
             topic,
@@ -1060,43 +1200,33 @@ async def produce_candidate(
         # The whole reason this stage sits here: NTS_096's reference case is a
         # right number attached to a wrong claim, which every other defence
         # passes. Checked after translation it would be bought four times.
-        report = await check_attribution(
-            body=f"{en_draft.title}\n\n{en_draft.body}",
+        #
+        # NTS_131 P3 Ф1: the target is zero distorted AND zero uncovered. An
+        # uncovered claim no longer reaches the text with a badge on it — the
+        # repair either rewrites it onto a sourced fact or turns it into an
+        # open question in move 5. At most ``ATTRIBUTION_MAX_REPAIRS`` cycles;
+        # what survives them goes to review flagged, never silently.
+        report, en_draft, repairs = await _attribute_until_clean(
+            en_draft=en_draft,
+            brand=brand,
             fact_pack=fact_pack,
-            document_text=primary_document.text if primary_document else "",
+            document_text=source_material,
             license_class=snapshot.license_class,
-            max_quote_words=getattr(config, "max_quote_words", {}),
-            model=str(getattr(config, "attribution_model", "gpt-4o-mini")),
+            config=config,
+            candidate_id=candidate_id,
         )
-        if report.needs_fix:
-            # Exactly one cycle (NTS_102 v2 §2). A second would be a loop with
-            # a model on both ends of it.
-            log.info(
-                "production.attribution_repair",
-                candidate_id=candidate_id,
-                **report.counts(),
-            )
-            writer = _writer_for(brand)
-            en_draft = await writer.repair_attribution(
-                en_draft, report.fix_instructions(), Language.en
-            )
-            report = await check_attribution(
-                body=f"{en_draft.title}\n\n{en_draft.body}",
-                fact_pack=fact_pack,
-                document_text=primary_document.text if primary_document else "",
-                license_class=snapshot.license_class,
-                max_quote_words=getattr(config, "max_quote_words", {}),
-                model=str(getattr(config, "attribution_model", "gpt-4o-mini")),
-            )
-        needs_attention = bool(report.distorted or report.flagged)
+        needs_attention = not report.clean if report.checked else False
         if fact_pack_id is not None:
-            _store_attribution(fact_pack_id, report.as_dict())
+            _store_attribution(
+                fact_pack_id, {**report.as_dict(), "repair_cycles": repairs}
+            )
         if needs_attention:
-            # The draft is still created — the check advises, it does not block
-            # (NTS_096 §C) — but the review card opens on these claims.
+            # The draft is still created — review decides — but the card opens
+            # on the claims two repair cycles could not fix.
             log.warning(
                 "production.needs_attention",
                 candidate_id=candidate_id,
+                repair_cycles=repairs,
                 **report.counts(),
             )
         _store_needs_attention(candidate_id=candidate_id, value=needs_attention)
@@ -1142,6 +1272,13 @@ async def produce_candidate(
             for language, draft in drafts
         ]
 
+        article_sources = _article_sources(
+            primary_url=primary_doc_url or str(topic.raw.url),
+            primary_title=topic.raw.title,
+            cluster_docs=cluster_docs,
+            fact_pack=fact_pack,
+        )
+
         # ``--tag`` marks the DRAFT's title, not the news peg's: the article
         # title is written by the model from the peg, so tagging the peg put
         # the mark somewhere the operator never sees. On the title it reaches
@@ -1158,6 +1295,7 @@ async def produce_candidate(
                 cover_image_asset_id=asset_id,
                 cover_image_alt=draft.title[:120],
                 display_date=display_date_iso,
+                sources=article_sources,
             )
             for language, draft in drafts
         ]
@@ -1205,35 +1343,6 @@ async def produce_candidate(
         if fact_pack_id is not None:
             _attach_fact_pack_to_draft(fact_pack_id, canonical_id)
 
-        # --- the judge, in the real loop at last (NTS_080, S10) -----------
-        # Advisory and after the draft exists, so a dead judge cannot block a
-        # publication. It reads the fact pack as well as the body: NTS_092
-        # established that withholding the pack makes every researched figure
-        # read as invented, and the judge would then flag the pipeline for
-        # doing exactly what it was asked.
-        try:
-            from pipeline.admin.judge import score_draft
-
-            source_text = f"{topic.raw.title}\n{topic.raw.summary or ''}"
-            if fact_pack is not None and not fact_pack.is_empty():
-                source_text = (
-                    f"{source_text}\n\n--- WEB RESEARCH FACT PACK "
-                    f"(also authoritative) ---\n{fact_pack.render()}"
-                )
-            await score_draft(
-                draft_id=canonical_id,
-                lang=Language.en.value,
-                draft_text=f"{en_draft.title}\n\n{en_draft.body}",
-                eval_enabled=bool(getattr(config, "eval_enabled", True)),
-                eval_threshold=float(getattr(config, "eval_threshold", 7.0)),
-                source_text=source_text,
-                voice_profile_yaml=getattr(brand, "voice_profile_yaml", "") or "",
-                brand_id_fk=brand_id_fk,
-                run_id=run_id,
-            )
-        except Exception:
-            log.exception("production.judge_failed", candidate_id=candidate_id)
-
         cap = float(getattr(config, "max_cost_per_candidate_usd", 0.0) or 0.0)
         if exceeds_cost_cap(candidate_id, cap):
             # After the fact by construction — the spend is only knowable once
@@ -1254,6 +1363,15 @@ async def produce_candidate(
         "languages": [lang.value for lang, _ in drafts],
         "title": posts[0].title if posts else None,
         "thin": fact_pack is None,
+        # NTS_131 P3 Ф5 — what the report table is built from.
+        "depth": decision.depth,
+        "n_facts": decision.n_facts,
+        "n_sources": len(article_sources),
+        "cluster_docs": len(cluster_docs),
+        "words_en": len(en_draft.body.split()),
+        "attribution": report.counts() if report.checked else None,
+        "repair_cycles": repairs,
+        "needs_attention": needs_attention,
     }
 
 

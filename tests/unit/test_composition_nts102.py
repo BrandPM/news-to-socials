@@ -93,7 +93,7 @@ def test_twelve_facts_without_pairs_is_an_article_not_a_deep():
     assert decision.depth == "article"
     assert decision.n_facts == 12
     assert decision.n_pairs == 0
-    assert "no table" in decision.reason
+    assert "comparable pair" in decision.reason
 
 
 def test_facts_and_pairs_together_make_a_deep():
@@ -106,12 +106,34 @@ def test_facts_and_pairs_together_make_a_deep():
         )
         for n in range(1, 5)
     ] + [
-        _fact(f"Rule {n} applies from 1 January 2027", value=str(n))
+        # NTS_131 P3 Ф2 — deep is a property of the event: the facts come from
+        # a second document of the cluster, not from the press release alone.
+        _fact(
+            f"Rule {n} applies from 1 January 2027",
+            value=str(n),
+            url="https://www.lenzstaehelin.com/alert",
+        )
         for n in range(8)
     ]
     decision = comp.compute_depth_final(_pack(facts))
     assert decision.depth == "deep"
     assert decision.n_pairs >= 2
+    assert decision.n_sources == 2
+
+
+def test_the_same_facts_from_one_document_stop_at_article():
+    facts = [
+        _fact(
+            f"The threshold in country {n} is EUR {n}m",
+            value=str(n),
+            unit="EUR",
+            comparable_group="reporting threshold",
+        )
+        for n in range(1, 13)
+    ]
+    decision = comp.compute_depth_final(_pack(facts))
+    assert decision.depth == "article"
+    assert "source document" in decision.reason
 
 
 def test_a_thin_pack_is_a_note():

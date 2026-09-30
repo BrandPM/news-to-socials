@@ -108,8 +108,14 @@ def test_deep_still_needs_its_pairs_and_demotes_to_article_not_brief() -> None:
         _pack(12, pairs=0), brief_min_facts=4, article_min_facts=10, deep_min_facts=10
     )
     assert decision.depth == "article"
+    # One document is enough here: the source-breadth rule of NTS_131 P3 has
+    # its own tests, and this one pins the pairs rule alone.
     decision = compute_depth_final(
-        _pack(12, pairs=2), brief_min_facts=4, article_min_facts=10, deep_min_facts=10
+        _pack(12, pairs=2),
+        brief_min_facts=4,
+        article_min_facts=10,
+        deep_min_facts=10,
+        deep_min_sources=0,
     )
     assert decision.depth == "deep"
 

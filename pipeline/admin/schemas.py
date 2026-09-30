@@ -268,6 +268,10 @@ class PipelineConfigOut(BaseModel):
     depth_brief_min_facts: int
     depth_article_min_facts: int
     depth_deep_min_facts: int
+    depth_deep_min_pairs: int = 1
+    depth_deep_min_sources: int = 2
+    cluster_threshold: float = 0.80
+    cluster_max_sources: int = 5
     # Spend kill-switch
     monthly_spend_cap_usd: float
     max_cost_per_candidate_usd: float
@@ -392,6 +396,10 @@ class PipelineConfigUpdate(BaseModel):
     depth_brief_min_facts: int | None = Field(default=None, ge=1, le=100)
     depth_article_min_facts: int | None = Field(default=None, ge=1, le=100)
     depth_deep_min_facts: int | None = Field(default=None, ge=1, le=200)
+    depth_deep_min_pairs: int | None = Field(default=None, ge=0, le=20)
+    depth_deep_min_sources: int | None = Field(default=None, ge=1, le=10)
+    cluster_threshold: float | None = Field(default=None, ge=0.5, le=1.0)
+    cluster_max_sources: int | None = Field(default=None, ge=0, le=12)
     monthly_spend_cap_usd: float | None = Field(default=None, ge=0.0, le=100000.0)
     max_cost_per_candidate_usd: float | None = Field(default=None, ge=0.0, le=1000.0)
     prefilter_deny_title_patterns: list[str] | None = None

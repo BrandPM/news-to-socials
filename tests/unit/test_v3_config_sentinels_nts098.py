@@ -92,7 +92,13 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
     # the space underneath it. Four facts never supported 600-900 words.
     ("depth_brief_min_facts", 4, 3),
     ("depth_article_min_facts", 10, 6),
-    ("depth_deep_min_facts", 10, 14),
+    # NTS_131 P3 Ф2 — deep is reached from an event cluster: 11 facts, one
+    # value-bearing pair, two documents.
+    ("depth_deep_min_facts", 11, 14),
+    ("depth_deep_min_pairs", 1, 3),
+    ("depth_deep_min_sources", 2, 4),
+    ("cluster_threshold", 0.80, 0.85),
+    ("cluster_max_sources", 5, 3),
     # --- spend kill-switch (NTS_106 §3)
     ("monthly_spend_cap_usd", 150.0, 220.0),
     ("max_cost_per_candidate_usd", 5.0, 8.5),
@@ -166,7 +172,7 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
             "note": (300, 450),
             "brief": (300, 400),
             "article": (600, 900),
-            "deep": (1200, None),
+            "deep": (900, 1300),
         },
         {"note": [200, 300], "article": [700, 1000], "deep": [1500, None]},
     ),
@@ -272,8 +278,9 @@ def test_every_v3_column_has_a_sentinel() -> None:
     )
     # 25 from 020, three mode flags (022 + 026), rank weights (026), the five
     # document budgets (027) the four composition
-    # keys (028), the cover mode (030) and the brief depth floor (034).
-    assert len(_SENTINELS) == 41
+    # keys (028), the cover mode (030), the brief depth floor (034) and the
+    # four event-cluster keys (039).
+    assert len(_SENTINELS) == 45
 
 
 # --- default reaches the runtime -----------------------------------------

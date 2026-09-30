@@ -73,7 +73,6 @@ from pipeline.publisher.sanity import (
 from pipeline.generator.fact_pack_store import persist_fact_pack
 from pipeline.selector.candidate_lifecycle import link_candidate_to_draft
 from pipeline.selector.dedup import extract_entities
-from pipeline.admin.judge import score_draft
 from pipeline.selector.dedup_service import (
     EMBED_USD_PER_1M,
     DedupEngine,
@@ -406,6 +405,7 @@ async def build_fact_pack_for_topic(
     research_enabled: bool = True,
     budget: ResearchBudget | None = None,
     document: Any = None,
+    cluster: Sequence[Any] = (),
 ) -> FactPack | None:
     """Research ``topic`` on the web, ONCE per topic (NTS_092).
 
@@ -423,7 +423,11 @@ async def build_fact_pack_for_topic(
     # ``document`` is the S5 seam (NTS_101 §2-7): the v2 path has none and
     # passes None, the production path passes the fetched primary document and
     # research is then grounded in it rather than in a headline.
-    return await build_fact_pack(topic, budget=budget, document=document)
+    # ``cluster`` (NTS_131 P3 Ф2): the event's other documents; the pack is
+    # built across all of them.
+    return await build_fact_pack(
+        topic, budget=budget, document=document, cluster=cluster
+    )
 
 
 def _fact_pack_as_dict(pack: FactPack | None) -> dict[str, object]:
@@ -436,13 +440,21 @@ def _fact_pack_as_dict(pack: FactPack | None) -> dict[str, object]:
     if pack is None:
         return {"empty": True, "reason": "no_fact_pack"}
 
-    def _facts(items: Sequence[Any]) -> list[dict[str, str]]:
+    def _facts(items: Sequence[Any]) -> list[dict[str, Any]]:
+        # Every field, not just the four the prose uses: the values and groups
+        # are what depth and the data blocks are computed from, and a pack
+        # stored without them could never be reused for either (NTS_131 P3).
         return [
             {
                 "text": f.text,
                 "url": f.url,
                 "publisher": f.publisher,
                 "date": f.date,
+                "comparable_group": f.comparable_group,
+                "value": f.value,
+                "unit": f.unit,
+                "label": f.label,
+                "corroborated_by": list(f.corroborated_by),
             }
             for f in items
         ]
@@ -453,6 +465,17 @@ def _fact_pack_as_dict(pack: FactPack | None) -> dict[str, object]:
         "context": _facts(pack.context),
         "angle_hints": list(pack.angle_hints),
         "citations": list(pack.citations),
+        "discrepancies": [
+            {
+                "point": d.point,
+                "claims": [
+                    {"publisher": pub, "says": says, "url": url}
+                    for pub, says, url in d.claims
+                ],
+            }
+            for d in pack.discrepancies
+        ],
+        "source_urls": pack.source_urls,
         "searches": pack.searches,
         "fact_count": pack.fact_count,
     }
@@ -744,8 +767,6 @@ async def _process_source(
     dedup_enabled: bool = True,
     dedup_threshold: float = 0.85,
     dedup_window_days: int = 7,
-    eval_enabled: bool = True,
-    eval_threshold: float = 7.0,
     images_on_demand: bool = False,
     research_enabled: bool = True,
     research_budget: ResearchBudget | None = None,
@@ -1056,41 +1077,6 @@ async def _process_source(
                         status="passed",
                         draft_id=draft_id,
                         language=language.value,
-                    )
-                    # ---- LLM-JUDGE EVAL (NTS_091): score the draft before the
-                    # manager sees it. EN gets the full rubric (vs the source);
-                    # non-EN gets the reduced rubric (vs the EN canon). FAILS
-                    # OPEN — score_draft never raises, so a dead judge cannot
-                    # block creation/publishing.
-                    if language == Language.en:
-                        # NTS_092 — the fact pack is part of the source of
-                        # truth now, not an extra. The factuality axis scores
-                        # "every claim is present in or supported by the
-                        # SOURCE"; withholding the pack would make every
-                        # researched figure read as invented and flag every
-                        # article needs_attention for doing exactly what this
-                        # task asked of it.
-                        _src = f"{topic.raw.title}\n{topic.raw.summary or ''}"
-                        if fact_pack is not None and not fact_pack.is_empty():
-                            _src = (
-                                f"{_src}\n\n--- WEB RESEARCH FACT PACK "
-                                f"(also authoritative) ---\n{fact_pack.render()}"
-                            )
-                        _en_text = ""
-                    else:
-                        _src = ""
-                        _en_text = en_draft.body if en_draft else ""
-                    await score_draft(
-                        draft_id=draft_id,
-                        lang=language.value,
-                        draft_text=f"{draft.title}\n\n{draft.body}",
-                        eval_enabled=eval_enabled,
-                        eval_threshold=eval_threshold,
-                        source_text=_src,
-                        en_text=_en_text,
-                        voice_profile_yaml=brand.voice_profile_yaml or "",
-                        brand_id_fk=brand_id_fk,
-                        run_id=run_id,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.error(
@@ -1407,9 +1393,6 @@ async def run_pipeline(
     dedup_enabled = getattr(config, "dedup_enabled", True)
     dedup_threshold = getattr(config, "dedup_threshold", 0.85)
     dedup_window_days = getattr(config, "dedup_window_days", 7)
-    # NTS_091 — LLM-judge eval config (fail-open defaults if row predates cols).
-    eval_enabled = getattr(config, "eval_enabled", True)
-    eval_threshold = getattr(config, "eval_threshold", 7.0)
     # NTS_094 — cover-on-demand. Fail-safe default False: an unknown/legacy
     # config keeps generating covers, so the flag can only ever REMOVE spend
     # deliberately, never silently.
@@ -1452,8 +1435,6 @@ async def run_pipeline(
                     dedup_enabled=dedup_enabled,
                     dedup_threshold=dedup_threshold,
                     dedup_window_days=dedup_window_days,
-                    eval_enabled=eval_enabled,
-                    eval_threshold=eval_threshold,
                     images_on_demand=images_on_demand,
                     research_enabled=research_enabled,
                     research_budget=research_budget,

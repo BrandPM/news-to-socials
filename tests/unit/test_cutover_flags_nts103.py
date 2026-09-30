@@ -34,7 +34,12 @@ import pytest
 from cryptography.fernet import Fernet
 
 from pipeline.admin import db as admin_db
-from pipeline.admin.models import Candidate, PipelineConfig, Run
+from pipeline.admin.models import (
+    DEPRECATED_CONFIG_COLUMNS,
+    Candidate,
+    PipelineConfig,
+    Run,
+)
 from pipeline.common import config as config_module
 from tests.unit.conftest import seed_icon_brand
 
@@ -49,7 +54,6 @@ CUTOVER_FLAGS: tuple[tuple[str, object, str], ...] = (
     ("production_enabled", False, "S4 / migration 026"),
     ("data_blocks_enabled", False, "S6 / migration 028"),
     ("cover_mode", "flux", "S9 / migration 030"),
-    ("eval_enabled", True, "NTS_091, judge — S10 puts it in the real loop"),
 )
 
 
@@ -128,6 +132,9 @@ def test_every_mode_flag_in_the_config_is_listed_here():
     # ``dedup_enabled`` and ``research_enabled`` are v2 tunables, not cutover
     # steps: they change how a stage behaves, not whether a contour runs.
     mode_flags -= {"dedup_enabled", "research_enabled", "images_on_demand"}
+    # ``eval_enabled`` was the judge's switch. The judge is gone (NTS_131 P3
+    # Ф1); the column is kept, marked deprecated, so its history stays readable.
+    mode_flags -= set(DEPRECATED_CONFIG_COLUMNS)
     listed = {name for name, _default, _origin in CUTOVER_FLAGS}
     assert mode_flags == listed, (
         f"flag(s) with no switch-off test: {sorted(mode_flags - listed)}; "
@@ -219,26 +226,6 @@ def test_cover_mode_flux_is_the_pre_s9_behaviour(db):
     assert AdminConfigClient(brand_slug="icon").get_config().cover_mode == "flux"
     _set(db, cover_mode="data")
     assert AdminConfigClient(brand_slug="icon").get_config().cover_mode == "data"
-
-
-async def test_the_judge_off_writes_no_score(db):
-    """NTS_080 — the judge advises; with it off nothing is scored and nothing
-    fails. S10 is where it enters the real loop, still behind this flag."""
-    from pipeline.admin.judge import score_draft
-    from pipeline.admin.models import DraftScore
-
-    result = await score_draft(
-        draft_id="drafts.x-en",
-        lang="en",
-        draft_text="body",
-        eval_enabled=False,
-        eval_threshold=7.0,
-        source_text="src",
-        brand_id_fk=db,
-    )
-    assert result is None
-    with admin_db.get_session_factory()() as session:
-        assert session.query(DraftScore).count() == 0
 
 
 # --------------------------------------------------------------------------

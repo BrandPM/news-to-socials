@@ -267,7 +267,7 @@ _DEPTH_LENGTH_TARGETS = json.dumps(
         "note": [300, 450],
         "brief": [300, 400],
         "article": [600, 900],
-        "deep": [1200, None],
+        "deep": [900, 1300],
     }
 )
 
@@ -312,9 +312,10 @@ class PipelineConfig(Base):
     dedup_window_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=7, server_default="7"
     )
-    # NTS_091 — LLM-judge eval (editable from Settings, no deploy).
-    #   eval_enabled    master switch (eval fails OPEN regardless).
-    #   eval_threshold  weighted total below this → draft flagged needs_attention.
+    # DEPRECATED (NTS_131 P3 Ф1, migration 038) — the LLM judge of NTS_091.
+    # The judge is removed from every run; nothing reads these two any more.
+    # Kept, not dropped, so the history of draft_scores still says under which
+    # threshold a row was flagged. See ``DEPRECATED_CONFIG_COLUMNS``.
     eval_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=text("1")
     )
@@ -446,7 +447,30 @@ class PipelineConfig(Base):
         Integer, nullable=False, default=10, server_default="10"
     )
     depth_deep_min_facts: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=10, server_default="10"
+        Integer, nullable=False, default=11, server_default="11"
+    )
+    # NTS_131 P3 Ф2 — ``deep`` is reachable from an event cluster. It used to
+    # need two comparable pairs counted on facts that carried a figure OR a
+    # date, while blocks were built only from facts with a ``value``: the two
+    # halves disagreed, so ``deep`` promised tables nothing could build. Now
+    # both count value-bearing facts, one pair is enough for a keyFigures
+    # block, and the facts must come from at least two documents — the depth
+    # is a property of the event, not of one press release.
+    depth_deep_min_pairs: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    depth_deep_min_sources: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, server_default="2"
+    )
+    # NTS_131 P3 Ф2 — joining an item to an existing event cluster. Lower than
+    # ``dedup_threshold_live`` on purpose: two outlets on one decision are not
+    # near-duplicates of each other, so similarity alone is not enough and the
+    # match also needs shared identifiers (see ``event_cluster.same_event``).
+    cluster_threshold: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.80, server_default="0.80"
+    )
+    cluster_max_sources: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default="5"
     )
 
     # --- Spend kill-switch (NTS_106 §3). At 80% of the monthly cap an alert
@@ -1000,13 +1024,40 @@ class DedupLog(Base):
     )
 
 
-class DraftScore(Base):
-    """**v2 legacy, read-only.** LLM-as-judge score per draft+language (NTS_091).
+# NTS_131 P3 Ф1 — config columns that are kept for their history but have no
+# reader. Listed in ``deprecated_columns`` by migration 038 as well; this tuple
+# is the code-side copy the tests use to keep mode-flag bookkeeping honest.
+DEPRECATED_CONFIG_COLUMNS: tuple[str, ...] = ("eval_enabled", "eval_threshold")
 
-    Written by ``judge.score_draft``, whose only caller is ``pipeline.run`` —
-    so no new row appears while ``v2_generation_enabled`` is off. Still read by
-    ``GET /eval/summary`` and the drafts list. NTS_114 S10 puts the judge into
-    the real v3 cycle (NTS_080); until then this is history.
+
+class DeprecatedColumn(Base):
+    """A column (or, with ``column_name='*'``, a table) kept but unread.
+
+    SQLite has no column comments, and dropping data is not what "deprecated"
+    means here: the rows are the record of what the removed feature did. So the
+    marker is a row, written by the migration that retired the feature.
+    """
+
+    __tablename__ = "deprecated_columns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    table_name: Mapped[str] = mapped_column(String, nullable=False)
+    column_name: Mapped[str] = mapped_column(String, nullable=False)
+    deprecated_in: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("table_name", "column_name", name="uq_deprecated_columns"),
+    )
+
+
+class DraftScore(Base):
+    """**Deprecated, read-only history.** LLM-as-judge score per draft+language.
+
+    The judge was removed from the pipeline in NTS_131 P3 Ф1 (migration 038):
+    it gated nothing and only added noise to acceptance. No code writes this
+    table any more; ``GET /eval/summary`` still reads the rows that exist.
 
     Original rationale below.
 
@@ -1384,6 +1435,84 @@ class BrandTaxonomy(Base):
 
     __table_args__ = (
         UniqueConstraint("brand_id_fk", "key", name="uq_brand_taxonomy_brand_key"),
+    )
+
+
+class EventCluster(Base):
+    """One news event, as the unit of work (NTS_131 P3 Ф2).
+
+    Before this table, one feed item was one candidate and one article, and
+    the second outlet on the same decision was a duplicate that dedup threw
+    away — so the article was written from one document and came out with six
+    facts where the event held fifteen. Now the candidate is the *anchor* of
+    a cluster, and every other material about the event is a
+    :class:`EventClusterSource` the fact pack is built across.
+
+    One cluster per anchor: ``anchor_candidate_id`` is UNIQUE, so "which
+    cluster does this candidate lead" has one answer.
+    """
+
+    __tablename__ = "event_clusters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    brand_id_fk: Mapped[int] = mapped_column(
+        Integer, ForeignKey("brands.id", ondelete="RESTRICT"), nullable=False
+    )
+    anchor_candidate_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("candidates.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+EVENT_SOURCE_ROLES = ("primary", "secondary")
+EVENT_SOURCE_ORIGINS = ("intake_dedup", "manual", "sourcing")
+
+
+class EventClusterSource(Base):
+    """One material about the event: another regulator, a client alert, press.
+
+    ``role='primary'`` is an official document (a second regulator's notice on
+    the same act); ``secondary`` is commentary or reporting. The anchor's own
+    document is not stored here — it is the candidate's ``primary_doc_url``.
+    ``from_candidate_id`` is set when intake joined a would-be duplicate to the
+    cluster instead of dropping it, which is the case the old dedup lost.
+    """
+
+    __tablename__ = "event_cluster_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    cluster_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("event_clusters.id", ondelete="CASCADE"), nullable=False
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url_key: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    publisher: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    role: Mapped[str] = mapped_column(String, nullable=False)
+    origin: Mapped[str] = mapped_column(String, nullable=False)
+    source_id_fk: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("sources.id", ondelete="SET NULL"), nullable=True
+    )
+    similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "url_key", name="uq_event_cluster_source_url"),
+        CheckConstraint(
+            _check_in("role", EVENT_SOURCE_ROLES), name="ck_event_cluster_sources_role"
+        ),
+        CheckConstraint(
+            _check_in("origin", EVENT_SOURCE_ORIGINS),
+            name="ck_event_cluster_sources_origin",
+        ),
+        Index("ix_event_cluster_sources_cluster", "cluster_id"),
     )
 
 

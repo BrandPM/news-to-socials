@@ -51,7 +51,10 @@ from pipeline.selector.ranking import (
 )
 from tests.unit.conftest import seed_icon_brand
 
-NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
+# Anchored to today, not to the day the file was written: run_production reads
+# the real clock for its sweep, so a fixed date turns every fixture candidate
+# into an expired one fourteen days later (the S4 date bomb, again).
+NOW = datetime.now(tz=UTC).replace(hour=12, minute=0, second=0, microsecond=0)
 TIERS = {"tier1": ["EU", "CH"], "tier2": ["US"]}
 
 
@@ -674,8 +677,11 @@ def test_the_thin_portfolio_alert_fires_three_days_before_the_slot(db):
     """NTS_100 §3.5 — three days out, while there is still time to act."""
     from pipeline.monitoring.alerts import check_thin_portfolio
 
-    slots = json.dumps([{"day": "wed", "capacity": 2}])
-    # 2026-09-06 is a Sunday; three days later is Wednesday the 9th.
+    # The slot is whatever weekday falls three days after NOW, so the test
+    # reads the same on any day it runs.
+    slot_day = (NOW + timedelta(days=3)).date()
+    weekday = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[slot_day.weekday()]
+    slots = json.dumps([{"day": weekday, "capacity": 2}])
     pulse = check_thin_portfolio(
         brand_id_fk=db,
         slots=slots,
@@ -685,8 +691,8 @@ def test_the_thin_portfolio_alert_fires_three_days_before_the_slot(db):
     )
     assert pulse is not None
     key, message = pulse
-    assert key.endswith("2026-09-09")
-    assert "2026-09-09" in message
+    assert key.endswith(slot_day.isoformat())
+    assert slot_day.isoformat() in message
 
     # Two candidates on their way to it — nothing to warn about.
     _candidate(db, status="drafted")
@@ -708,7 +714,17 @@ def test_no_alert_for_a_day_that_is_not_a_slot(db):
     assert (
         check_thin_portfolio(
             brand_id_fk=db,
-            slots=json.dumps([{"day": "mon", "capacity": 2}]),
+            # The day after the lead-time day: never the one that is warned on.
+            slots=json.dumps(
+                [
+                    {
+                        "day": ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[
+                            (NOW + timedelta(days=4)).weekday()
+                        ],
+                        "capacity": 2,
+                    }
+                ]
+            ),
             timezone_name="Europe/Madrid",
             now=NOW,
         )
@@ -1150,8 +1166,10 @@ async def test_attribution_runs_before_a_single_translation_is_bought(db, wired)
     assert writer.drafted == ["en"], "the canon is drafted once, before the check"
 
 
-async def test_a_distortion_triggers_exactly_one_repair_cycle(db, wired, monkeypatch):
-    """One cycle, not a loop with a model on both ends of it (NTS_102 v2 §2)."""
+async def test_a_distortion_fixed_by_the_first_repair_costs_one_cycle(
+    db, wired, monkeypatch
+):
+    """The loop stops as soon as the check comes back clean (NTS_131 P3 Ф1)."""
     from pipeline.generator import comment_writer as writer_mod
     from pipeline.production import run_production
 
@@ -1161,7 +1179,7 @@ async def test_a_distortion_triggers_exactly_one_repair_cycle(db, wired, monkeyp
 
     repairs: list[str] = []
 
-    async def _repair(self, draft, instructions, language=Language.en):
+    async def _repair(self, draft, instructions, language=Language.en, *, sources=""):
         repairs.append(instructions)
         return draft
 
@@ -1188,15 +1206,65 @@ async def test_a_distortion_that_survives_the_repair_flags_the_candidate(
     composer.distorted_survives = True
     cid = _candidate(db)
 
-    async def _repair(self, draft, instructions, language=Language.en):
+    repairs: list[str] = []
+
+    async def _repair(self, draft, instructions, language=Language.en, *, sources=""):
+        repairs.append(instructions)
         return draft
 
     monkeypatch.setattr(writer_mod.CommentWriter, "repair_attribution", _repair)
     stats = await run_production(brand_slug="icon", dry_run=True)
 
     assert stats.drafted == 1, "a distorted claim does not block the draft"
+    # NTS_131 P3 Ф1 — two repair cycles at most, then review with the flag.
+    assert len(repairs) == 2
+    assert composer.attribution_calls == 3, "checked, then re-checked after each repair"
     with admin_db.get_session_factory()() as session:
         assert session.get(Candidate, cid).needs_attention is True
+
+
+async def test_an_uncovered_claim_is_repaired_with_the_source_material(
+    db, wired, monkeypatch
+):
+    """NTS_131 P3 Ф1 — uncovered is no longer only reported. The repair is
+    told to rewrite it onto a sourced fact or move it to the open questions,
+    and it is handed the material to do that with."""
+    from pipeline.generator import comment_writer as writer_mod
+    from pipeline.generator import composition as comp_mod
+    from pipeline.generator.composition import AttributionReport, Claim
+    from pipeline.production import run_production
+
+    _writer, _publisher, _documents, composer = wired
+    calls = {"n": 0}
+
+    async def _check(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return AttributionReport(
+                claims=[Claim("Clients will face audits in 2027", "uncovered", "not in any source")],
+                checked=True,
+            )
+        return AttributionReport(claims=[Claim("EUR 5m threshold", "confirmed")], checked=True)
+
+    monkeypatch.setattr(comp_mod, "check_attribution", _check)
+    seen: list[tuple[str, str]] = []
+
+    async def _repair(self, draft, instructions, language=Language.en, *, sources=""):
+        seen.append((instructions, sources))
+        return draft
+
+    monkeypatch.setattr(writer_mod.CommentWriter, "repair_attribution", _repair)
+    cid = _candidate(db)
+    stats = await run_production(brand_slug="icon", dry_run=True)
+
+    assert stats.drafted == 1
+    assert len(seen) == 1
+    instructions, sources = seen[0]
+    assert "UNCOVERED" in instructions and "Clients will face audits in 2027" in instructions
+    assert "don't-know" in instructions
+    assert "https://reg.test/doc" in sources, "the repair sees the documents"
+    with admin_db.get_session_factory()() as session:
+        assert session.get(Candidate, cid).needs_attention is False
 
 
 async def test_depth_final_and_the_plan_reach_the_writer_and_the_pack(db, wired):

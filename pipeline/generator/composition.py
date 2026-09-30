@@ -93,12 +93,15 @@ class DepthDecision:
     n_pairs: int
     has_dates: bool
     reason: str
+    # NTS_131 P3 Ф2 — distinct documents the facts rest on.
+    n_sources: int = 1
 
     def as_log(self) -> dict[str, Any]:
         return {
             "depth_final": self.depth,
             "n_facts": self.n_facts,
             "n_pairs": self.n_pairs,
+            "n_sources": self.n_sources,
             "has_dates": self.has_dates,
             "reason": self.reason,
         }
@@ -134,12 +137,28 @@ def comparable_groups(facts: Sequence[Any]) -> dict[str, list[Any]]:
     return usable
 
 
+def _has_value(fact: Any) -> bool:
+    return bool((getattr(fact, "value", "") or "").strip())
+
+
+def _distinct_sources(facts: Sequence[Any]) -> int:
+    urls: set[str] = set()
+    for fact in facts:
+        url = (getattr(fact, "url", "") or "").strip()
+        if url:
+            urls.add(url)
+        urls.update(u for u in getattr(fact, "corroborated_by", ()) or () if u)
+    return len(urls)
+
+
 def compute_depth_final(
     pack: Any,
     *,
     brief_min_facts: int = 4,
     article_min_facts: int = 10,
-    deep_min_facts: int = 10,
+    deep_min_facts: int = 11,
+    deep_min_pairs: int = 1,
+    deep_min_sources: int = 2,
 ) -> DepthDecision:
     """The depth the *material* supports (NTS_102 v2 §1, NTS_129 P2 Ф2).
 
@@ -163,39 +182,44 @@ def compute_depth_final(
     )
     countable = [f for f in facts if _countable(f)]
     n_facts = len(countable)
-    groups = comparable_groups(countable)
+    # Pairs are counted on exactly the facts a block can be built from — the
+    # ones with a ``value`` (NTS_131 P3 Ф2 §5). Counting them on "a figure or
+    # a date" while ``build_data_blocks`` groups only filled values meant
+    # ``deep`` could be granted for pairs no block could use.
+    groups = comparable_groups([f for f in countable if _has_value(f)])
     n_pairs = sum(len(members) // 2 for members in groups.values())
+    n_sources = _distinct_sources(countable)
     has_dates = any(
         _EFFECTIVE_RE.search(getattr(f, "text", "") or "") for f in facts
     )
 
-    if n_facts >= deep_min_facts and n_pairs >= 2:
-        return DepthDecision(
-            "deep", n_facts, n_pairs, has_dates, "facts and pairs both clear deep"
-        )
+    def _decide(depth: str, reason: str) -> DepthDecision:
+        return DepthDecision(depth, n_facts, n_pairs, has_dates, reason, n_sources)
+
     if n_facts >= deep_min_facts:
-        return DepthDecision(
+        missing = []
+        if n_pairs < deep_min_pairs:
+            missing.append(f"{n_pairs} comparable pair(s) with values")
+        if n_sources < deep_min_sources:
+            missing.append(f"{n_sources} source document(s)")
+        if not missing:
+            return _decide(
+                "deep",
+                f"{n_facts} facts from {n_sources} documents, {n_pairs} pair(s)",
+            )
+        return _decide(
             "article",
-            n_facts,
-            n_pairs,
-            has_dates,
-            f"{n_facts} facts reach deep but only {n_pairs} comparable pair(s) "
-            "— a deep piece with no table to put in it",
+            f"{n_facts} facts reach deep but only " + " and ".join(missing),
         )
     if n_facts >= article_min_facts:
-        return DepthDecision("article", n_facts, n_pairs, has_dates, "enough for an article")
+        return _decide("article", "enough for an article")
     if n_facts >= brief_min_facts:
-        return DepthDecision(
+        return _decide(
             "brief",
-            n_facts,
-            n_pairs,
-            has_dates,
             f"{n_facts} fact(s) — real material, but not {article_min_facts} "
             "for an article",
         )
-    return DepthDecision(
-        "note", n_facts, n_pairs, has_dates, f"only {n_facts} countable fact(s)"
-    )
+    return _decide("note", f"only {n_facts} countable fact(s)")
 
 
 def depth_guidance(
@@ -253,7 +277,8 @@ def depth_guidance(
     if decision is not None:
         lines.append(
             f"(Depth was computed from the material: {decision.n_facts} facts "
-            f"carrying a figure or date, {decision.n_pairs} comparable pair(s).)"
+            f"carrying a figure or date, from {decision.n_sources} source "
+            f"document(s), {decision.n_pairs} comparable pair(s).)"
         )
     return "\n".join(lines)
 
@@ -579,8 +604,20 @@ class AttributionReport:
 
     @property
     def needs_fix(self) -> bool:
-        """One automatic fix cycle is warranted (NTS_102 v2 §2)."""
-        return bool(self.distorted or self.flagged)
+        """A repair cycle is warranted (NTS_102 v2 §2, NTS_131 P3 Ф1).
+
+        Uncovered claims count now. Before NTS_131 they were only reported,
+        and "reported" meant an unsupported sentence reached the editor with a
+        badge on it. The rule is that an unsupported claim does not reach the
+        text at all: it is rewritten onto a fact the sources hold, or it moves
+        to what we don't know.
+        """
+        return bool(self.distorted or self.uncovered or self.flagged)
+
+    @property
+    def clean(self) -> bool:
+        """Checked, and nothing left to repair."""
+        return self.checked and not self.needs_fix
 
     def counts(self) -> dict[str, int]:
         out = {"confirmed": 0, "distorted": 0, "uncovered": 0}
@@ -610,16 +647,28 @@ class AttributionReport:
         }
 
     def fix_instructions(self) -> str:
-        """What the polish pass is told to repair, claim by claim."""
+        """What the repair pass is told to fix, claim by claim."""
         lines = [
             "ATTRIBUTION REPAIR (mandatory, highest priority). The following "
-            "statements do not say what the source says. Rewrite each one to "
-            "match the source, or delete it. Do NOT add new facts, do NOT "
-            "reach for other numbers, and do not shorten the rest of the "
-            "piece to compensate.",
+            "statements are not what the sources say, or are not in the "
+            "sources at all. Do NOT add facts from memory, do NOT reach for "
+            "other numbers, and do not shorten the rest of the piece to "
+            "compensate.",
         ]
         for claim in self.distorted:
-            lines.append(f'* "{claim.claim}" — {claim.why or "not what the source says"}')
+            lines.append(
+                f'* DISTORTED: "{claim.claim}" — {claim.why or "not what the source says"}. '
+                "Rewrite it to say exactly what the source says."
+            )
+        for claim in self.uncovered:
+            lines.append(
+                f'* UNCOVERED: "{claim.claim}" — {claim.why or "no source holds this"}. '
+                "Either rewrite it onto a fact the SOURCE MATERIAL below "
+                "actually holds (same point, sourced wording), or, if no source "
+                "holds anything like it, turn it into an open question in the "
+                "closing what-we-don't-know paragraphs (\"the notice does not "
+                "say whether …\"). It may not stay as an assertion."
+            )
         for claim in self.flagged:
             if "person_detail" in claim.flags:
                 lines.append(
@@ -700,7 +749,10 @@ async def check_attribution(
                     "role": "user",
                     "content": _ATTRIBUTION_INPUT.format(
                         body=body[:24000],
-                        document=(document_text or "(no primary document)")[:24000],
+                        # A whole event cluster, not one press release
+                        # (NTS_131 P3 Ф2): a claim taken from the fourth
+                        # document must be checkable against it.
+                        document=(document_text or "(no primary document)")[:90000],
                         fact_pack=(
                             fact_pack.render() if fact_pack is not None else "(none)"
                         ),
@@ -778,9 +830,24 @@ class DataBlock:
 
 
 def _label_of(fact: Any) -> str:
-    """A short caption for a figure: the fact's own words, trimmed."""
-    text = (getattr(fact, "text", "") or "").strip()
-    return text[:90]
+    """A short caption for a figure (NTS_131 P3 Ф2 §6).
+
+    Research's 2-5 word ``label`` when it wrote one. Otherwise the fact's own
+    words, cut at the first clause and to five words — a whole sentence under
+    a 34px number is what made the cards unreadable, and a trimmed clause of
+    the source's wording is still the source's wording.
+    """
+    label = (getattr(fact, "label", "") or "").strip()
+    if not label:
+        text = (getattr(fact, "text", "") or "").strip()
+        clause = re.split(r"[,;:(—–]| - ", text, maxsplit=1)[0]
+        label = " ".join(clause.split()[:5]).rstrip(".")
+    return _capitalised(label)
+
+
+def _capitalised(text: str) -> str:
+    text = (text or "").strip()
+    return text[:1].upper() + text[1:] if text else text
 
 
 def _series_points(members: Sequence[Any]) -> list[dict[str, Any]]:
@@ -851,7 +918,9 @@ def build_data_blocks(
                         "series": [{"name": group, "points": points}],
                         "unit": unit,
                         "sourceRefs": sources,
-                        "caption": f"{group} ({unit})".strip(),
+                        "caption": _capitalised(
+                            f"{group} ({unit})" if unit else group
+                        ),
                     },
                 )
             )
@@ -861,7 +930,7 @@ def build_data_blocks(
                 DataBlock(
                     "statTable",
                     {
-                        "caption": group,
+                        "caption": _capitalised(group),
                         "columns": ["", unit or "value"],
                         "rows": [
                             {

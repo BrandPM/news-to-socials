@@ -476,15 +476,19 @@ carries a detail that must not be published.
 
 {repairs}
 
-Rewrite ONLY those statements. For each: restate it as the source actually
-has it, or delete the clause. Do NOT introduce any number, date, name or
-claim that is not already in the draft, do NOT reach for a different figure to
+Rewrite ONLY those statements. For each: restate it as the SOURCE MATERIAL
+below actually has it, or — for an uncovered claim no source supports — turn
+it into a named open question in the closing what-we-don't-know paragraphs.
+Every number, date, name or claim you write must be in the SOURCE MATERIAL or
+already in the draft; do NOT reach for a different figure from memory to
 replace a wrong one, and do NOT shorten or restructure the rest of the piece —
 the lede, the H2 sections and the close stay as they are.
 
 If a statement cannot be repaired without inventing something, delete it. A
-shorter accurate article is the correct outcome; a plausible fix is the
-failure this pass exists to prevent.
+plausible fix is the failure this pass exists to prevent.
+
+SOURCE MATERIAL (the only thing a repaired statement may rest on):
+{sources}
 
 Draft:
 {draft_json}
@@ -1174,7 +1178,12 @@ class CommentWriter:
 
     @with_retry()
     async def repair_attribution(
-        self, draft: Draft, repairs: str, language: Language = Language.en
+        self,
+        draft: Draft,
+        repairs: str,
+        language: Language = Language.en,
+        *,
+        sources: str = "",
     ) -> Draft:
         """The single fix cycle of NTS_102 v2 §2, on the EN canon.
 
@@ -1190,6 +1199,7 @@ class CommentWriter:
         prompt = _ATTRIBUTION_REPAIR_PROMPT.format(
             language_name=_language_name(language),
             repairs=repairs,
+            sources=sources or "(none supplied — delete what cannot be kept)",
             draft_json=payload.model_dump_json(),
         )
         resp = await self.client.chat.completions.create(
