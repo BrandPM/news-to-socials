@@ -154,3 +154,35 @@ async def test_a_polish_that_summarises_is_not_used(monkeypatch, polish_words, k
     writer = _Writer(draft_words=1300, polish_words=polish_words)
     out: Draft = await writer.write(_topic(), "", Language.en)
     assert out.body.split()[2] == kept
+
+
+# --------------------------------------------------------------------------
+# what the first cluster run surfaced on the way to the Studio
+# --------------------------------------------------------------------------
+
+
+def test_a_markdown_table_becomes_a_list_with_the_same_cells():
+    md = "Lede.\n\n| Item | Figure | Why |\n|---|---:|---|\n| Cap | 100% | more |\n| Floor | GBP 1m | |\n\nAfter."
+    out = comp.tables_to_lists(md)
+    assert "|" not in out
+    assert "- **Cap** — figure: 100%; why: more" in out
+    assert "- **Floor** — figure: GBP 1m" in out
+    assert out.startswith("Lede.") and out.endswith("After.")
+
+
+def test_the_check_reads_the_article_a_few_sections_at_a_time():
+    sections = "".join(f"## S{i}\n\n" + "word " * 200 + "\n\n" for i in range(5))
+    chunks = comp.split_for_attribution("Title\n\nLede.\n\n" + sections)
+    assert len(chunks) == 5 // 2 + 1
+    assert chunks[0].startswith("Title")
+    assert all(c.count("## ") <= 2 for c in chunks)
+
+
+def test_a_takeaway_is_never_cut_mid_word():
+    from pipeline.publisher.sanity import _clip
+
+    text = "The ruling reprices PEP files. " + "Clients must map assets outside appetite " * 10
+    clipped = _clip(text, 280)
+    assert len(clipped) <= 281
+    assert clipped.endswith((".", "…"))
+    assert _clip("short", 280) == "short"

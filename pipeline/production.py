@@ -530,7 +530,12 @@ def _store_document_link(
         row.primary_doc_url = url
         if version_id is not None:
             row.doc_version_id = str(version_id)
-        if doc_match:
+        # A manager's (or sourcing's) manual link stays manual: it is what
+        # admits a document from a domain the registry does not know, and
+        # overwriting it with the fetch verdict made the next attempt on the
+        # same candidate refuse the very document it had just been written
+        # from (NTS_131 P3, the Greek cluster).
+        if doc_match and row.doc_match != "manual":
             row.doc_match = doc_match
         row.doc_sections_used = json.dumps(list(sections), ensure_ascii=False)
         session.commit()
@@ -904,6 +909,67 @@ def _repair_sources(fact_pack: Any, document_text: str) -> str:
     return "\n\n".join(parts)
 
 
+# NTS_131 P3 — the first cluster run wrote a Ukrainian sibling of 102 words
+# under a 1 047-word canon, and nothing on the production path looked. The
+# checks existed (``translation_check``, NTS_065) but only the backfill and
+# the regenerate endpoint called them.
+TRANSLATION_ATTEMPTS = 3
+
+
+def translation_defects(en_body: str, body: str, language: str) -> list[str]:
+    """What is wrong with a translation, deterministically. Empty = usable."""
+    from pipeline.generator import translation_check as tc
+
+    defects: list[str] = []
+    if not tc.length_within(en_body, body):
+        defects.append(f"length ratio {tc.length_ratio(en_body, body):.2f}")
+    if tc.h2_count(body) != tc.h2_count(en_body):
+        defects.append(f"H2 {tc.h2_count(body)} vs {tc.h2_count(en_body)}")
+    dropped = tc.dropped_numbers(en_body, body)
+    if dropped:
+        defects.append(f"dropped numbers {dropped[:5]}")
+    if language in ("ru", "uk") and not tc.is_mostly_cyrillic(body):
+        defects.append("not Cyrillic")
+    if language == "pl" and not tc.is_polish_latin(body):
+        defects.append("not Polish")
+    return defects
+
+
+async def _checked_translation(
+    *,
+    translate: Any,
+    topic: Any,
+    brand: Any,
+    language: Language,
+    en_draft: Any,
+    candidate_id: int,
+) -> Any:
+    """Translate, check, retry. Raises when every attempt is defective.
+
+    Raising is the right end: the run rolls the candidate back to pending
+    with the reason on the row, and a set with a truncated sibling never
+    reaches the Studio — a half-translated article is worse than none
+    (NTS_100 §4).
+    """
+    defects: list[str] = []
+    for attempt in range(1, TRANSLATION_ATTEMPTS + 1):
+        draft = await translate(topic, brand, language, en_draft)
+        defects = translation_defects(en_draft.body, draft.body, language.value)
+        if not defects:
+            return draft
+        log.warning(
+            "production.translation_defective",
+            candidate_id=candidate_id,
+            language=language.value,
+            attempt=attempt,
+            defects=defects,
+        )
+    raise RuntimeError(
+        f"translation {language.value} defective after "
+        f"{TRANSLATION_ATTEMPTS} attempts: {'; '.join(defects)}"
+    )
+
+
 async def produce_candidate(
     *,
     candidate_id: int,
@@ -1208,6 +1274,13 @@ async def produce_candidate(
             ),
         )
 
+        # A markdown table has no Portable Text form (the converter would put
+        # a line of pipes in the Studio): rewrite it as a list in the canon,
+        # before the check and before any translation sees it.
+        from pipeline.generator.composition import tables_to_lists
+
+        en_draft.body = tables_to_lists(en_draft.body)
+
         # --- ATTRIBUTION, before a single translation (NTS_096 §C) --------
         # The whole reason this stage sits here: NTS_096's reference case is a
         # right number attached to a wrong claim, which every other defence
@@ -1227,7 +1300,9 @@ async def produce_candidate(
             config=config,
             candidate_id=candidate_id,
         )
-        needs_attention = not report.clean if report.checked else False
+        # An article the check could not read is not a clean article: it goes
+        # to review flagged, exactly like one the repairs could not fix.
+        needs_attention = not report.clean
         if fact_pack_id is not None:
             _store_attribution(
                 fact_pack_id, {**report.as_dict(), "repair_cycles": repairs}
@@ -1264,8 +1339,13 @@ async def produce_candidate(
             drafts.append(
                 (
                     language,
-                    await translate_draft_for_language(
-                        topic, brand, language, en_draft
+                    await _checked_translation(
+                        translate=translate_draft_for_language,
+                        topic=topic,
+                        brand=brand,
+                        language=language,
+                        en_draft=en_draft,
+                        candidate_id=candidate_id,
                     ),
                 )
             )

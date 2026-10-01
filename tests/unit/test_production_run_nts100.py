@@ -339,6 +339,10 @@ def wired(monkeypatch):
     import pipeline.run as run_mod
     import pipeline.sources.document_fetcher as doc_mod
 
+    # The stub translations are placeholders, not translations; the gate that
+    # checks real ones has its own tests (test_translation_gate_*).
+    monkeypatch.setattr(production, "translation_defects", lambda *a: [])
+
     # S6: the plan and the attribution check are model calls. Stubbed at the
     # module boundary — their own behaviour is covered in
     # ``test_composition_nts102``; what these tests are about is the ORDER.
@@ -1284,3 +1288,54 @@ async def test_depth_final_and_the_plan_reach_the_writer_and_the_pack(db, wired)
         pack = session.query(FactPack).one()
         assert json.loads(pack.plan)["sections"][0]["heading"] == "What changes"
         assert json.loads(pack.attribution)["counts"]["confirmed"] == 1
+
+
+# --------------------------------------------------------------------------
+# NTS_131 P3 — the translation gate on the production path
+# --------------------------------------------------------------------------
+
+
+EN_BODY = "## The cap\n\nThe cap rises from 50% to 100% on 1 January 2027.\n\n## Who pays\n\nFirms above GBP 1 million."
+UK_BODY = "## Стеля\n\nСтеля зростає з 50% до 100% з 1 січня 2027 року.\n\n## Хто платить\n\nФірми понад GBP 1 мільйон."
+
+
+def test_translation_gate_passes_a_faithful_sibling():
+    from pipeline.production import translation_defects
+
+    assert translation_defects(EN_BODY, UK_BODY, "uk") == []
+
+
+def test_translation_gate_catches_the_truncated_sibling():
+    """The case the first cluster run shipped: 102 words under 1 047."""
+    from pipeline.production import translation_defects
+
+    truncated = UK_BODY.split("## Хто")[0]
+    defects = translation_defects(EN_BODY, truncated, "uk")
+    assert any(d.startswith("H2") for d in defects)
+    assert any(d.startswith("dropped numbers") for d in defects)
+
+
+async def test_translation_gate_retries_then_refuses():
+    from pipeline.production import TRANSLATION_ATTEMPTS, _checked_translation
+
+    calls = {"n": 0}
+
+    async def _translate(topic, brand, language, en_draft):
+        calls["n"] += 1
+        body = UK_BODY if calls["n"] == 2 else "## Стеля"
+        return Draft(topic_id="t", brand_id="icon", language=language, title="T", body=body, key_takeaway="")
+
+    en = Draft(topic_id="t", brand_id="icon", language=Language.en, title="T", body=EN_BODY, key_takeaway="")
+    out = await _checked_translation(
+        translate=_translate, topic=None, brand=None, language=Language.uk, en_draft=en, candidate_id=1
+    )
+    assert out.body == UK_BODY and calls["n"] == 2
+
+    async def _always_bad(topic, brand, language, en_draft):
+        return Draft(topic_id="t", brand_id="icon", language=language, title="T", body="x", key_takeaway="")
+
+    with pytest.raises(RuntimeError, match="defective"):
+        await _checked_translation(
+            translate=_always_bad, topic=None, brand=None, language=Language.uk, en_draft=en, candidate_id=1
+        )
+    assert TRANSLATION_ATTEMPTS == 3

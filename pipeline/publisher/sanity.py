@@ -375,6 +375,19 @@ class SanityPostInput:
     sources: Sequence[Mapping[str, str]] = ()
 
 
+def _clip(text: str, limit: int) -> str:
+    """Cut at a sentence, else a word boundary — never mid-word (NTS_131 P3:
+    a takeaway reached the Studio ending "assets not a")."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+    if end >= limit // 2:
+        return cut[: end + 1]
+    return cut[: cut.rfind(" ")].rstrip(" ,;:—-") + "…"
+
+
 class SanityPublisher:
     """Publishes a draft of a post into Sanity for Andriy to approve."""
 
@@ -437,7 +450,7 @@ class SanityPublisher:
             "slug": {"_type": "slug", "current": slug},
             "language": post.language.value,
             "category": post.category,
-            "excerpt": post.key_takeaway[:280] or excerpt_from_body(post.body_markdown),
+            "excerpt": _clip(post.key_takeaway, 280) or excerpt_from_body(post.body_markdown),
             "readTime": read_time,
             "publishedAt": datetime.now(tz=timezone.utc).isoformat(),
             "body": body_pt,
@@ -445,7 +458,7 @@ class SanityPublisher:
             # Content Hub before publish). On approve it becomes publishedAt.
             "displayDate": post.display_date,
             # NEW fields from the post.ts patch (see docs/sanity-post-patch.md)
-            "keyTakeaway": post.key_takeaway[:280],
+            "keyTakeaway": _clip(post.key_takeaway, 280),
             "sourceUrl": post.source_url,
             "topicId": post.topic_id,
             "generatedBy": "pipeline",

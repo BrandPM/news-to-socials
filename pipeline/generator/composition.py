@@ -40,6 +40,7 @@ block, and an article without a table is a normal outcome (NTS_095).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -623,8 +624,12 @@ _ATTRIBUTION_INSTRUCTIONS = """\
 You check whether an article's factual claims are what its sources actually
 say. You are not judging style, structure or interest.
 
-For EVERY factual claim in the article — every number, date, threshold, named
-entity, quotation and every statement about who did what — return one verdict:
+Go sentence by sentence. EVERY sentence that states a fact — a number, date,
+threshold, named entity, quotation, a statement about who did what, or what
+someone must or may do — gets a verdict; expect about one claim per sentence,
+and a sentence with two facts is two claims. Check the RELATION as well as the
+figure: which party a transaction involved, against whom a proceeding runs,
+whether something happened or must happen. Return one verdict per claim:
 
 * "confirmed" — the source says this, including the SUBJECT and the RELATION,
   not merely the number.
@@ -809,6 +814,70 @@ def quote_ceiling(
     return int(mapping[license_class])
 
 
+# ~60 000 characters is ~15 000 tokens of document, which with the pack and
+# the article keeps one check under a 30 000 TPM ceiling (NTS_131 P3: the
+# Greek cluster asked for 36 000 and was refused).
+ATTRIBUTION_DOC_CHARS = 45000
+
+
+async def _attribution_call(
+    client: Any,
+    model: str,
+    ceiling: int,
+    body: str,
+    fact_pack: Any,
+    document_text: str,
+    *,
+    doc_chars: int,
+) -> Any:
+    return await client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": _ATTRIBUTION_INSTRUCTIONS.format(max_quote_words=ceiling),
+            },
+            {
+                "role": "user",
+                "content": _ATTRIBUTION_INPUT.format(
+                    body=body[:24000],
+                    # A whole event cluster, not one press release (NTS_131
+                    # P3 Ф2): a claim from the fourth document must be
+                    # checkable against it.
+                    document=(document_text or "(no primary document)")[:doc_chars],
+                    fact_pack=(fact_pack.render() if fact_pack is not None else "(none)"),
+                ),
+            },
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+
+
+ATTRIBUTION_CHUNK_WORDS = 450
+
+
+def split_for_attribution(body: str, max_words: int = ATTRIBUTION_CHUNK_WORDS) -> list[str]:
+    """The article in pieces of whole H2 sections, about ``max_words`` each.
+
+    The title and lede ride with the first piece. A single section longer than
+    the limit stays whole: splitting inside a section would separate a claim
+    from the sentence that qualifies it.
+    """
+    parts = re.split(r"(?m)^(?=## )", body or "")
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        if current and len((current + part).split()) > max_words:
+            chunks.append(current.strip())
+            current = part
+        else:
+            current += part
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks or [body]
+
+
 async def check_attribution(
     *,
     body: str,
@@ -841,36 +910,52 @@ async def check_attribution(
         client = AsyncOpenAI(api_key=api_key)
 
     ceiling = quote_ceiling(license_class, max_quote_words)
-    try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": _ATTRIBUTION_INSTRUCTIONS.format(
-                        max_quote_words=ceiling
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": _ATTRIBUTION_INPUT.format(
-                        body=body[:24000],
-                        # A whole event cluster, not one press release
-                        # (NTS_131 P3 Ф2): a claim taken from the fourth
-                        # document must be checkable against it.
-                        document=(document_text or "(no primary document)")[:90000],
-                        fact_pack=(
-                            fact_pack.render() if fact_pack is not None else "(none)"
-                        ),
-                    ),
-                },
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
+    chunks = split_for_attribution(body)
+    if len(chunks) > 1:
+        # NTS_131 P3 — one call over a 1 100-word article returned ~18
+        # verdicts for ~60 factual sentences, and two distortions were among
+        # the unchecked. A section at a time, every sentence is looked at.
+        reports = [
+            await check_attribution(
+                body=chunk,
+                fact_pack=fact_pack,
+                document_text=document_text,
+                license_class=license_class,
+                max_quote_words=max_quote_words,
+                model=model,
+                client=client,
+            )
+            for chunk in chunks
+        ]
+        failed = [r for r in reports if not r.checked]
+        merged = AttributionReport(
+            claims=[c for r in reports for c in r.claims],
+            checked=not failed,
+            error="; ".join(r.error for r in failed)[:200],
         )
-    except Exception as exc:
-        log.warning("composition.attribution_failed", err=str(exc)[:200])
-        return AttributionReport(error=f"{type(exc).__name__}: {exc}"[:200])
+        log.info("composition.attribution_total", chunks=len(chunks), **merged.counts())
+        return merged
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = await _attribution_call(
+                client, model, ceiling, body, fact_pack, document_text,
+                doc_chars=ATTRIBUTION_DOC_CHARS // (attempt + 1),
+            )
+            break
+        except Exception as exc:
+            # A rate limit is the one failure worth waiting out: the cluster
+            # is large, the per-minute token ceiling is shared with the plan
+            # and the draft, and a minute later the same call fits. Each retry
+            # also halves the document share, so a request that is simply too
+            # large for the ceiling shrinks until it is not.
+            if "429" in str(exc) and attempt < 2:
+                log.info("composition.attribution_rate_limited", attempt=attempt)
+                await asyncio.sleep(65)
+                continue
+            log.warning("composition.attribution_failed", err=str(exc)[:200])
+            return AttributionReport(error=f"{type(exc).__name__}: {exc}"[:200])
+    assert resp is not None
 
     usage = getattr(resp, "usage", None)
     if usage is not None:
@@ -1128,3 +1213,40 @@ def strip_banned_phrases(text: str, banned: Sequence[str]) -> list[str]:
     """
     lowered = (text or "").lower()
     return [phrase for phrase in banned if phrase and phrase.lower() in lowered]
+
+
+# NTS_131 P3 — the Sanity body is Portable Text built from markdown, and the
+# converter has no table: a markdown table reached the Studio as one line of
+# pipes. The data blocks of NTS_095 are the structured way to carry a table
+# and they are behind their flag, so until then a table the writer produces is
+# rewritten, deterministically, as a list with the same cells.
+_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{2,}")
+
+
+def tables_to_lists(markdown: str) -> str:
+    out: list[str] = []
+    lines = (markdown or "").split("\n")
+    i = 0
+    while i < len(lines):
+        if (
+            _TABLE_ROW.match(lines[i])
+            and i + 1 < len(lines)
+            and _TABLE_RULE.match(lines[i + 1])
+        ):
+            header = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+            i += 2
+            while i < len(lines) and _TABLE_ROW.match(lines[i]):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                head, rest = cells[0], cells[1:]
+                tail = "; ".join(
+                    f"{header[j + 1].lower()}: {c}" if j + 1 < len(header) and header[j + 1] else c
+                    for j, c in enumerate(rest)
+                    if c
+                )
+                out.append(f"- **{head}** — {tail}" if tail else f"- **{head}**")
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
