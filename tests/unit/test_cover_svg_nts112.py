@@ -262,3 +262,10 @@ async def test_an_explicit_custom_prompt_still_takes_the_diffusion_path():
     finally:
         mod.ImageGenerator = original  # type: ignore[assignment]
     assert calls == ["flux"]
+
+
+def test_the_stamp_keeps_the_space_before_a_word_and_shortens_it():
+    """NTS_133 P5 Ф3 — the digit grouping swallowed the space before
+    «billion» and stamped «USD 86billion» on a real cover."""
+    assert pick_stamp(facts=["A7 moved USD 86 billion"]) == "USD 86bn"
+    assert pick_stamp(facts=["a fine of GBP 4.73 million"]) == "GBP 4.73m"

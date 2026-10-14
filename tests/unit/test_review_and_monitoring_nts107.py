@@ -390,7 +390,8 @@ def test_retries_stop_at_the_ceiling(db):
 def test_the_dead_man_switch_fires_on_silence_not_on_failure(db):
     """NTS_106 §5 — a monitoring channel that has gone quiet looks exactly like
     a quiet morning, and telling those apart is the only thing this does."""
-    morning = datetime(2026, 9, 7, 8, 30, tzinfo=UTC)  # 10:30 in Madrid
+    # NTS_133 P5 — the switch waits until 13:00, after the 11:40 intake.
+    morning = datetime(2026, 9, 7, 11, 30, tzinfo=UTC)  # Monday 13:30 in Madrid
     pulse = alerts_mod.check_dead_man(
         brand_id_fk=db, timezone_name="Europe/Madrid", now=morning
     )
@@ -413,12 +414,25 @@ def test_the_dead_man_switch_fires_on_silence_not_on_failure(db):
     )
 
 
-def test_the_dead_man_switch_stays_quiet_before_nine(db):
-    """Before 09:00 the silence is not yet evidence of anything."""
-    early = datetime(2026, 9, 7, 5, 0, tzinfo=UTC)  # 07:00 in Madrid
+def test_the_dead_man_switch_stays_quiet_before_one(db):
+    """Before 13:00 the silence is not yet evidence of anything: the intake
+    that sends the day's heartbeat runs at 11:40 (NTS_133 P5 Ф1)."""
+    early = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)  # 12:00 in Madrid
     assert (
         alerts_mod.check_dead_man(
             brand_id_fk=db, timezone_name="Europe/Madrid", now=early
+        )
+        is None
+    )
+
+
+def test_the_dead_man_switch_is_off_at_weekends(db):
+    """No intake runs at weekends and every pulse is held, so a silent
+    Saturday is the schedule (NTS_133 P5 Ф1)."""
+    saturday = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)  # Saturday 14:00 Madrid
+    assert (
+        alerts_mod.check_dead_man(
+            brand_id_fk=db, timezone_name="Europe/Madrid", now=saturday
         )
         is None
     )

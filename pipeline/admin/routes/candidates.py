@@ -753,7 +753,12 @@ def candidate_traceability(candidate_id: int, brand_id: int) -> dict[str, Any]:
     нового платного вызова**", which is why every field here is a read of
     something the run already stored (migrations 025/027/028).
     """
-    from pipeline.admin.models import DocumentVersion, FactPack
+    from pipeline.admin.models import (
+        DocumentVersion,
+        EventCluster,
+        EventClusterSource,
+        FactPack,
+    )
 
     with session_scope() as session:
         _brand_or_404(session, brand_id)
@@ -777,6 +782,50 @@ def candidate_traceability(candidate_id: int, brand_id: int) -> dict[str, Any]:
                 document = session.get(DocumentVersion, int(candidate.doc_version_id))
             except (TypeError, ValueError):
                 document = None
+
+        # NTS_133 P5 Ф4 — what the event was assembled from. The anchor is
+        # the candidate itself; every other row is a material the cluster
+        # joined (NTS_131 P3 Ф2). ``source_count`` counts the anchor, so a
+        # single-document article reads «1», not «0».
+        cluster_row = session.execute(
+            select(EventCluster).where(
+                EventCluster.anchor_candidate_id == candidate_id
+            )
+        ).scalars().first()
+        cluster_sources = (
+            [
+                {
+                    "url": src.url,
+                    "title": src.title,
+                    "publisher": src.publisher,
+                    "role": src.role,
+                    "origin": src.origin,
+                }
+                for src in session.execute(
+                    select(EventClusterSource)
+                    .where(EventClusterSource.cluster_id == cluster_row.id)
+                    .order_by(EventClusterSource.id)
+                )
+                .scalars()
+                .all()
+            ]
+            if cluster_row is not None
+            else []
+        )
+        anchor_source = {
+            "url": candidate.source_url,
+            "title": candidate.source_title,
+            "publisher": candidate.source_name,
+            "role": "anchor",
+            "origin": "intake",
+        }
+        anchor_url = (candidate.source_url or "").strip()
+        cluster = {
+            "source_count": 1
+            + sum(1 for s in cluster_sources if (s["url"] or "").strip() != anchor_url),
+            "sources": [anchor_source]
+            + [s for s in cluster_sources if (s["url"] or "").strip() != anchor_url],
+        }
 
         decisions = [
             {
@@ -871,6 +920,7 @@ def candidate_traceability(candidate_id: int, brand_id: int) -> dict[str, Any]:
         "plan": _json(pack["plan"], None) if pack else None,
         "attribution": _json(pack["attribution"], None) if pack else None,
         "sources": _json(pack["sources"], []) if pack else [],
+        "cluster": cluster,
         "history": decisions,
     }
 

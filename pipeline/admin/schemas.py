@@ -231,6 +231,8 @@ class PipelineConfigOut(BaseModel):
     voice_profile: str
     # NTS_089 — staleness threshold (days) for the Content Hub ⚠️ flag.
     stale_draft_days: int
+    # NTS_133 P5 Ф4 — the same flag for document-based drafts (migration 041).
+    stale_draft_days_document: int = 60
     # NTS_090 — embedding-dedup tunables.
     dedup_enabled: bool
     dedup_threshold: float
@@ -249,6 +251,8 @@ class PipelineConfigOut(BaseModel):
     # Rhythm
     publication_slots: list[dict[str, Any]]
     weekly_draft_budget: int
+    # NTS_133 P5 Ф2 — migration 041.
+    production_batch_size: int = 2
     portfolio_daily_cap_document: int
     portfolio_daily_cap_news: int
     candidate_ttl_days: dict[str, int]
@@ -301,6 +305,8 @@ class PipelineConfigOut(BaseModel):
     attribution_model: str
     # NTS_112 — data | flux (migration 030)
     cover_mode: str
+    # NTS_133 P5 Ф2 — migration 041, OFF.
+    autopublish_enabled: bool = False
     guard_model: str
     updated_at: datetime
 
@@ -360,6 +366,7 @@ class PipelineConfigUpdate(BaseModel):
     banned_phrases: list[str] | None = None
     voice_profile: str | None = None
     stale_draft_days: int | None = Field(default=None, ge=1, le=60)
+    stale_draft_days_document: int | None = Field(default=None, ge=1, le=365)
     # NTS_090 — dedup tunables (editable from Settings, no deploy).
     dedup_enabled: bool | None = None
     dedup_threshold: float | None = Field(default=None, ge=0.5, le=0.99)
@@ -380,6 +387,7 @@ class PipelineConfigUpdate(BaseModel):
     # structurally so a malformed slot list is a 422, not a broken run.
     publication_slots: list[PublicationSlot] | None = None
     weekly_draft_budget: int | None = Field(default=None, ge=0, le=50)
+    production_batch_size: int | None = Field(default=None, ge=0, le=20)
     portfolio_daily_cap_document: int | None = Field(default=None, ge=0, le=50)
     portfolio_daily_cap_news: int | None = Field(default=None, ge=0, le=50)
     candidate_ttl_days: dict[str, int] | None = None
@@ -432,6 +440,7 @@ class PipelineConfigUpdate(BaseModel):
     )
     cover_mode: Literal["data", "flux"] | None = None
     guard_model: str | None = Field(default=None, min_length=1, max_length=100)
+    autopublish_enabled: bool | None = None
 
     @field_validator("brand_timezone")
     @classmethod
@@ -1168,6 +1177,11 @@ class DraftListItem(BaseModel):
     # NTS_090 — missing structural components (same codes as
     # ``DraftDetailOut.missing``); powers the ⚠️ badge on incomplete cards.
     missing: list[str] = []
+    # NTS_133 P5 Ф4 — after how many days this draft's date reads as stale:
+    # ``stale_draft_days`` for news, ``stale_draft_days_document`` for a draft
+    # written from a primary document. ``None`` when the draft has no linked
+    # candidate (v2-era drafts); the UI falls back to the brand-wide value.
+    stale_after_days: int | None = None
 
 
 class DraftListOut(BaseModel):

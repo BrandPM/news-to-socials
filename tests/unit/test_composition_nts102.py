@@ -355,12 +355,42 @@ def test_no_comparable_numbers_means_no_block_and_that_is_a_normal_outcome():
     assert comp.build_data_blocks(_pack(facts), depth="deep", enabled=True) == []
 
 
-def test_blocks_are_not_built_below_deep_or_while_the_flag_is_off():
+def test_blocks_are_not_built_below_article_or_while_the_flag_is_off():
     """NTS_095 fixes the order schema → render → pipeline. The generator is
-    written and tested now and writes nothing until S8's PR is merged."""
+    written and tested now and writes nothing until S8's PR is merged.
+    NTS_133 P5 Ф3 opened ``article``: ``deep`` alone was unreachable."""
     pack = _pack(_series(4, dates=True))
     assert comp.build_data_blocks(pack, depth="deep", enabled=False) == []
-    assert comp.build_data_blocks(pack, depth="article", enabled=True) == []
+    assert comp.build_data_blocks(pack, depth="article", enabled=True) != []
+    assert comp.build_data_blocks(pack, depth="brief", enabled=True) == []
+    assert comp.build_data_blocks(pack, depth="note", enabled=True) == []
+
+
+def test_labelled_figures_become_key_figures_without_a_comparable_group():
+    """NTS_133 P5 Ф3 — a regulator's document with numbers but no group of two
+    still gets a block: each card is a labelled figure with its own source."""
+    facts = [
+        _fact("OFSI imposed a penalty of GBP 4.73 million", value="4.73",
+              unit="GBP m", label="OFSI penalty"),
+        _fact("The maximum penalty is now 100% of the breach", value="100",
+              unit="%", label="Maximum penalty share"),
+        _fact("The breach lasted 14 months", value="14", unit="months",
+              label="Breach duration"),
+        _fact("The NCA issued guidance"),
+    ] + [_fact(f"filler {i}") for i in range(8)]
+    blocks = comp.build_data_blocks(_pack(facts), depth="article", enabled=True)
+    assert [b.type for b in blocks] == ["keyFigures"]
+    figures = blocks[0].payload["figures"]
+    # Three labelled figures become two cards: the site lays cards out 2x2
+    # and four in a row, and a third card leaves an empty cell.
+    assert [f["value"] for f in figures] == ["4.73\u00a0GBP m", "100%"]
+    assert [f["label"] for f in figures] == ["OFSI penalty", "Maximum penalty share"]
+    assert all(f["sourceRef"] for f in figures)
+
+
+def test_one_labelled_figure_is_not_a_block():
+    facts = [_fact("A fine of EUR 2m", value="2", unit="EUR m", label="Fine")]
+    assert comp.build_data_blocks(_pack(facts), depth="deep", enabled=True) == []
 
 
 def test_at_most_two_blocks_per_article():
@@ -580,3 +610,61 @@ async def test_the_service_is_a_lookup_not_a_model_call(category, expected):
         assert placed == []
     else:
         assert placed and placed[0].url.endswith(expected)
+
+
+def test_a_figure_repeated_by_every_outlet_counts_once():
+    """NTS_133 P5 Ф3 — a cluster pack reports 15% and 3% from six documents;
+    that is one comparison, not a six-point chart."""
+    facts = [
+        _fact(f"rate {i}", value=v, unit="%", comparable_group="transfer tax rate",
+              label=lab)
+        for i, (v, lab) in enumerate(
+            [("15", "New rate"), ("3", "Old rate")] * 3
+        )
+    ]
+    blocks = comp.build_data_blocks(_pack(facts), depth="article", enabled=True)
+    assert [b.type for b in blocks] == ["keyFigures"]
+    assert [f["value"] for f in blocks[0].payload["figures"]] == ["15%", "3%"]
+
+
+def test_a_bar_chart_is_keyed_on_labels_when_some_points_lack_a_date():
+    facts = [
+        _fact(f"t{i}", value=str(i + 1), unit="%", comparable_group="rate",
+              label=f"Rate {i}", date="2027-07-01" if i == 0 else "")
+        for i in range(4)
+    ]
+    chart = comp.build_data_blocks(_pack(facts), depth="deep", enabled=True)[0]
+    assert chart.payload["chartType"] == "bar"
+    assert [p["x"] for p in chart.payload["series"][0]["points"]] == [
+        "Rate 0", "Rate 1", "Rate 2", "Rate 3",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "unit", "shown"),
+    [
+        ("4732830.58", "GBP", "£4.73m"),
+        ("86000000000", "$", "$86bn"),
+        ("15", "%", "15%"),
+        ("10600000", "CHF", "CHF\u00a010.6m"),
+        ("600000", "GBP", "£600k"),
+        ("3158", "", "3158"),
+        ("4.73", "GBP m", "4.73\u00a0GBP m"),
+        ("2026", "", "2026"),
+        ("CHF 10m", "CHF", "CHF 10m"),
+    ],
+)
+def test_card_values_are_readable_at_a_glance(value, unit, shown):
+    assert comp._figure_value(_fact("x", value=value, unit=unit)) == shown
+
+
+def test_one_figure_is_one_card_even_under_two_labels():
+    facts = [
+        _fact("A7 moved $86bn", value="86000000000", unit="$", label="A7 transactions"),
+        _fact("A7 settled $86bn", value="86000000000", unit="$", label="A7 settlements"),
+        _fact("500 designations", value="500", label="Individuals/entities/ships"),
+    ]
+    blocks = comp.build_data_blocks(_pack(facts), depth="article", enabled=True)
+    figures = blocks[0].payload["figures"]
+    assert [f["value"] for f in figures] == ["$86bn", "500"]
+    assert figures[1]["label"] == "Individuals / entities / ships"

@@ -52,7 +52,11 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
         ({"day": "mon", "capacity": 2}, {"day": "thu", "capacity": 2}),
         [{"day": "tue", "capacity": 3}, {"day": "fri", "capacity": 1}],
     ),
-    ("weekly_draft_budget", 6, 9),
+    ("weekly_draft_budget", 4, 9),
+    # migration 041 — NTS_133 P5: two runs a week of two each.
+    ("production_batch_size", 2, 3),
+    ("autopublish_enabled", False, True),
+    ("stale_draft_days_document", 60, 45),
     ("portfolio_daily_cap_document", 2, 4),
     ("portfolio_daily_cap_news", 1, 3),
     (
@@ -145,6 +149,7 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
             "w_kind": 0.05,
             "w_div": 0.20,
             "w_juris_div": 0.10,
+            "w_scope": 0.40,
         },
         {
             "w_conf": 0.5,
@@ -154,6 +159,7 @@ _SENTINELS: tuple[tuple[str, Any, Any], ...] = (
             "w_kind": 0.1,
             "w_div": 0.3,
             "w_juris_div": 0.2,
+            "w_scope": 0.6,
         },
     ),
     # migration 027 — the primary-document fetch budgets (NTS_101 §4).
@@ -279,8 +285,9 @@ def test_every_v3_column_has_a_sentinel() -> None:
     # 25 from 020, three mode flags (022 + 026), rank weights (026), the five
     # document budgets (027) the four composition
     # keys (028), the cover mode (030), the brief depth floor (034) and the
-    # four event-cluster keys (039).
-    assert len(_SENTINELS) == 45
+    # four event-cluster keys (039), and the rhythm / autopublish / staleness
+    # keys of 041.
+    assert len(_SENTINELS) == 48
 
 
 # --- default reaches the runtime -----------------------------------------

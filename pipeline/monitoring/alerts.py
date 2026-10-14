@@ -83,6 +83,8 @@ VISIBILITY_PREFIXES = (
     "run_started:",
     "run_finished:",
     "published:",
+    # NTS_133 P5 Ф2 — the one message a production run sends.
+    "production_summary:",
     # NTS_106 §2 — the daily contour-1 funnel. A pulse, not an incident: the
     # numbers are always "true", so there is nothing for the recovered
     # reconciliation to clear.
@@ -114,7 +116,22 @@ CLOSE_RETRY_PREFIX = "close_retry_rate:"
 # brand's timezone. The silence itself is the alert, because a monitoring
 # channel that has gone quiet is indistinguishable from a quiet morning.
 DEAD_MAN_PREFIX = "dead_man:"
-DEAD_MAN_HOUR = 9
+# NTS_133 P5 Ф1 — 13:00, not 09:00: the intake moved to 11:40 Madrid, and the
+# heartbeat it sends is the message the switch waits for. At 09:00 the switch
+# would fire every weekday morning on a channel that is working as designed.
+DEAD_MAN_HOUR = 13
+
+# NTS_133 P5 Ф1 — quiet hours, in the brand's timezone. Between 20:00 and
+# 08:00 and all weekend a message is written to the ledger and held: the next
+# pass after the window closes delivers it through the ordinary retry path
+# (``pending_deliveries``), so nothing is dropped, only moved to the morning.
+# Two things are never held, because holding them defeats their purpose: the
+# dead-man switch and the spend kill-switch firing at 100%.
+QUIET_START_HOUR = 20
+QUIET_END_HOUR = 8
+# The zone quiet hours fall back to when no active brand names one. Madrid
+# rather than UTC: the people the quiet hours protect are in Madrid.
+QUIET_TIMEZONE_FALLBACK = "Europe/Madrid"
 PRODUCTION_PREFIXES = (
     THIN_PORTFOLIO_PREFIX,
     CANDIDATE_FAILED_PREFIX,
@@ -167,6 +184,54 @@ _TRIGGER_LABELS = {
 _FINISHED_EMOJI = {"success": "✅", "cancelled": "⏹", "failed": "🔴"}
 
 
+def is_quiet_hours(now: datetime, timezone_name: str | None) -> bool:
+    """True from 20:00 to 08:00 and all of Saturday and Sunday, brand-local."""
+    from pipeline.selector.candidate_store import resolve_timezone
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    local = now.astimezone(
+        resolve_timezone(timezone_name or QUIET_TIMEZONE_FALLBACK)
+    )
+    if local.weekday() >= 5:
+        return True
+    return local.hour >= QUIET_START_HOUR or local.hour < QUIET_END_HOUR
+
+
+def is_critical(notification_id: str) -> bool:
+    """The two alerts quiet hours never hold (NTS_133 P5 Ф1).
+
+    The dead-man switch exists to say the channel is silent, and the spend cap
+    at 100% says production has stopped — a message about either that waits
+    until Monday morning has already failed. The 80% warning is not critical:
+    there is room to act on it after the weekend.
+    """
+    if notification_id.startswith(DEAD_MAN_PREFIX):
+        return True
+    return notification_id.startswith(SPEND_CAP_PREFIX) and notification_id.endswith(
+        ":100"
+    )
+
+
+def _quiet_hours_timezone() -> str | None:
+    """The first active brand's ``brand_timezone`` — the authority for slots
+    since S4 (``PipelineConfig.brand_timezone``), and so for quiet hours."""
+    from pipeline.admin.models import PipelineConfig
+
+    with session_scope() as session:
+        brand = (
+            session.execute(
+                select(Brand).where(Brand.active.is_(True)).order_by(Brand.id)
+            )
+            .scalars()
+            .first()
+        )
+        if brand is None:
+            return None
+        cfg = session.get(PipelineConfig, brand.id)
+        return getattr(cfg, "brand_timezone", None)
+
+
 def _is_oneshot_key(notification_id: str) -> bool:
     """One-shot pulse keys (visibility + backup-stale) — excluded from the
     "recovered" reconciliation, which only clears real incidents."""
@@ -184,7 +249,10 @@ def _fmt_time(dt: datetime) -> str:
 
 
 def _link(href: str, text: str) -> str:
-    url = f"{ALERT_BASE_URL}{href}"
+    # NTS_133 P5: the S4/S7 pulses passed the base URL in already, and got
+    # ``https://iconpipe.comhttps://iconpipe.com/...`` — a link that opens
+    # nothing. A path or an absolute URL both work now.
+    url = href if href.startswith(("http://", "https://")) else f"{ALERT_BASE_URL}{href}"
     # href is server-controlled ("/runs/47", "/sources"); text is too.
     return f'→ <a href="{html.escape(url, quote=True)}">{html.escape(text)}</a>'
 
@@ -410,6 +478,65 @@ def format_intake_heartbeat(
             "причины: "
             + ", ".join(f"{html.escape(str(k))} {v}" for k, v in top)
         )
+    lines.append(f"🕓 {_fmt_hm(finished_at)} UTC")
+    return "\n".join(lines)
+
+
+# --- Production summary (NTS_133 P5 Ф2) ------------------------------------
+
+PRODUCTION_SUMMARY_PREFIX = "production_summary:"
+
+# ``ProductionStats.stopped_reason`` → what it means to the reader. A run that
+# drafted nothing must say why in words, or "0 черновиков" reads as a failure
+# on a week when the budget was simply spent on Tuesday.
+_STOPPED_REASONS = {
+    "production_enabled is off": "производство выключено в Настройках",
+    "monthly_spend_cap": "месячный кап исчерпан",
+    "batch_already_run": "партия на сегодня уже взята",
+    "weekly_budget_exhausted": "недельный бюджет выбран",
+    "empty_portfolio": "в портфеле нечего брать",
+    "run_cost_cap": "достигнут кап прогона",
+}
+
+
+def format_production_summary(
+    *,
+    run_id: int,
+    status: str,
+    stats: dict,
+    titles: dict[int, str],
+    in_review: int,
+    finished_at: datetime,
+) -> str:
+    """One message per production run: topics, drafts, what waits in Review.
+
+    Replaces the generic start + finish pulses for ``run_type='production'``:
+    the editor needs one answer twice a week — what came out and what to read —
+    not a «запущен» followed by «завершён» with v2's «релевантных 0/0».
+    """
+    emoji = _FINISHED_EMOJI.get(status, "✅")
+    selected = int(stats.get("selected", 0) or 0)
+    drafted = int(stats.get("drafted", 0) or 0)
+    lines = [
+        f"{emoji} <b>Производство · Run #{run_id}</b>",
+        f"Тем взято: {selected} · черновиков: {drafted}",
+    ]
+    for item in stats.get("candidates", []) or []:
+        if not isinstance(item, dict) or item.get("candidate_id") is None:
+            continue
+        cid = int(item["candidate_id"])
+        title = titles.get(cid) or "(без заголовка)"
+        mark = "📝" if item.get("status") == "drafted" else "⚠️"
+        lines.append(f"{mark} #{cid} {html.escape(title[:100])}")
+    reason = stats.get("stopped_reason")
+    if reason:
+        lines.append(f"Почему так: {html.escape(_STOPPED_REASONS.get(reason, str(reason)))}")
+    budget = int(stats.get("weekly_budget", 0) or 0)
+    if budget:
+        taken = int(stats.get("taken_this_week", 0) or 0) + drafted
+        lines.append(f"Неделя: {min(taken, budget)} из {budget}")
+    lines.append(f"Ждёт в Ревью: {in_review}")
+    lines.append(_link("/review", "Открыть Ревью"))
     lines.append(f"🕓 {_fmt_hm(finished_at)} UTC")
     return "\n".join(lines)
 
@@ -694,6 +821,10 @@ def check_dead_man(
     local = now.astimezone(resolve_timezone(timezone_name))
     if local.hour < DEAD_MAN_HOUR:
         return None
+    # Weekends are quiet by design (NTS_133 P5 Ф1): no intake runs and every
+    # pulse is held, so silence on a Saturday is the schedule, not a failure.
+    if local.weekday() >= 5:
+        return None
     day_start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
     day_start = day_start_local.astimezone(UTC).replace(tzinfo=None)
     with session_scope() as session:
@@ -937,6 +1068,38 @@ def _parse_stats(stats_json: str | None) -> dict:
     return val if isinstance(val, dict) else {}
 
 
+def _candidate_titles(session: Any, stats: dict) -> dict[int, str]:
+    """``source_title`` of every candidate a production run reported on."""
+    from pipeline.admin.models import Candidate
+
+    ids = [
+        int(item["candidate_id"])
+        for item in stats.get("candidates", []) or []
+        if isinstance(item, dict) and item.get("candidate_id") is not None
+    ]
+    if not ids:
+        return {}
+    rows = session.execute(
+        select(Candidate.id, Candidate.source_title).where(Candidate.id.in_(ids))
+    ).all()
+    return {int(cid): title or "" for cid, title in rows}
+
+
+def _count_in_review(session: Any, brand_id_fk: int | None) -> int:
+    """Candidates whose drafts wait for an editor: ``drafted`` and ``returned``
+    back from rework — the two states the Review screen lists."""
+    from sqlalchemy import func
+
+    from pipeline.admin.models import Candidate
+
+    query = select(func.count()).select_from(Candidate).where(
+        Candidate.status.in_(("drafted", "returned"))
+    )
+    if brand_id_fk is not None:
+        query = query.where(Candidate.brand_id_fk == brand_id_fk)
+    return int(session.execute(query).scalar() or 0)
+
+
 def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
     """``run_started`` + ``run_finished`` pulses not yet in the ledger.
 
@@ -960,6 +1123,9 @@ def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
         for r in running:
             key = f"run_started:{r.id}"
             if key in already:
+                continue
+            # A production run speaks once, when it is done (NTS_133 P5 Ф2).
+            if r.run_type == "production":
                 continue
             out.append(
                 (
@@ -1004,6 +1170,24 @@ def _gather_run_events(already: set[str]) -> list[tuple[str, str]]:
                             run_id=r.id,
                             finished_at=r.finished_at,
                             stats=stats,
+                        ),
+                    )
+                )
+                continue
+            if r.run_type == "production":
+                key = f"{PRODUCTION_SUMMARY_PREFIX}{r.id}"
+                if key in already or r.finished_at is None:
+                    continue
+                out.append(
+                    (
+                        key,
+                        format_production_summary(
+                            run_id=r.id,
+                            status=r.status,
+                            stats=stats,
+                            titles=_candidate_titles(session, stats),
+                            in_review=_count_in_review(session, r.brand_id_fk),
+                            finished_at=r.finished_at,
                         ),
                     )
                 )
@@ -1152,6 +1336,7 @@ async def run_alerts(
     *,
     publisher: TelegramPublisher | None = None,
     send_resolved: bool = True,
+    now: datetime | None = None,
 ) -> dict[str, list[str]]:
     """Compute, dedup, and push alerts. Never raises.
 
@@ -1192,6 +1377,14 @@ async def run_alerts(
     publisher = publisher or TelegramPublisher()
     sent: list[str] = []
 
+    if now is None:
+        now = datetime.now(tz=UTC)
+    try:
+        quiet = is_quiet_hours(now, _quiet_hours_timezone())
+    except Exception:  # unattended; a config read must not silence the pass
+        log.exception("alerts.quiet_hours_check_failed")
+        quiet = False
+
     async def deliver(notification_id: str, message: str) -> bool:
         """Record the intent, try to send, record the outcome (NTS_106 §1).
 
@@ -1200,6 +1393,11 @@ async def run_alerts(
         with no trace and nothing to retry. That was the state NTS_122 §8 found.
         """
         record_intent(notification_id, message)
+        if quiet and not is_critical(notification_id):
+            # Written down, not sent: the first pass after quiet hours picks
+            # it up from ``pending_deliveries`` with zero attempts spent.
+            log.info("alerts.held_for_quiet_hours", notification_id=notification_id)
+            return False
         try:
             await publisher._send_message(chat_id, message)
         except Exception:
@@ -1217,7 +1415,10 @@ async def run_alerts(
         if await deliver(nid, format_alert(item, brand_name=brand_name)):
             sent.append(nid)
 
-    if overflow:
+    # In quiet hours the overflow is left unrecorded rather than summarised:
+    # the first pass after the window computes it again, so one summary goes
+    # out in the morning instead of one held summary per 15-minute pass.
+    if overflow and not quiet:
         summary_key = f"summary:{datetime.now(tz=UTC).strftime('%Y-%m-%dT%H:%M')}"
         if await deliver(summary_key, format_summary(len(overflow))):
             # The overflow ids are "handled" — record them so the next pass
@@ -1262,6 +1463,8 @@ async def run_alerts(
         log.exception("alerts.retry_gather_failed")
         retries = []
     for key, message in retries:
+        if quiet and not is_critical(key):
+            continue
         if await deliver(key, message):
             log.info("alerts.redelivered", key=key)
 
@@ -1274,7 +1477,9 @@ async def run_alerts(
     # defaults and undo exactly the bookkeeping this pass exists to keep.
 
     resolved: list[str] = []
-    if send_resolved and gone_ids:
+    # Held in quiet hours by leaving the rows in place: the reconciliation
+    # finds the same ids gone on the first pass after the window.
+    if send_resolved and gone_ids and not quiet:
         try:
             await publisher._send_message(chat_id, format_resolved(len(gone_ids)))
         except Exception:  # noqa: BLE001

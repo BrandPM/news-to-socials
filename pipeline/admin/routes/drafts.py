@@ -214,6 +214,51 @@ def _upsert_approval(
         return row
 
 
+def _apply_staleness_thresholds(items: list[DraftListItem], brand_id: int) -> None:
+    """Set ``stale_after_days`` per item from its candidate's ``input_kind``.
+
+    NTS_133 P5 Ф4: one 3-day threshold flagged a 31-day-old guidance draft as
+    «news going stale», which it is not — guidance is the current text until
+    it is replaced. The candidate link is on the EN canon only (NTS_065), so
+    each item looks itself and its siblings up. One query for the page.
+    """
+    from pipeline.admin.models import Candidate, PipelineConfig
+
+    def _bare(doc_id: str) -> str:
+        return doc_id[len("drafts.") :] if doc_id.startswith("drafts.") else doc_id
+
+    ids: set[str] = set()
+    for item in items:
+        for doc_id in [item.sanity_id, *(s.sanity_id for s in item.siblings)]:
+            ids.update({_bare(doc_id), f"drafts.{_bare(doc_id)}"})
+    if not ids:
+        return
+    try:
+        with session_scope() as session:
+            cfg = session.get(PipelineConfig, brand_id)
+            news_days = int(getattr(cfg, "stale_draft_days", 3) or 3)
+            doc_days = int(getattr(cfg, "stale_draft_days_document", 60) or 60)
+            kinds = {
+                _bare(str(draft_id)): kind
+                for draft_id, kind in session.execute(
+                    select(Candidate.sanity_draft_id, Candidate.input_kind).where(
+                        Candidate.brand_id_fk == brand_id,
+                        Candidate.sanity_draft_id.in_(ids),
+                    )
+                ).all()
+            }
+    except Exception as exc:  # a staleness hint is not worth failing the list
+        log.warning(
+            "drafts.staleness_lookup_failed", err=f"{type(exc).__name__}: {exc}"
+        )
+        return
+    for item in items:
+        family = [_bare(item.sanity_id), *(_bare(s.sanity_id) for s in item.siblings)]
+        kind = next((kinds[d] for d in family if d in kinds), None)
+        if kind is not None:
+            item.stale_after_days = doc_days if kind == "document" else news_days
+
+
 def _log_review_decision(
     *,
     brand_id: int,
@@ -261,7 +306,11 @@ def _log_review_decision(
 
 
 def _advance_candidate_on_approve(
-    *, sanity_draft_id: str, brand_id: int, note: str | None
+    *,
+    sanity_draft_id: str,
+    brand_id: int,
+    note: str | None,
+    reviewer: str = "admin",
 ) -> None:
     """Walk the linked candidate ``drafted → ready → published`` (NTS_098 §2).
 
@@ -291,6 +340,7 @@ def _advance_candidate_on_approve(
         candidate_id=candidate_id,
         action="approve",
         comment=note,
+        reviewer=reviewer,
     )
 
 
@@ -680,6 +730,8 @@ async def list_drafts(
                 missing=validate_draft_complete(raw),
             )
         )
+
+    _apply_staleness_thresholds(items, brand_id)
 
     # NTS_091 — optional score sort of the fetched page (weakest/strongest
     # first). Items without a score sort last regardless of direction so the
@@ -1240,6 +1292,23 @@ async def approve_all_siblings(
     "approved 3, 1 pending" rather than "all-or-nothing".
     """
     _ensure_brand_owns_draft(brand_id)
+    return await publish_topic_siblings(topic_id, brand_id)
+
+
+async def publish_topic_siblings(
+    topic_id: str,
+    brand_id: int,
+    *,
+    reviewer: str = "admin",
+    note: str | None = None,
+) -> BatchApprovalOut:
+    """The body of ``approve-all-siblings``, callable without a request.
+
+    NTS_133 P5 Ф2: autopublish publishes through exactly this path — the
+    completeness guard, the shared ``publishedAt``, the candidate walked to
+    ``ready``/``published`` — with ``reviewer='system'`` in the review log, so
+    an article the system published is never mistaken for one an editor did.
+    """
     sanity_client, brand_slug = _build_sanity_client_for_brand(brand_id)
 
     # Find every pending draft sharing topic_id (skip already-published
@@ -1344,7 +1413,7 @@ async def approve_all_siblings(
             continue
 
         _row, published_id, failure = await _publish_one_draft(
-            draft_id, brand_id, None, published_at=shared_published_at
+            draft_id, brand_id, note, published_at=shared_published_at
         )
         # Only the EN canon carries the candidate link (NTS_065: a candidate
         # has one ``sanity_draft_id``), so this is a no-op on the siblings —
@@ -1352,7 +1421,7 @@ async def approve_all_siblings(
         # batch approve would publish the article and leave the candidate at
         # ``drafted`` with no slot.
         _advance_candidate_on_approve(
-            sanity_draft_id=draft_id, brand_id=brand_id, note=None
+            sanity_draft_id=draft_id, brand_id=brand_id, note=note, reviewer=reviewer
         )
         if failure is not None:
             fail += 1

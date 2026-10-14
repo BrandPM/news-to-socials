@@ -105,7 +105,8 @@ class ConfigRecord:
         {"day": "mon", "capacity": 2},
         {"day": "thu", "capacity": 2},
     )
-    weekly_draft_budget: int = 6
+    weekly_draft_budget: int = 4
+    production_batch_size: int = 2
     portfolio_daily_cap_document: int = 2
     portfolio_daily_cap_news: int = 1
     candidate_ttl_days: Mapping[str, int] = MappingProxyType(
@@ -195,6 +196,10 @@ class ConfigRecord:
     attribution_model: str = "gpt-4o-mini"
     # NTS_112 — data | flux.
     cover_mode: str = "flux"
+    # NTS_133 P5 Ф2 — publish a clean draft on its slot without a human. OFF.
+    autopublish_enabled: bool = False
+    # NTS_133 P5 Ф4 — staleness for drafts written from a primary document.
+    stale_draft_days_document: int = 60
     # NTS_100 §2 — the rank formula's seven weights, parsed here like the other
     # JSON-as-TEXT keys so the selector never sees a string.
     rank_weights: Mapping[str, float] = MappingProxyType(
@@ -206,6 +211,7 @@ class ConfigRecord:
             "w_kind": 0.05,
             "w_div": 0.20,
             "w_juris_div": 0.10,
+            "w_scope": 0.40,
         }
     )
     guard_model: str = "gpt-4o-mini"
@@ -304,6 +310,9 @@ def _v3_keys(row: Any) -> dict[str, Any]:
         "publication_slots": tuple(slots),
         "weekly_draft_budget": _int_or(
             getattr(row, "weekly_draft_budget", None), d.weekly_draft_budget
+        ),
+        "production_batch_size": _int_or(
+            getattr(row, "production_batch_size", None), d.production_batch_size
         ),
         "portfolio_daily_cap_document": _int_or(
             getattr(row, "portfolio_daily_cap_document", None),
@@ -439,6 +448,13 @@ def _v3_keys(row: Any) -> dict[str, Any]:
             getattr(row, "attribution_model", None), d.attribution_model
         ),
         "cover_mode": _str_or(getattr(row, "cover_mode", None), d.cover_mode),
+        "autopublish_enabled": bool(
+            getattr(row, "autopublish_enabled", d.autopublish_enabled)
+        ),
+        "stale_draft_days_document": _int_or(
+            getattr(row, "stale_draft_days_document", None),
+            d.stale_draft_days_document,
+        ),
         # A weight the operator zeroed is a weight the operator zeroed, so the
         # per-key fallback is only for keys the JSON does not mention at all.
         "rank_weights": MappingProxyType(

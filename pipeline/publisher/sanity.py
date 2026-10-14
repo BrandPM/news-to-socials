@@ -373,6 +373,10 @@ class SanityPostInput:
     # NTS_131 P3 Ф2 — every document the article rests on: the primary one,
     # the event cluster, the research context. ``[{url,title,publisher,role}]``.
     sources: Sequence[Mapping[str, str]] = ()
+    # NTS_133 P5 Ф4 — the run label of a test or proof run («nts131»,
+    # «e2e-2026-09»). Its own field, never part of ``title``: on the title it
+    # reached the slug and from there the live URL of an article.
+    run_tag: str | None = None
 
 
 def _clip(text: str, limit: int) -> str:
@@ -463,6 +467,8 @@ class SanityPublisher:
             "topicId": post.topic_id,
             "generatedBy": "pipeline",
         }
+        if post.run_tag:
+            doc["runTag"] = post.run_tag[:60]
         if post.sources:
             doc["sources"] = [
                 {

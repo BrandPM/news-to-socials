@@ -24,6 +24,7 @@ article bodies over the wire.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # GROQ projection that carries exactly what :func:`validate_draft_complete`
@@ -39,7 +40,29 @@ COMPLETENESS_PROJECTION = (
 
 # Canonical order for the returned codes — stable so tests and the UI banner
 # read the same way every time (cover first: it is the incident).
-COMPONENT_CODES = ("coverImage", "title", "slug", "body", "body_h2", "displayDate")
+COMPONENT_CODES = (
+    "coverImage",
+    "title",
+    "slug",
+    "body",
+    "body_h2",
+    "displayDate",
+    "run_tag",
+)
+
+# NTS_133 P5 Ф4 — a run label in a title or slug is a test article on its way
+# to the site. ``[nts131]``, ``[e2e-2026-09]`` in the title; ``nts131-…``,
+# ``e2e-…`` at the start of the slug, which is where a tagged title put it.
+RUN_TAG_IN_TITLE_RE = re.compile(r"\[(?:e2e|nts\d*|test|proof)[\w.-]*\]", re.IGNORECASE)
+RUN_TAG_IN_SLUG_RE = re.compile(r"^(?:e2e|nts\d+|test|proof)(?:[-_]|$)", re.IGNORECASE)
+
+
+def has_run_tag(title: Any, slug: Any) -> bool:
+    """True when the title or slug still carries a run label."""
+    return bool(
+        (isinstance(title, str) and RUN_TAG_IN_TITLE_RE.search(title))
+        or (isinstance(slug, str) and RUN_TAG_IN_SLUG_RE.search(slug))
+    )
 
 
 def _non_empty_str(value: Any) -> bool:
@@ -116,6 +139,9 @@ def validate_draft_complete(doc: dict | None) -> list[str]:
 
     if not _non_empty_str(doc.get("displayDate")):
         missing.append("displayDate")
+
+    if has_run_tag(doc.get("title"), _slug_value(doc)):
+        missing.append("run_tag")
 
     return missing
 

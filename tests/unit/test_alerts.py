@@ -10,7 +10,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
@@ -120,6 +120,10 @@ def alert_env(tmp_path, monkeypatch):
     hb = tmp_path / ".last_ok"
     hb.write_text(datetime.now(tz=timezone.utc).isoformat())
     monkeypatch.setenv("BACKUP_HEARTBEAT_PATH", str(hb))
+    # NTS_133 P5 — quiet hours read the wall clock; the tests here are about
+    # what is sent, not when, so they must not depend on when the suite runs.
+    # The quiet-hours tests below restore the real function.
+    monkeypatch.setattr(alerts, "is_quiet_hours", lambda *_a, **_k: False)
     admin_db.reset_for_tests()
     engine = admin_db.get_engine(path=tmp_path / "admin.db")
     admin_db.Base.metadata.create_all(engine)
@@ -548,3 +552,151 @@ def test_backup_stale_not_treated_as_recovered(alert_env, monkeypatch, tmp_path)
     res = asyncio.run(alerts.run_alerts(publisher=fake))
     assert res["resolved"] == []
     assert not any("Recovered" in html for _, html in fake.sent)
+
+
+# --- NTS_133 P5 Ф1/Ф2: quiet hours, production summary, links ----------------
+
+_REAL_IS_QUIET = alerts.is_quiet_hours.__wrapped__ if hasattr(
+    alerts.is_quiet_hours, "__wrapped__"
+) else alerts.is_quiet_hours
+
+
+@pytest.mark.parametrize(
+    ("when", "quiet"),
+    [
+        (datetime(2026, 10, 14, 10, 0, tzinfo=UTC), False),  # Wed 12:00 CEST
+        (datetime(2026, 10, 14, 5, 59, tzinfo=UTC), True),  # Wed 07:59 CEST
+        (datetime(2026, 10, 14, 6, 0, tzinfo=UTC), False),  # Wed 08:00 CEST
+        (datetime(2026, 10, 14, 18, 0, tzinfo=UTC), True),  # Wed 20:00 CEST
+        (datetime(2026, 10, 17, 10, 0, tzinfo=UTC), True),  # Saturday noon
+        (datetime(2026, 10, 18, 10, 0, tzinfo=UTC), True),  # Sunday noon
+        (datetime(2026, 11, 4, 7, 0, tzinfo=UTC), False),  # Wed 08:00 CET
+    ],
+)
+def test_quiet_hours_are_madrid_evenings_and_weekends(when, quiet) -> None:
+    assert _REAL_IS_QUIET(when, "Europe/Madrid") is quiet
+
+
+def test_only_dead_man_and_the_kill_switch_are_critical() -> None:
+    assert alerts.is_critical("dead_man:1:2026-10-14")
+    assert alerts.is_critical("spend_cap:1:2026-10:100")
+    assert not alerts.is_critical("spend_cap:1:2026-10:80")
+    assert not alerts.is_critical("run-47")
+    assert not alerts.is_critical("intake_heartbeat:9")
+
+
+def test_quiet_hours_hold_a_message_and_deliver_it_in_the_morning(
+    alert_env, monkeypatch
+) -> None:
+    """Held, not dropped: the row is written in the night and the first pass
+    after 08:00 sends it through the retry path, with no attempt spent."""
+    monkeypatch.setattr(alerts, "is_quiet_hours", _REAL_IS_QUIET)
+    run_id = _add_failed_run(alert_env)
+    night = datetime(2026, 10, 14, 21, 0, tzinfo=UTC)  # 23:00 Madrid
+
+    fake = FakePublisher()
+    res = asyncio.run(alerts.run_alerts(publisher=fake, now=night))
+    assert res["sent"] == []
+    assert fake.sent == []
+    with admin_db.get_session_factory()() as session:
+        row = session.get(AlertSent, f"run-{run_id}")
+        assert row is not None
+        assert row.delivered is False
+        assert row.attempts == 0
+
+    morning = datetime(2026, 10, 15, 7, 0, tzinfo=UTC)  # 09:00 Madrid
+    fake2 = FakePublisher()
+    asyncio.run(alerts.run_alerts(publisher=fake2, now=morning))
+    assert any(f"Run #{run_id}" in html for _, html in fake2.sent)
+    with admin_db.get_session_factory()() as session:
+        assert session.get(AlertSent, f"run-{run_id}").delivered is True
+
+
+def test_quiet_hours_let_the_kill_switch_through(alert_env, monkeypatch) -> None:
+    monkeypatch.setattr(alerts, "is_quiet_hours", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        alerts,
+        "_gather_production_events",
+        lambda already: [("spend_cap:1:2026-10:100", "🔴 cap"), ("spend_cap:1:2026-10:80", "🟡 cap")],
+    )
+    fake = FakePublisher()
+    res = asyncio.run(alerts.run_alerts(publisher=fake))
+    assert res["sent"] == ["spend_cap:1:2026-10:100"]
+    assert [html for _, html in fake.sent] == ["🔴 cap"]
+
+
+def test_a_production_run_sends_one_summary(alert_env) -> None:
+    from pipeline.admin.models import Candidate
+
+    brand_id = alert_env
+    factory = admin_db.get_session_factory()
+    now = datetime.now(tz=UTC)
+    with factory() as session:
+        for cid, title, status in (
+            (501, "OFSI fines Citibank", "drafted"),
+            (502, "FINMA closes Julius Baer case", "drafted"),
+            (503, "Older draft", "drafted"),
+        ):
+            session.add(
+                Candidate(
+                    id=cid,
+                    brand_id_fk=brand_id,
+                    input_kind="document",
+                    source_title=title,
+                    source_url=f"https://example.org/{cid}",
+                    verdict="accept",
+                    reason_code="ok",
+                    reason="in scope",
+                    status=status,
+                    created_at=now,
+                )
+            )
+        running = Run(
+            brand_id_fk=brand_id, triggered_by="cron", source_ids="[]",
+            started_at=now, status="running", run_type="production",
+        )
+        done = Run(
+            brand_id_fk=brand_id, triggered_by="cron", source_ids="[]",
+            started_at=now, finished_at=now, status="success", run_type="production",
+            stats=(
+                '{"selected": 2, "drafted": 2, "weekly_budget": 4, '
+                '"taken_this_week": 0, "candidates": ['
+                '{"candidate_id": 501, "status": "drafted"}, '
+                '{"candidate_id": 502, "status": "drafted"}]}'
+            ),
+        )
+        session.add_all([running, done])
+        session.commit()
+        running_id, done_id = running.id, done.id
+
+    fake = FakePublisher()
+    res = asyncio.run(alerts.run_alerts(publisher=fake))
+    assert f"run_started:{running_id}" not in res["sent"]
+    assert f"run_finished:{done_id}" not in res["sent"]
+    assert f"production_summary:{done_id}" in res["sent"]
+    summary = [h for _, h in fake.sent if "Производство" in h]
+    assert len(summary) == 1
+    text = summary[0]
+    assert "Тем взято: 2 · черновиков: 2" in text
+    assert "#501 OFSI fines Citibank" in text
+    assert "Неделя: 2 из 4" in text
+    assert "Ждёт в Ревью: 3" in text
+    assert 'href="https://iconpipe.com/review"' in text
+
+
+def test_an_empty_production_run_says_why() -> None:
+    text = alerts.format_production_summary(
+        run_id=7,
+        status="success",
+        stats={"selected": 0, "drafted": 0, "stopped_reason": "weekly_budget_exhausted"},
+        titles={},
+        in_review=1,
+        finished_at=datetime(2026, 10, 15, 10, 5, tzinfo=UTC),
+    )
+    assert "Почему так: недельный бюджет выбран" in text
+
+
+def test_links_are_never_doubled() -> None:
+    text = alerts.format_spend_cap(spent_usd=9.0, cap_usd=10.0, stopped=False)
+    assert 'href="https://iconpipe.com/settings"' in text
+    assert "comhttps" not in text

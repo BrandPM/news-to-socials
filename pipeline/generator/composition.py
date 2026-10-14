@@ -76,6 +76,17 @@ CHART_MIN_POINTS = 4
 BLOCK_MIN_FACTS = 2
 # NTS_095 — "один-два блока на статью, не больше".
 MAX_BLOCKS = 2
+# NTS_133 P5 Ф3 — the depths a block may be built at. ``deep`` alone made the
+# blocks unreachable in production: material almost never got there, and a
+# regulator's document with ten-plus facts is an ``article`` that has numbers
+# worth a card. ``brief`` and ``note`` stay without blocks — 300-400 words
+# with a table is a table with a caption.
+BLOCK_DEPTHS = ("article", "deep")
+# keyFigures from labelled figures when no comparable group exists: two or
+# four cards, never three. The site lays the cards out 2x2 on a phone and four
+# in a row on a desktop, and three cards leave an empty grey cell in both
+# (seen on the OFSI/Citibank pack, NTS_133 P5 Ф3).
+KEY_FIGURES_MAX = 4
 
 # NTS_102 v2 §1b — pie charts are banned: shares read badly on a phone, and
 # every Icon story that would want one is better as a bar.
@@ -122,10 +133,20 @@ def comparable_groups(facts: Sequence[Any]) -> dict[str, list[Any]]:
     percentage and an amount would build a table comparing 12.5 with 5 000 000.
     """
     buckets: dict[str, list[Any]] = {}
+    seen: set[tuple[str, str]] = set()
     for fact in facts:
         group = (getattr(fact, "comparable_group", "") or "").strip().lower()
         if not group:
             continue
+        # NTS_133 P5 Ф3 — one figure, many outlets. A cluster pack repeats the
+        # same number from every document that reports it, and a "series" of
+        # 15, 3, 15, 3, 15, 3 is one comparison drawn three times. A value
+        # with a filled ``value`` counts once per group.
+        value = (getattr(fact, "value", "") or "").strip().lower()
+        if value:
+            if (group, value) in seen:
+                continue
+            seen.add((group, value))
         buckets.setdefault(group, []).append(fact)
     usable: dict[str, list[Any]] = {}
     for group, members in buckets.items():
@@ -1029,11 +1050,99 @@ def _label_of(fact: Any) -> str:
     the source's wording is still the source's wording.
     """
     label = (getattr(fact, "label", "") or "").strip()
+    # «individuals/entities/ships» is one unbreakable word on a 150px card.
+    label = re.sub(r"\s*/\s*", " / ", label)
     if not label:
         text = (getattr(fact, "text", "") or "").strip()
         clause = re.split(r"[,;:(—–]| - ", text, maxsplit=1)[0]
         label = " ".join(clause.split()[:5]).rstrip(".")
     return _capitalised(label)
+
+
+_CURRENCY_SYMBOLS = ("$", "€", "£", "₣", "¥")
+# A card is ~150px wide at 34px type: «GBP 19.72 m» breaks into three lines,
+# «£19.72m» fits on one. Codes without a common symbol keep the code, joined
+# to the number by a no-break space so the two never land on separate lines.
+_CODE_TO_SYMBOL = {"GBP": "£", "EUR": "€", "USD": "$"}
+_PLAIN_NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _readable_number(value: str) -> str:
+    """«4732830.58» → «4.73 m», «86000000000» → «86 bn».
+
+    Display only, and only for plain numbers of a million and up: the card is
+    read at a glance, and seven digits are not. The article text keeps the
+    source's exact figure (``text``), so nothing the reader can check is lost.
+    Anything that is not a bare number — «4.73», «CHF 10m», «2026» — is left
+    exactly as research wrote it.
+    """
+    if not _PLAIN_NUMBER_RE.match(value):
+        return value
+    number = float(value)
+    for size, suffix in ((1e9, "bn"), (1e6, "m")):
+        if abs(number) >= size:
+            scaled = f"{number / size:.2f}".rstrip("0").rstrip(".")
+            return f"{scaled}{suffix}"
+    return value
+
+
+def _figure_value(fact: Any) -> str:
+    """``value`` with its unit, the way a card prints it: «GBP 4.73 m», «15%»."""
+    raw = (getattr(fact, "value", "") or "").strip()
+    unit = (getattr(fact, "unit", "") or "").strip()
+    if not unit or unit.lower() in raw.lower():
+        # A bare number is left for the site to format in the reader's locale
+        # (``Intl.NumberFormat`` in PortableBodyBlocks) unless it is a million
+        # and up, which no locale makes readable at a glance.
+        return _readable_number(raw)
+    value = _readable_number(raw)
+    # With a unit attached the site no longer sees a plain number and prints
+    # the string as is, so «£600000» needs its shortening here.
+    if value == raw and _PLAIN_NUMBER_RE.match(raw) and abs(float(raw)) >= 10_000:
+        value = f"{float(raw) / 1e3:.1f}".rstrip("0").rstrip(".") + "k"
+    if unit in ("%", "‰"):
+        return f"{value}{unit}"
+    if unit in _CURRENCY_SYMBOLS:
+        return f"{unit}{value}"
+    if unit.upper() in _CODE_TO_SYMBOL:
+        return f"{_CODE_TO_SYMBOL[unit.upper()]}{value}"
+    if len(unit) == 3 and unit.isalpha() and unit.isupper():
+        return f"{unit}{_NBSP}{value}"  # ISO code first, as finance writes it
+    return f"{value}{_NBSP}{unit}"
+
+
+def _key_figure_candidates(facts: Sequence[Any]) -> list[Any]:
+    """Facts fit for a key-figures card: a value, a source URL and a label
+    research wrote itself (NTS_131 P3 Ф2 §6).
+
+    The research label is required, not derived: a card without one would be
+    captioned by a clipped sentence, which is the unreadable state this block
+    was redesigned to leave. Order is the pack's — primary-document facts
+    come first — and a figure repeated by a second outlet is taken once.
+    """
+    out: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for fact in facts:
+        value = (getattr(fact, "value", "") or "").strip()
+        label = (getattr(fact, "label", "") or "").strip()
+        url = (getattr(fact, "url", "") or "").strip()
+        if not (value and label and url):
+            continue
+        # One figure is one card. «$86bn A7 transactions» and «$86bn A7
+        # settlements» are the same number reported twice (OFSI/NCA pack);
+        # two cards with one figure read as an error, not as emphasis.
+        # Keyed on what the card will print, so «86000000000 $» and
+        # «86000000000.0 USD» are recognised as one figure too.
+        key = (_figure_value(fact).lower(), "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fact)
+        if len(out) >= KEY_FIGURES_MAX:
+            break
+    if len(out) == 3:
+        out = out[:2]
+    return out
 
 
 def _capitalised(text: str) -> str:
@@ -1044,6 +1153,14 @@ def _capitalised(text: str) -> str:
 def _series_points(members: Sequence[Any]) -> list[dict[str, Any]]:
     """``[{x, y}]`` from facts that carry a value and something to key it on."""
     points: list[dict[str, Any]] = []
+    # Dates key the axis only when every member has one. A mixed series —
+    # one point at «2027-07-01», the rest at «Current rate» — is neither a
+    # time line nor a set of categories (NTS_133 P5 Ф3, the Greece pack).
+    dated = all(
+        (getattr(f, "date", "") or "").strip()
+        for f in members
+        if (getattr(f, "value", "") or "").strip()
+    )
     for fact in members:
         value = (getattr(fact, "value", "") or "").strip()
         if not value:
@@ -1056,7 +1173,7 @@ def _series_points(members: Sequence[Any]) -> list[dict[str, Any]]:
         if y.is_integer():
             y = int(y)
         date = (getattr(fact, "date", "") or "").strip()
-        points.append({"x": date or _label_of(fact)[:40], "y": y})
+        points.append({"x": date if dated else _label_of(fact)[:40], "y": y})
     return points
 
 
@@ -1078,14 +1195,45 @@ def build_data_blocks(
     and is tested while the flag is off, and only stops returning an empty list
     once the Sanity schema PR of S8 is merged.
     """
-    if not enabled or depth != "deep" or fact_pack is None:
+    if not enabled or depth not in BLOCK_DEPTHS or fact_pack is None:
         return []
     facts = list(getattr(fact_pack, "source_facts", []) or []) + list(
         getattr(fact_pack, "context", []) or []
     )
     groups = comparable_groups([f for f in facts if (getattr(f, "value", "") or "")])
     if not groups:
-        return []
+        # NTS_133 P5 Ф3 — the gap NTS_131 named: depth counted facts with a
+        # figure, blocks needed a *comparable group* of them, and research
+        # rarely labels two facts into one group. Labelled headline figures
+        # are a key-figures block in their own right; each card still carries
+        # its own source, and none is compared with another.
+        figures = _key_figure_candidates(facts)
+        if len(figures) < BLOCK_MIN_FACTS:
+            return []
+        blocks_kf = [
+            DataBlock(
+                "keyFigures",
+                {
+                    "figures": [
+                        {
+                            "value": _figure_value(f),
+                            "label": _label_of(f),
+                            "sourceRef": getattr(f, "url", ""),
+                        }
+                        for f in figures
+                    ],
+                    "caption": "",
+                },
+            )
+        ]
+        log.info(
+            "composition.data_blocks",
+            depth=depth,
+            blocks=["keyFigures"],
+            groups=0,
+            fallback="labelled_figures",
+        )
+        return blocks_kf
 
     blocks: list[DataBlock] = []
     for group, members in sorted(
@@ -1125,7 +1273,12 @@ def build_data_blocks(
                         "columns": ["", unit or "value"],
                         "rows": [
                             {
-                                "cells": [_label_of(f), getattr(f, "value", "")],
+                                "cells": [
+                                    _label_of(f),
+                                    _readable_number(
+                                        (getattr(f, "value", "") or "").strip()
+                                    ),
+                                ],
                                 "sourceRef": getattr(f, "url", ""),
                             }
                             for f in members
@@ -1138,20 +1291,24 @@ def build_data_blocks(
     if len(blocks) == 1 and blocks[0].type == "statTable" and len(
         blocks[0].payload.get("rows", [])
     ) == 2:
-        rows = blocks[0].payload["rows"]
+        caption = blocks[0].payload.get("caption", "")
+        members = groups.get(caption.lower(), [])
         blocks = [
             DataBlock(
                 "keyFigures",
                 {
+                    # Built from the facts, not from the table rows: a row
+                    # cell holds the bare value and the unit sits in the column
+                    # header, which a card does not have.
                     "figures": [
                         {
-                            "value": row["cells"][1],
-                            "label": row["cells"][0],
-                            "sourceRef": row["sourceRef"],
+                            "value": _figure_value(f),
+                            "label": _label_of(f),
+                            "sourceRef": getattr(f, "url", ""),
                         }
-                        for row in rows
+                        for f in members
                     ],
-                    "caption": blocks[0].payload.get("caption", ""),
+                    "caption": caption,
                 },
             )
         ]

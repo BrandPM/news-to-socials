@@ -266,6 +266,7 @@ def eligible_candidates(
 
     from pipeline.admin.db import get_session_factory
     from pipeline.admin.models import Candidate
+    from pipeline.selector.scope import scope_of
     from pipeline.sources.document_fetcher import DOC_RETRY_AFTER_HOURS
 
     now = now or datetime.now(tz=UTC)
@@ -320,6 +321,11 @@ def eligible_candidates(
                     created_at=row.created_at,
                     source_published_at=row.source_published_at,
                     manual_action=row.manual_action,
+                    scope=scope_of(
+                        row.service_category,
+                        title=row.source_title,
+                        summary=row.source_summary,
+                    ),
                 )
             )
     return out
@@ -1371,13 +1377,14 @@ async def produce_candidate(
             fact_pack=fact_pack,
         )
 
-        # ``--tag`` marks the DRAFT's title, not the news peg's: the article
-        # title is written by the model from the peg, so tagging the peg put
-        # the mark somewhere the operator never sees. On the title it reaches
-        # the slug too, which is how a test article is found and deleted later.
+        # ``--tag`` goes to the draft's own ``runTag`` field (NTS_133 P5 Ф4).
+        # It used to prefix the title, which carried it into the slug and from
+        # there into a published URL; a test run is now found by
+        # ``*[runTag == $tag]`` and the publish guard refuses a tagged title.
         posts = [
             SanityPostInput(
-                title=f"[{tag}] {draft.title}" if tag else draft.title,
+                title=draft.title,
+                run_tag=tag,
                 body_markdown=draft.body,
                 language=language,
                 category=category,
@@ -1650,17 +1657,22 @@ async def run_production(
         return stats
 
     # --- the weekly budget (NTS_100 §3.1-3.2) ----------------------------
-    budget = int(getattr(config, "weekly_draft_budget", 6))
+    budget = int(getattr(config, "weekly_draft_budget", 4))
+    batch_size = int(getattr(config, "production_batch_size", 2))
     taken, category_counts, jurisdiction_counts = taken_this_week(
         brand_id_fk=brand_id_fk, now=now, timezone_name=tz_name
     )
     stats.weekly_budget = budget
     stats.taken_this_week = taken
-    slots_left = budget - taken
+    # NTS_133 P5 Ф2 — the week is two runs of ``production_batch_size``, not
+    # one run that takes whatever the budget allows. ``--limit`` can only
+    # narrow it further.
+    slots_left = min(budget - taken, batch_size)
     if limit is not None:
         slots_left = min(slots_left, int(limit))
     log_lines.append(
-        f"budget: weekly={budget} taken={taken} slots={max(0, slots_left)}"
+        f"budget: weekly={budget} taken={taken} batch={batch_size} "
+        f"slots={max(0, slots_left)}"
     )
     if slots_left <= 0:
         stats.stopped_reason = "weekly_budget_exhausted"
@@ -1920,7 +1932,7 @@ def main(
         None, "--cost-cap-usd", help="stop between candidates above this spend"
     ),
     tag: str | None = typer.Option(
-        None, "--tag", help="mark the drafts' titles/slugs, e.g. for an e2e proof"
+        None, "--tag", help="mark the drafts' runTag field, e.g. for an e2e proof"
     ),
     triggered_by: str = typer.Option("cron", "--triggered-by"),
     candidate: list[int] = typer.Option(

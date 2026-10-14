@@ -123,7 +123,7 @@ class CoverData:
 # --------------------------------------------------------------------------
 
 _AMOUNT_RE = re.compile(
-    r"\b(?:EUR|USD|CHF|GBP|PLN|UAH)\s?[\d][\d\s,.]*(?:\s?(?:m|bn|million|billion))?",
+    r"\b(?:EUR|USD|CHF|GBP|PLN|UAH)\s?[\d][\d\s,.]*(?:\s?(?:million|billion|bn|m)\b)?",
     re.IGNORECASE,
 )
 _PERCENT_RE = re.compile(r"\b\d+(?:[.,]\d+)?\s?%")
@@ -178,7 +178,15 @@ def _tidy(raw: str) -> str:
             out = char + out
         return out
 
-    return re.sub(r"[\d][\d\s,]*", _group, text).strip()
+    # The group may span «5 000 000» but never the space before a word: the
+    # first version swallowed it and stamped «USD 86billion» (NTS_133 P5 Ф3).
+    grouped = re.sub(r"\d[\d,]*(?:\s\d{3}(?!\d))*", _group, text).strip()
+    # «86 billion» → «86bn»: the stamp is set at 48px, and the short form is
+    # how the financial press writes it.
+    grouped = re.sub(r"\s+%", "%", grouped)
+    grouped = re.sub(r"\s?billion\b", "bn", grouped, flags=re.IGNORECASE)
+    grouped = re.sub(r"\s?million\b", "m", grouped, flags=re.IGNORECASE)
+    return re.sub(r"(\d)\s(m|bn)\b", r"\1\2", grouped)
 
 
 # --------------------------------------------------------------------------

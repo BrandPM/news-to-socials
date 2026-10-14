@@ -1,28 +1,33 @@
 # systemd units
 
-The active deployment (ADR-018 Sanity pivot; NTS_025/073/074) runs five units:
+The active deployment (ADR-018 Sanity pivot; NTS_025/073/074) runs these
+units. **Every calendar is in `Europe/Madrid`** (NTS_133 P5 Ф1) — the brand's
+`brand_timezone` — so a run stays at the same Madrid hour across DST instead
+of drifting an hour twice a year.
 
-* `nts-admin-api.service` — the FastAPI admin API (uvicorn). Triggers pipeline
-  runs as detached subprocesses (NTS_074), serves the operator UI's backend.
-* `nts-monitor.timer` / `.service` — the Telegram failure + pipeline-visibility
-  alerter (NTS_073/075), every 15 minutes.
-* `nts-intake.timer` / `.service` — the v3 contour-1 intake (NTS_099/NTS_103),
-  once a day at 06:10 UTC. **Reads `pipeline_config.intake_enabled`**: with the
-  flag off (the shipped default) the run exits without fetching anything, so
-  the unit can be enabled before the shadow week starts and the start itself is
-  a Settings edit. It makes no generation call of any kind — one embedding plus
-  one cheap guard completion per item.
-* `nts-production.timer` / `.service` — the v3 contour-2 production run
-  (NTS_100), Wednesdays and Sundays at 05:00 UTC. **Reads
-  `pipeline_config.production_enabled`**, off by default like the intake flag:
-  with it off the run writes a `cancelled` row and exits 0, so the unit is safe
-  to enable before the first supervised run. This is the only unit that spends
-  money on generation.
-* `nts-portfolio-sweep.timer` / `.service` — the daily TTL / production-timeout
-  / retention passes (NTS_100 §6), 04:40 UTC. Deliberately daily while
-  production is twice a week, and deliberately **not** behind
-  `production_enabled`: expiring a candidate and pruning a 30-day-old reject is
-  hygiene, costs nothing, and must keep happening while generation is off.
+| Unit | When (Madrid) | What |
+|---|---|---|
+| `nts-admin-api.service` | always on | FastAPI admin API (uvicorn); triggers detached runs (NTS_074) |
+| `nts-monitor.timer` | every 15 min | Telegram alerts (NTS_073/075). **Quiet hours** in code: 20:00–08:00 and all weekend nothing is sent except the dead-man switch and the spend kill-switch at 100%; held messages go out on the first pass after 08:00 Mon–Fri |
+| `nts-portfolio-sweep.timer` | Mon–Fri 10:40 | TTL / production-timeout / retention passes (NTS_100 §6); not behind `production_enabled` |
+| `nts-autopublish.timer` | Mon–Fri 10:00 | publishes clean drafts on their `publication_slots` day; obeys `autopublish_enabled` (OFF) |
+| `nts-intake.timer` | Mon–Fri 11:40 | contour-1 intake (NTS_099/103); obeys `intake_enabled` |
+| `nts-production.timer` | Tue, Thu 12:00 | contour-2 production, `production_batch_size` (2) per run, `weekly_draft_budget` (4) per week; obeys `production_enabled`. The only unit that spends on generation; sends one summary to Telegram when done |
+| `nts-backup.timer` (`infra/backup`) | 03:00 UTC daily | admin.db backup (NTS_088), unchanged |
+
+`Persistent=true` on every timer: a run missed while the VPS was down is caught
+up at boot. The daytime timers all start at 10:00 Madrid or later, so a
+catch-up after a daytime reboot lands in working hours; after a night reboot it
+runs at boot and quiet hours hold its messages until 08:00.
+
+The dead-man switch fires at **13:00** Madrid on weekdays (after the 11:40
+intake heartbeat), never at weekends.
+
+**`nts-run.service` / `nts-run.timer` (v2, NTS_004 era) are retired.** They are
+not in this directory and nothing in the code calls them: the admin API's
+manual runs are transient `systemd-run --scope --unit=nts-run-<id>` units
+(`pipeline/admin/jobs.py`), a different name. Remove them from the VPS — see
+"Decommission" below.
 
 The legacy Directus-era units (`news-poll`, `news-dispatch`, `news-stale`,
 `news-summary`, `news-bot`) were removed in NTS_076 — dead since the ADR-018
@@ -38,13 +43,15 @@ All units run as the unprivileged service user with access to
 sudo cp nts-admin-api.service nts-monitor.service nts-monitor.timer \
         nts-intake.service nts-intake.timer \
         nts-production.service nts-production.timer \
-        nts-portfolio-sweep.service nts-portfolio-sweep.timer /etc/systemd/system/
+        nts-portfolio-sweep.service nts-portfolio-sweep.timer \
+        nts-autopublish.service nts-autopublish.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now nts-admin-api.service
 sudo systemctl enable --now nts-monitor.timer
 sudo systemctl enable --now nts-intake.timer
 sudo systemctl enable --now nts-production.timer
 sudo systemctl enable --now nts-portfolio-sweep.timer
+sudo systemctl enable --now nts-autopublish.timer
 ```
 
 Enabling the two new timers does **not** start producing: `production_enabled`
@@ -77,4 +84,13 @@ done
 sudo systemctl disable --now news-bot.service 2>/dev/null || true
 sudo rm -f /etc/systemd/system/news-{poll,dispatch,stale,summary,bot}.{service,timer}
 sudo systemctl daemon-reload
+```
+
+## Decommission (v2 `nts-run`, NTS_133 P5)
+
+```bash
+grep -rn "nts-run\.service\|nts-run\.timer" /etc/systemd/system /etc/cron* 2>/dev/null  # expect only the two files
+sudo systemctl disable --now nts-run.timer nts-run.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/nts-run.service /etc/systemd/system/nts-run.timer
+sudo systemctl daemon-reload && sudo systemctl reset-failed
 ```

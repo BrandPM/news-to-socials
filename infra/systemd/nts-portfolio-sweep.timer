@@ -1,13 +1,15 @@
 [Unit]
-Description=Run the News-to-Socials portfolio passes once a day (NTS_100 §6)
+Description=Run the News-to-Socials portfolio passes on weekdays (NTS_133 P5 Ф1)
 Requires=nts-portfolio-sweep.service
 
 [Timer]
-# 04:40 UTC — before production (05:00 Wed/Sun) so a timed-out candidate is
-# back in `pending` and rankable the same morning, and before the intake
-# (06:10) so the daily cap is counted against a portfolio that has already
-# shed its expired rows.
-OnCalendar=*-*-* 04:40:00 UTC
+# Mon..Fri 10:40 Madrid — before the intake (11:40) so the daily cap is
+# counted against a portfolio that has already shed its expired rows, and
+# before production (Tue/Thu 12:00) so a timed-out candidate is back in
+# `pending` and rankable the same day. Weekdays only: production does not run
+# at weekends, and a TTL that expires on Saturday is applied on Monday
+# morning, before anything could have picked the candidate up.
+OnCalendar=Mon..Fri *-*-* 10:40:00 Europe/Madrid
 Persistent=true
 
 [Install]

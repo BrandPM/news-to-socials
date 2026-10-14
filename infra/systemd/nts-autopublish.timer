@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the News-to-Socials autopublish pass on weekday mornings (NTS_133 P5 Ф2)
+Requires=nts-autopublish.service
+
+[Timer]
+# Mon..Fri 10:00 Madrid. The pass itself publishes only on a day
+# publication_slots names (Mon and Thu for Icon) and only up to that day's
+# capacity, so the calendar lives in the config, not here; this is just the
+# moment of the day it is applied — morning, with the editor at work to see it.
+OnCalendar=Mon..Fri *-*-* 10:00:00 Europe/Madrid
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,25 @@
+[Unit]
+Description=News-to-Socials: publish clean drafts on their slot (NTS_133 P5 Ф2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=news-deploy
+Group=news-deploy
+WorkingDirectory=/opt/news-to-socials/repo
+EnvironmentFile=/opt/news-to-socials/repo/.env
+# Obeys pipeline_config.autopublish_enabled (OFF by default): with the flag off
+# the pass returns before reading a single draft and writes no run row. Safe to
+# enable before Andriy switches the flag on.
+ExecStart=/opt/news-to-socials/repo/.venv/bin/python -m pipeline.autopublish icon
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/news-to-socials /opt/news-to-socials/repo
+MemoryMax=256M
+
+StandardOutput=append:/var/log/news-to-socials/production.log
+StandardError=append:/var/log/news-to-socials/production.log

@@ -39,7 +39,8 @@ from ..common.logging import get_logger
 
 log = get_logger(__name__)
 
-# The seven weights of NTS_100 §2, in the order the spec writes them. Exported
+# The seven weights of NTS_100 §2, in the order the spec writes them, plus
+# ``w_scope`` (NTS_133 P5 Ф2). Exported
 # because the API validator rejects any key outside this set — a misspelled
 # weight that saves cleanly and is never read is the silent-config failure the
 # sentinel suite exists to prevent.
@@ -51,6 +52,8 @@ RANK_WEIGHT_KEYS: tuple[str, ...] = (
     "w_kind",
     "w_div",
     "w_juris_div",
+    # NTS_133 P5 Ф2 — the eighth: is the story about private wealth at all.
+    "w_scope",
 )
 
 # depth_weight[depth_prior] — NTS_100 §2. An unknown depth scores as ``note``:
@@ -91,6 +94,9 @@ def default_weights() -> dict[str, float]:
         "w_kind": 0.05,
         "w_div": 0.20,
         "w_juris_div": 0.10,
+        # The heaviest term on purpose: a confident, fresh, tier-1 story about
+        # a furniture chain must lose to a weaker one about a family office.
+        "w_scope": 0.40,
     }
 
 
@@ -105,6 +111,7 @@ class RankWeights:
     w_kind: float = 0.05
     w_div: float = 0.20
     w_juris_div: float = 0.10
+    w_scope: float = 0.40
 
     @classmethod
     def from_config(cls, config: Any) -> RankWeights:
@@ -156,6 +163,10 @@ class CandidateFacts:
     created_at: datetime | None
     source_published_at: datetime | None = None
     manual_action: str | None = None
+    # NTS_133 P5 Ф2 — :func:`pipeline.selector.scope.scope_of`. 1.0 by default
+    # so a snapshot built without it ranks as before; 0.0 means the story is
+    # not about private wealth and is never picked by the formula.
+    scope: float = 1.0
 
     @property
     def primary_jurisdiction(self) -> str | None:
@@ -245,6 +256,7 @@ def score_candidate(
         "juris_div_penalty": -(
             weights.w_juris_div * float(same_jurisdiction_taken)
         ),
+        "scope": weights.w_scope * float(facts.scope),
     }
     ranked = RankedCandidate(
         candidate_id=facts.candidate_id,
@@ -337,6 +349,13 @@ def select_batch(
         ranked.terms["_promoted"] = 1.0
         log.info("ranking.promoted", **ranked.as_log())
         _take(facts, ranked)
+
+    # NTS_133 P5 Ф2 — out of scope is a floor, not only a low rank: on a thin
+    # week the best of what is left would otherwise be the furniture chain.
+    # After the promoted pass, so a manager's promotion still wins.
+    for facts in [c for c in remaining if c.scope <= 0.0]:
+        log.info("ranking.off_scope", candidate_id=facts.candidate_id)
+        remaining.remove(facts)
 
     while remaining and len(picked) < limit:
         scored = [

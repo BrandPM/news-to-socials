@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -984,3 +985,58 @@ def test_build_live_url_missing_language_or_slug_is_none(
     from pipeline.admin.routes.drafts import _build_live_url
 
     assert _build_live_url("icon", language, slug) is None
+
+
+def test_list_drafts_reports_a_staleness_threshold_per_material_kind(
+    monkeypatch, client, icon_with_creds
+) -> None:
+    """NTS_133 P5 Ф4 — a guidance draft is not «news going stale» at 31 days.
+
+    The candidate link sits on the EN canon; the RU sibling finds it through
+    the topic's sibling list.
+    """
+    from pipeline.admin import db as admin_db
+    from pipeline.admin.models import Candidate, PipelineConfig
+
+    bid = icon_with_creds
+    with admin_db.get_session_factory()() as session:
+        if session.get(PipelineConfig, bid) is None:
+            session.add(
+                PipelineConfig(
+                    brand_id_fk=bid, scoring_threshold=7, topics_per_run=3,
+                    banned_phrases="[]", voice_profile="x",
+                )
+            )
+        for cid, kind, draft in ((901, "document", "drafts.post-doc-en"),
+                                 (902, "news", "drafts.post-news-en")):
+            session.add(Candidate(
+                id=cid, brand_id_fk=bid, input_kind=kind, source_title="t",
+                verdict="accept", reason_code="ok", reason="r", status="drafted",
+                sanity_draft_id=draft,
+                created_at=datetime(2026, 10, 1),
+            ))
+        session.commit()
+    items = [
+        {"_id": "drafts.post-doc-ru", "title": "Guidance", "language": "ru",
+         "topicId": "t-doc", "_createdAt": "2026-10-01T10:00:00Z"},
+        {"_id": "drafts.post-news-en", "title": "Deal", "language": "en",
+         "topicId": "t-news", "_createdAt": "2026-10-01T10:00:00Z"},
+        {"_id": "drafts.post-old", "title": "v2", "language": "en",
+         "topicId": "t-old", "_createdAt": "2026-05-01T10:00:00Z"},
+    ]
+    siblings = [
+        {"_id": "drafts.post-doc-en", "language": "en", "topicId": "t-doc", "isDraft": True},
+        {"_id": "drafts.post-doc-ru", "language": "ru", "topicId": "t-doc", "isDraft": True},
+    ]
+    from pipeline.publisher import sanity as sanity_mod
+
+    monkeypatch.setattr(
+        sanity_mod.SanityClient, "query",
+        _make_list_query_mock({"total": 3, "en": 2, "ru": 1}, items, siblings),
+    )
+    resp = client.get(f"/api/v1/drafts?brand_id={bid}", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    by_id = {it["sanity_id"]: it for it in resp.json()["items"]}
+    assert by_id["drafts.post-doc-ru"]["stale_after_days"] == 60
+    assert by_id["drafts.post-news-en"]["stale_after_days"] == 3
+    assert by_id["drafts.post-old"]["stale_after_days"] is None

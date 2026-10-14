@@ -1,12 +1,21 @@
 [Unit]
-Description=Run the News-to-Socials intake once a day (NTS_098 §5)
+Description=Run the News-to-Socials intake on weekdays (NTS_133 P5 Ф1)
 Requires=nts-intake.service
 
 [Timer]
-# 06:10 UTC — early enough that the 09:00 brand-timezone heartbeat
-# (NTS_106 §2) has real numbers to report, late enough that the overnight
-# European regulator publications are already in the feeds.
-OnCalendar=*-*-* 06:10:00 UTC
+# Mon..Fri 11:40 Madrid (09:40 UTC in summer, 10:40 UTC in winter). The
+# calendar is in the brand's timezone, not in UTC, on purpose: the directive
+# fixes the run to the middle of the Madrid working day, and a UTC calendar
+# would drift an hour on every DST change. Weekend feeds are not lost: the
+# prefilter keeps news for 72 h and primary documents for 240 h, so Monday's
+# run still reads what was published on Friday afternoon and Sunday.
+# The 13:00 dead-man switch (pipeline.monitoring.alerts) waits for the
+# heartbeat this run sends.
+OnCalendar=Mon..Fri *-*-* 11:40:00 Europe/Madrid
+# A run missed while the VPS was down is caught up at boot. All three daytime
+# timers start no earlier than 08:40 Madrid, so a catch-up lands in working
+# hours unless the machine itself reboots at night — and then quiet hours
+# hold its messages until 08:00.
 Persistent=true
 
 [Install]

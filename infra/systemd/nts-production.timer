@@ -1,15 +1,16 @@
 [Unit]
-Description=Run News-to-Socials production twice a week (NTS_123 §S4)
+Description=Run News-to-Socials production on Tuesday and Thursday (NTS_133 P5 Ф1)
 Requires=nts-production.service
 
 [Timer]
-# Wednesday and Sunday, 05:00 UTC — an hour before the intake so the
-# production run works the portfolio as it stood at the end of the previous
-# day, and the operator reads one funnel per morning rather than two.
-# The rhythm is NTS_123's; NTS_098 §5 wrote "daily", and the difference is
-# absorbed by the weekly budget (weekly_draft_budget), which counts articles
-# per ISO week rather than per run.
-OnCalendar=Wed,Sun *-*-* 05:00:00 UTC
+# Tuesday and Thursday, 12:00 Madrid — twenty minutes after the intake, so
+# production ranks a portfolio that already holds this morning's candidates,
+# and the summary of the run lands in the chat in the middle of the working
+# day. Two runs × production_batch_size (2) = 4 drafts a week, under
+# weekly_draft_budget (4); see migration 041.
+# Was Wed,Sun 05:00 UTC (NTS_123 §S4): a Sunday run at 07:00 Madrid woke the
+# chat on a weekend.
+OnCalendar=Tue,Thu *-*-* 12:00:00 Europe/Madrid
 Persistent=true
 
 [Install]

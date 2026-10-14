@@ -299,6 +299,13 @@ class PipelineConfig(Base):
     stale_draft_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=3, server_default="3"
     )
+    # NTS_133 P5 Ф4 — the same flag for drafts written from a primary
+    # document. Guidance, a consultation or an enforcement notice is still the
+    # current text a month later; flagging it at 31 days as «news going stale»
+    # was a false alarm. ``stale_draft_days`` keeps governing news.
+    stale_draft_days_document: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60, server_default="60"
+    )
     # NTS_090 — embedding dedup (editable from Settings, no deploy).
     #   dedup_enabled     master switch (dedup fails OPEN regardless).
     #   dedup_threshold   cosine >= this → duplicate; [0.75, this) → yellow.
@@ -365,9 +372,16 @@ class PipelineConfig(Base):
         default='[{"day": "mon", "capacity": 2}, {"day": "thu", "capacity": 2}]',
         server_default='[{"day": "mon", "capacity": 2}, {"day": "thu", "capacity": 2}]',
     )
-    # Ceiling on candidates entering in_production per ISO week.
+    # Ceiling on candidates entering in_production per ISO week. NTS_133 P5
+    # Ф2: 6 → 4, two production runs (Tue, Thu) of two each — migration 041.
     weekly_draft_budget: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=6, server_default="6"
+        Integer, nullable=False, default=4, server_default="4"
+    )
+    # NTS_133 P5 Ф2 — how many one production run may take. The weekly budget
+    # alone let Tuesday take the whole week (six) and Thursday nothing; the
+    # rhythm the directive asks for is steady, not front-loaded.
+    production_batch_size: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, server_default="2"
     )
     # NTS_099 §5 — the daily accept cap is counted per input_kind.
     portfolio_daily_cap_document: Mapped[int] = mapped_column(
@@ -547,9 +561,11 @@ class PipelineConfig(Base):
         Text,
         nullable=False,
         default='{"w_conf": 0.3, "w_depth": 0.25, "w_fresh": 0.15, '
-        '"w_juris": 0.15, "w_kind": 0.05, "w_div": 0.2, "w_juris_div": 0.1}',
+        '"w_juris": 0.15, "w_kind": 0.05, "w_div": 0.2, "w_juris_div": 0.1, '
+        '"w_scope": 0.4}',
         server_default='{"w_conf": 0.3, "w_depth": 0.25, "w_fresh": 0.15, '
-        '"w_juris": 0.15, "w_kind": 0.05, "w_div": 0.2, "w_juris_div": 0.1}',
+        '"w_juris": 0.15, "w_kind": 0.05, "w_div": 0.2, "w_juris_div": 0.1, '
+        '"w_scope": 0.4}',
     )
     # NTS_099 §2 — "дешёвая модель (gpt-4o-mini или аналог)". A config key so
     # swapping the guard model is a Settings edit, not a deploy.
@@ -595,6 +611,12 @@ class PipelineConfig(Base):
     # a new mode must not switch modes.
     cover_mode: Mapped[str] = mapped_column(
         Text, nullable=False, default="flux", server_default="flux"
+    )
+    # NTS_133 P5 Ф2 (from NTS_132 Ф4) — publish a clean draft on its slot
+    # without a human. OFF, like every new mode: Andriy switches it on after
+    # reading a couple of issues. The rule is ``autopublish.decide``.
+    autopublish_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
     )
 
     # --- Primary document fetch budgets (NTS_101 §4) — migration 027.

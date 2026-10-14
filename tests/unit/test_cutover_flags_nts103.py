@@ -54,6 +54,7 @@ CUTOVER_FLAGS: tuple[tuple[str, object, str], ...] = (
     ("production_enabled", False, "S4 / migration 026"),
     ("data_blocks_enabled", False, "S6 / migration 028"),
     ("cover_mode", "flux", "S9 / migration 030"),
+    ("autopublish_enabled", False, "NTS_133 P5 / migration 041"),
 )
 
 
@@ -295,3 +296,22 @@ def test_the_rank_weights_survive_a_round_trip_through_the_api(db):
     assert (
         dict(AdminConfigClient(brand_slug="icon").get_config().rank_weights) == original
     )
+
+
+async def test_autopublish_off_publishes_nothing_and_writes_no_run(db):
+    """NTS_133 P5 Ф2 — off means not even a run row: the timer fires four
+    mornings a week, and «disabled» four times a week is noise in Runs."""
+    from pipeline.autopublish import run_autopublish
+
+    cid = _candidate(db, status="drafted", sanity_draft_id="drafts.abc")
+    calls: list[int] = []
+
+    async def publish(brand_id, candidate_id, draft_id):
+        calls.append(candidate_id)
+
+    result = await run_autopublish("icon", now=NOW, publish=publish)
+    assert result.skipped == "autopublish_enabled is off"
+    assert calls == []
+    with admin_db.get_session_factory()() as session:
+        assert session.get(Candidate, cid).status == "drafted"
+        assert session.query(Run).filter(Run.run_type == "publish").count() == 0

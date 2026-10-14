@@ -9,9 +9,9 @@ User=news-deploy
 Group=news-deploy
 WorkingDirectory=/opt/news-to-socials/repo
 EnvironmentFile=/opt/news-to-socials/repo/.env
-# Runs every day, unlike production (Wed/Sun): NTS_100 §6 makes the three
+# Runs every weekday, unlike production (Tue/Thu): NTS_100 §6 makes the three
 # passes daily, and a candidate must not sit four days past its TTL waiting
-# for Wednesday. Not gated on production_enabled — expiry and retention are
+# for Tuesday. Not gated on production_enabled — expiry and retention are
 # hygiene, not generation, and they cost nothing.
 ExecStart=/opt/news-to-socials/repo/.venv/bin/python -m pipeline.selector.portfolio_sweep icon
 

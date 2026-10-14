@@ -380,7 +380,7 @@ def wired(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_rank_is_the_sum_of_the_seven_terms_and_every_term_is_reported():
+def test_rank_is_the_sum_of_the_eight_terms_and_every_term_is_reported():
     """"Слагаемые в логе на каждого кандидата" — the breakdown IS the answer.
 
     The weights were picked by eye (NTS_100 §Риски); the only way to correct
@@ -406,6 +406,7 @@ def test_rank_is_the_sum_of_the_seven_terms_and_every_term_is_reported():
         "kind",
         "div_penalty",
         "juris_div_penalty",
+        "scope",  # NTS_133 P5 Ф2
     }
     assert ranked.rank == pytest.approx(sum(contributions.values()))
     # The two penalties are subtractive and scale with the count.
@@ -657,6 +658,44 @@ async def test_limit_caps_the_batch_below_the_weekly_budget(db, wired):
         _candidate(db, title=f"Directive {i}")
     stats = await run_production(brand_slug="icon", dry_run=True, limit=1)
     assert stats.selected == 1
+
+
+async def test_one_run_takes_the_batch_size_not_the_whole_week(db, wired):
+    """NTS_133 P5 Ф2 — budget 6 used to let Tuesday take all six. Two runs a
+    week of ``production_batch_size`` each is the rhythm."""
+    from pipeline.production import run_production
+
+    for i in range(5):
+        _candidate(db, title=f"Directive {i}")
+    first = await run_production(brand_slug="icon", dry_run=True, force=True)
+    assert first.selected == 2
+    second = await run_production(brand_slug="icon", dry_run=True, force=True)
+    assert second.selected == 2
+
+
+async def test_an_off_scope_deal_is_never_picked_and_a_wealth_deal_is(db, wired):
+    """NTS_133 P5 Ф2 — the furniture chain the 2026-10 run took is out; an
+    ``ma`` story about a wealth manager stays in."""
+    from pipeline.production import run_production
+
+    junk = _candidate(
+        db,
+        title="XXXLutz to acquire Porta furniture stores",
+        service_category="ma",
+        confidence=0.99,
+    )
+    good = _candidate(
+        db,
+        title="Jyske Bank agrees to buy Danish wealth manager Formuepleje",
+        service_category="ma",
+        confidence=0.6,
+    )
+    stats = await run_production(brand_slug="icon", dry_run=True, force=True)
+    picked = {c["candidate_id"] for c in stats.candidates}
+    assert good in picked
+    assert junk not in picked
+    with admin_db.get_session_factory()() as session:
+        assert session.get(Candidate, junk).status == "pending"
 
 
 # --------------------------------------------------------------------------
@@ -1096,8 +1135,10 @@ async def test_a_production_run_drafts_four_siblings_in_one_transaction(db, wire
     languages = [p.language.value for p in publisher.batches[0]]
     assert languages[0] == "en", "the canon must be built before its translations"
     assert set(languages) == {"en", "ru", "uk", "pl"}
-    # The tag reaches the title, so the draft is identifiable in the Studio.
-    assert all("[e2e-test]" in p.title for p in publisher.batches[0])
+    # NTS_133 P5 Ф4 — the tag is the draft's runTag, never its title: on the
+    # title it reached the slug and the live URL.
+    assert all(p.run_tag == "e2e-test" for p in publisher.batches[0])
+    assert not any("[e2e-test]" in p.title for p in publisher.batches[0])
 
     with admin_db.get_session_factory()() as session:
         row = session.get(Candidate, cid)
